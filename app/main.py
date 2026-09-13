@@ -1,0 +1,257 @@
+import logging
+import math
+import re
+import shutil
+import tempfile
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional, Set
+from uuid import uuid4
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse
+
+from app.config import get_settings
+from app.db import Database
+from app.llm import AnalysisError, LLMAnalyzer
+from app.models import MeetingHistory, MeetingListItem, TaskAccepted, TaskStatus, TeamMeetingReport
+from app.pipeline import build_team_report
+from app.security import AdmissionController, AdmissionError, AdmissionReservation
+from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
+from app.transcription import WhisperTranscriber, probe_audio_duration
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "meeting-review-uploads"
+MIN_FREE_DISK_BYTES = 1024**3
+ALLOWED_EXTENSIONS: Set[str] = {".mp3", ".m4a", ".wav"}
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+settings = get_settings()
+database = Database(settings.database_path)
+transcriber = WhisperTranscriber(settings)
+analyzer = LLMAnalyzer(settings)
+admission = AdmissionController(settings.rate_limit_per_hour, settings.daily_task_limit)
+
+
+def _on_task_status(record: TaskRecord) -> None:
+    if record.team_id:
+        database.update_status(record.task_id, record.team_id, record.status)
+
+
+def _on_audio_deleted(record: TaskRecord) -> None:
+    if record.team_id:
+        database.clear_audio_path(record.task_id, record.team_id)
+
+
+async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingReport:
+    team_id = database.owner_team_id(path.stem)
+    if not progress("转写中", "正在转写，长会议可能需要较长时间…"):
+        raise TaskAborted()
+    try:
+        transcript = await run_in_threadpool(transcriber.transcribe, path)
+    finally:
+        path.unlink(missing_ok=True)
+        if team_id:
+            database.clear_audio_path(path.stem, team_id)
+
+    duration = transcript.duration_seconds
+    if not math.isfinite(duration) or duration > settings.max_audio_minutes * 60:
+        raise TaskProcessingError(422, f"当前版本支持 {settings.max_audio_minutes:g} 分钟以内的录音")
+    if not transcript.segments:
+        raise TaskProcessingError(422, "未检测到可转写的语音")
+    if team_id:
+        database.save_transcript(path.stem, team_id, transcript)
+    if not progress("AI 分析中", "转写完成，正在进行 AI 分析…"):
+        raise TaskAborted()
+    try:
+        report = await build_team_report(transcript, analyzer)
+        if team_id:
+            database.save_report(path.stem, team_id, report)
+        return report
+    except AnalysisError as exc:
+        raise TaskProcessingError(502, str(exc)) from exc
+
+
+task_manager = InMemoryTaskManager(
+    _process_audio,
+    timeout_seconds=settings.processing_timeout_seconds,
+    retention_seconds=settings.task_retention_minutes * 60,
+    status_callback=_on_task_status,
+    audio_deleted_callback=_on_audio_deleted,
+)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    database.initialize(settings.parsed_team_tokens())
+    prepare_upload_dir()
+    await task_manager.start()
+    yield
+    await task_manager.stop()
+
+
+app = FastAPI(title="团队长会复盘器", version="0.3.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def request_context_and_gates(request: Request, call_next):
+    supplied = request.headers.get("X-Request-ID", "")
+    request_id = supplied if REQUEST_ID_PATTERN.fullmatch(supplied) else uuid4().hex
+    request.state.request_id = request_id
+    logger.info("request_started request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
+    if request.url.path.startswith("/api/"):
+        team_id = database.authenticate(request.headers.get("X-Access-Token", ""))
+        if team_id is None:
+            response = JSONResponse(status_code=403, content={"detail": "团队口令错误"})
+            response.headers["X-Request-ID"] = request_id
+            return response
+        request.state.team_id = team_id
+
+    if request.method == "POST" and request.url.path == "/api/review":
+        reservation: Optional[AdmissionReservation] = None
+        queue_reserved = False
+        committed = False
+        try:
+            reservation = admission.reserve(_client_ip(request))
+            if not task_manager.try_reserve_queue_slot(settings.queue_max):
+                raise HTTPException(status_code=429, detail="当前排队人数较多，请稍后再试")
+            queue_reserved = True
+            _ensure_disk_capacity()
+            response = await call_next(request)
+            committed = response.status_code == status.HTTP_202_ACCEPTED
+        except AdmissionError as exc:
+            response = JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+        except HTTPException as exc:
+            response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        except OSError as exc:
+            logger.warning("disk_check_error request_id=%s error_type=%s", request_id, type(exc).__name__)
+            response = JSONResponse(status_code=503, content={"detail": "服务器存储空间检查失败，请稍后再试"})
+        finally:
+            if queue_reserved:
+                task_manager.release_queue_reservation()
+            if not committed and reservation is not None:
+                admission.rollback(reservation)
+    else:
+        response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    logger.info("request_finished request_id=%s status=%s", request_id, response.status_code)
+    return response
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.get("/", include_in_schema=False)
+async def index() -> FileResponse:
+    return FileResponse(BASE_DIR / "static" / "index.html")
+
+
+@app.get("/api/auth/check")
+async def auth_check(request: Request) -> dict:
+    return {"status": "ok", "team_id": request.state.team_id}
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def prepare_upload_dir(upload_dir: Path = UPLOAD_DIR) -> None:
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    for entry in upload_dir.iterdir():
+        if entry.is_file() or entry.is_symlink():
+            entry.unlink(missing_ok=True)
+
+
+def _ensure_disk_capacity(upload_dir: Path = UPLOAD_DIR) -> None:
+    if shutil.disk_usage(upload_dir).free < MIN_FREE_DISK_BYTES:
+        raise HTTPException(status_code=503, detail="服务器存储空间不足，请稍后再试")
+
+
+async def _save_upload(upload: UploadFile, path: Path) -> None:
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    total = 0
+    with path.open("wb") as output:
+        while chunk := await upload.read(1024 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(status_code=413, detail=f"文件超过 {settings.max_upload_mb} MB 限制")
+            output.write(chunk)
+    if total == 0:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+
+
+@app.post("/api/review", response_model=TaskAccepted, status_code=status.HTTP_202_ACCEPTED)
+async def review(request: Request, file: UploadFile = File(...), title: str = Form(default="")) -> TaskAccepted:
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="仅支持 mp3、m4a 和 wav 文件")
+    clean_title = title.strip()[:100] or "未命名会议"
+    submitted = False
+    created = False
+    temp_path: Optional[Path] = None
+    task_id = uuid4().hex
+    try:
+        temp_path = UPLOAD_DIR / f"{task_id}{suffix}"
+        await _save_upload(file, temp_path)
+        metadata_duration = await run_in_threadpool(probe_audio_duration, temp_path)
+        if metadata_duration is not None and metadata_duration > settings.max_audio_minutes * 60:
+            actual_minutes = math.ceil(metadata_duration / 6) / 10
+            raise HTTPException(status_code=422, detail=f"当前版本支持 {settings.max_audio_minutes:g} 分钟以内的录音，你的录音约 {actual_minutes:.1f} 分钟")
+        long_meeting = metadata_duration is not None and metadata_duration > 30 * 60
+        database.create_meeting(task_id, request.state.team_id, clean_title, temp_path)
+        created = True
+        accepted = await task_manager.submit(
+            temp_path, request.state.request_id, task_id=task_id,
+            team_id=request.state.team_id, long_meeting=long_meeting,
+        )
+        submitted = True
+        return accepted
+    except HTTPException:
+        raise
+    except OSError as exc:
+        logger.warning("upload_storage_error request_id=%s error_type=%s", request.state.request_id, type(exc).__name__)
+        raise HTTPException(status_code=503, detail="服务器暂时无法保存录音，请稍后再试") from exc
+    except Exception as exc:
+        logger.error("submit_audio_failed request_id=%s error_type=%s", request.state.request_id, type(exc).__name__)
+        raise HTTPException(status_code=500, detail="提交音频失败，请稍后重试") from exc
+    finally:
+        await file.close()
+        if not submitted:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+            if created:
+                database.delete_meeting(task_id, request.state.team_id)
+
+
+def _assert_team_owns_meeting(meeting_id: str, team_id: int) -> None:
+    owner = database.owner_team_id(meeting_id)
+    if owner is not None and owner != team_id:
+        raise HTTPException(status_code=403, detail="无权访问其他团队的会议")
+
+
+@app.get("/api/tasks/{task_id}", response_model=TaskStatus)
+async def task_status(request: Request, task_id: str) -> TaskStatus:
+    _assert_team_owns_meeting(task_id, request.state.team_id)
+    task = task_manager.get(task_id, request.state.team_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    return task
+
+
+@app.get("/api/meetings", response_model=list[MeetingListItem])
+async def meeting_list(request: Request) -> list[MeetingListItem]:
+    return database.list_meetings(request.state.team_id)
+
+
+@app.get("/api/meetings/{meeting_id}", response_model=MeetingHistory)
+async def meeting_history(request: Request, meeting_id: str) -> MeetingHistory:
+    _assert_team_owns_meeting(meeting_id, request.state.team_id)
+    history = database.get_history(meeting_id, request.state.team_id)
+    if history is None:
+        raise HTTPException(status_code=404, detail="历史报告不存在或尚未生成")
+    return history

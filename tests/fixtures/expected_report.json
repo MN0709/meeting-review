@@ -1,0 +1,27 @@
+{
+  "meeting_minutes": {
+    "key_points": ["建议优先进入校园市场。", "校园用户较集中，预期获客成本较低。", "可先选择三个社团进行试点。"],
+    "conclusions": ["优先验证校园市场，并以三个社团作为首批试点。"],
+    "action_items": [{"task": "确定三个试点社团并制定试点计划。", "owner": "未明确", "deadline": "未明确"}]
+  },
+  "overall_score": 7,
+  "overall_comment": "结论和理由较清晰，但行动计划缺少时间闭环。",
+  "performance_analysis": [
+    {"dimension": "表达清晰度", "score": 8, "assessment": "能用编号说明理由，核心依据容易理解。", "evidence": [{"quote": "原因有两个：第一，用户集中；第二，获客成本低。", "timestamp": "00:00:12"}]},
+    {"dimension": "结论先行", "score": 8, "assessment": "先给出主张，再补充原因，回答方向明确。", "evidence": [{"quote": "我先说结论：我认为应该优先做校园市场。", "timestamp": "00:00:04"}]},
+    {"dimension": "逻辑结构", "score": 6, "assessment": "提出了试点动作，但缺少明确时间和下一步决策。", "evidence": [{"quote": "具体时间我还没想好，然后再讨论。", "timestamp": "00:00:27"}]}
+  ],
+  "improvement_suggestions": [
+    {"title": "给行动项加时间边界", "action": "每个行动项同时说明负责人、完成时间和验收结果。", "example": "由我在本周五前确定三个社团，下周完成首次访谈。"},
+    {"title": "为判断补充数据", "action": "为用户集中和获客成本低各补充一个指标或验证办法。", "example": "先统计三个社团的触达人数，并比较每名有效用户的获取成本。"},
+    {"title": "减少无效衔接词", "action": "停顿半秒后直接说动作，减少“然后”和“就是”。", "example": "下一步先找三个社团试点。"}
+  ],
+  "stats": {
+    "recording_duration_seconds": 40.0,
+    "transcribed_speech_seconds": 34.0,
+    "speech_ratio_percent": 85.0,
+    "scope_note": "该比例是转写语音片段时长占录音总时长，未做说话人分离",
+    "filler_counts": {"然后": 2, "就是": 1, "嗯": 1, "呃": 1},
+    "total_fillers": 5
+  }
+}

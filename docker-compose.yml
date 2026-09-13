@@ -1,0 +1,26 @@
+services:
+  meeting-review:
+    build: .
+    env_file:
+      - .env
+    environment:
+      APP_HOST: 0.0.0.0
+      HF_HOME: /models/huggingface
+      DATABASE_PATH: /data/meeting-review.db
+    ports:
+      - "${APP_PORT:-8000}:${APP_PORT:-8000}"
+    volumes:
+      - whisper-models:/models/huggingface
+      - meeting-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  whisper-models:
+  meeting-data:
