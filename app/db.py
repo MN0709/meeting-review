@@ -23,6 +23,10 @@ class ProjectHasActiveMeetingsError(RuntimeError):
     pass
 
 
+class ProjectHasChildrenError(RuntimeError):
+    pass
+
+
 class Database:
     """Small SQLite repository. Every public resource read is team-scoped."""
 
@@ -68,6 +72,7 @@ class Database:
                     id TEXT PRIMARY KEY,
                     team_id INTEGER NOT NULL REFERENCES teams(id),
                     name TEXT NOT NULL,
+                    parent_id TEXT REFERENCES projects(id),
                     created_at TEXT NOT NULL,
                     UNIQUE(team_id, name)
                 );
@@ -98,10 +103,13 @@ class Database:
                 """
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
+            self._ensure_column(connection, "projects", "parent_id", "TEXT REFERENCES projects(id)")
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_projects_team_created
                     ON projects(team_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_projects_team_parent
+                    ON projects(team_id, parent_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_meetings_team_created
                     ON meetings(team_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_meetings_team_project_created
@@ -131,11 +139,13 @@ class Database:
                 return team_id
         return None
 
-    def create_project(self, project_id: str, team_id: int, name: str) -> ProjectListItem:
+    def create_project(
+        self, project_id: str, team_id: int, name: str, parent_id: Optional[str] = None
+    ) -> ProjectListItem:
         with self._lock, self._connect() as connection:
             connection.execute(
-                "INSERT INTO projects(id,team_id,name,created_at) VALUES(?,?,?,?)",
-                (project_id, team_id, name, _utc_now()),
+                "INSERT INTO projects(id,team_id,name,parent_id,created_at) VALUES(?,?,?,?,?)",
+                (project_id, team_id, name, parent_id, _utc_now()),
             )
         created = self.get_project(project_id, team_id)
         if created is None:
@@ -145,7 +155,7 @@ class Database:
     def get_project(self, project_id: str, team_id: int) -> Optional[ProjectListItem]:
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                """SELECT p.id,p.name,p.created_at,COUNT(m.id) AS meeting_count
+                """SELECT p.id,p.name,p.parent_id,p.created_at,COUNT(m.id) AS meeting_count
                    FROM projects p LEFT JOIN meetings m ON m.project_id=p.id
                    WHERE p.id=? AND p.team_id=? GROUP BY p.id""",
                 (project_id, team_id),
@@ -160,7 +170,7 @@ class Database:
     def list_projects(self, team_id: int) -> list[ProjectListItem]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                """SELECT p.id,p.name,p.created_at,COUNT(m.id) AS meeting_count
+                """SELECT p.id,p.name,p.parent_id,p.created_at,COUNT(m.id) AS meeting_count
                    FROM projects p LEFT JOIN meetings m ON m.project_id=p.id
                    WHERE p.team_id=? GROUP BY p.id ORDER BY p.created_at DESC""",
                 (team_id,),
@@ -176,6 +186,12 @@ class Database:
 
     def delete_project(self, project_id: str, team_id: int, delete_meetings: bool) -> int:
         with self._lock, self._connect() as connection:
+            child = connection.execute(
+                "SELECT 1 FROM projects WHERE team_id=? AND parent_id=? LIMIT 1",
+                (team_id, project_id),
+            ).fetchone()
+            if child:
+                raise ProjectHasChildrenError()
             rows = connection.execute(
                 "SELECT id,status,audio_path FROM meetings WHERE team_id=? AND project_id=?",
                 (team_id, project_id),

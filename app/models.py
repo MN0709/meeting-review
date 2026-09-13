@@ -131,11 +131,17 @@ class ChunkSummary(StrictModel):
 
 class ProjectCreate(StrictModel):
     name: str = Field(min_length=1, max_length=50)
+    parent_id: Optional[str] = None
+
+
+class ProjectRename(StrictModel):
+    name: str = Field(min_length=1, max_length=50)
 
 
 class ProjectListItem(StrictModel):
     id: str
     name: str
+    parent_id: Optional[str] = None
     meeting_count: int = Field(ge=0)
     created_at: str
 

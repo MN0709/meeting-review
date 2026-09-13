@@ -656,6 +656,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "先选择项目文件夹" in html
     assert "只删除文件夹，会议移入“未分类”" in html
     assert "删除文件夹及其中全部会议" in html
+    assert "parentProjectSelect" in html
+    assert "最多两级" in html
+    assert "会议元数据、转写稿和报告都会删除，且不可恢复" in html
+    assert "confirmPermanentDelete" in html
+    assert "$('permanentDeleteDialog').showModal()" in html
     assert "delete_meetings=${deleteMeetings}" in html
     assert "面向产品项目组" not in html
     assert "innerHTML" not in html
@@ -697,7 +702,9 @@ def test_existing_database_adds_project_column_without_losing_meetings(tmp_path)
     assert meetings[0].project_id is None
     with sqlite3.connect(path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(meetings)")}
+        project_columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
     assert "project_id" in columns
+    assert "parent_id" in project_columns
 
 
 def test_project_folders_are_created_listed_and_isolated_by_team() -> None:
@@ -728,6 +735,51 @@ def test_project_folders_are_created_listed_and_isolated_by_team() -> None:
             f"/api/meetings?project_id={project['id']}", headers=other_headers
         )
         assert denied_filter.status_code == 403
+
+
+def test_project_folders_support_two_levels_but_reject_a_third() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        root = client.post("/api/projects", json={"name": "客户项目"}).json()
+        child_response = client.post(
+            "/api/projects", json={"name": "2026年度", "parent_id": root["id"]}
+        )
+        assert child_response.status_code == 201
+        child = child_response.json()
+        assert child["parent_id"] == root["id"]
+
+        third = client.post(
+            "/api/projects", json={"name": "第三层", "parent_id": child["id"]}
+        )
+        assert third.status_code == 422
+        assert "最多支持两级" in third.json()["detail"]
+
+
+def test_project_parent_must_belong_to_current_team() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        root = client.post("/api/projects", json={"name": "甲团队根目录"}).json()
+        response = client.post(
+            "/api/projects",
+            headers={"X-Access-Token": "other-team-token"},
+            json={"name": "越权子目录", "parent_id": root["id"]},
+        )
+        assert response.status_code == 403
+
+
+def test_project_with_child_folder_cannot_be_deleted() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        root = client.post("/api/projects", json={"name": "有子目录"}).json()
+        child = client.post(
+            "/api/projects", json={"name": "子目录", "parent_id": root["id"]}
+        ).json()
+
+        response = client.delete(f"/api/projects/{root['id']}")
+
+        assert response.status_code == 409
+        assert "先处理二级文件夹" in response.json()["detail"]
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        assert main_module.database.get_project(root["id"], team_id) is not None
+        assert main_module.database.get_project(child["id"], team_id) is not None
 
 
 def test_review_can_be_assigned_to_project_folder(monkeypatch) -> None:

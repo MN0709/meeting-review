@@ -14,10 +14,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.config import get_settings
-from app.db import Database, ProjectHasActiveMeetingsError
+from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.llm import AnalysisError, LLMAnalyzer
 from app.models import (
     MeetingHistory, MeetingListItem, ProjectCreate, ProjectDeleteResult, ProjectListItem,
+    ProjectRename,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
@@ -264,15 +265,24 @@ async def project_create(request: Request, payload: ProjectCreate = Body(...)) -
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="项目文件夹名称不能为空")
+    if payload.parent_id is not None:
+        _assert_team_owns_project(payload.parent_id, request.state.team_id)
+        parent = database.get_project(payload.parent_id, request.state.team_id)
+        if parent is None:
+            raise HTTPException(status_code=404, detail="上级项目文件夹不存在")
+        if parent.parent_id is not None:
+            raise HTTPException(status_code=422, detail="项目文件夹最多支持两级")
     try:
-        return database.create_project(uuid4().hex, request.state.team_id, name)
+        return database.create_project(
+            uuid4().hex, request.state.team_id, name, parent_id=payload.parent_id
+        )
     except sqlite3.IntegrityError as exc:
         raise HTTPException(status_code=409, detail="同名项目文件夹已经存在") from exc
 
 
 @app.patch("/api/projects/{project_id}", response_model=ProjectListItem)
 async def project_rename(
-    request: Request, project_id: str, payload: ProjectCreate = Body(...)
+    request: Request, project_id: str, payload: ProjectRename = Body(...)
 ) -> ProjectListItem:
     _assert_team_owns_project(project_id, request.state.team_id)
     name = payload.name.strip()
@@ -296,6 +306,11 @@ async def project_delete(
         affected = database.delete_project(
             project_id, request.state.team_id, delete_meetings=delete_meetings
         )
+    except ProjectHasChildrenError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="该文件夹下还有二级文件夹，请先处理二级文件夹",
+        ) from exc
     except ProjectHasActiveMeetingsError as exc:
         raise HTTPException(
             status_code=409,
