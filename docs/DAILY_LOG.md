@@ -20,6 +20,9 @@
 - 已启用后续 9 天的每日 09:00 自动执行与日报心跳。
 - 已创建私有仓库 `MN0709/meeting-review`，推送 `main` 基线与 10 天开发分支。
 - 将声纹识别登记为独立 Post-MVP 项目 [GitHub #1](https://github.com/MN0709/meeting-review/issues/1)，记录现有扩展点、分阶段方案、隐私边界和上线门槛。
+- 核查 Read AI 的周期会议/历史搜索模式，以及 Vexa、Meetily、sqlite-vec、Amurex 的代码许可证与架构适配性。
+- 调整协作方式：每天交付可打开页面、3 步验收路径和一个真实产品判断，不再只发技术文档。
+- 建立 [GitHub #2](https://github.com/MN0709/meeting-review/issues/2)，把历史搜索和周期回顾纳入 Day 6-7 验收。
 
 ### 风险与阻塞
 
