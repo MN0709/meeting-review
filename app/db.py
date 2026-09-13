@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
-from app.models import MeetingHistory, MeetingListItem, TeamMeetingReport, Transcript
+from app.models import MeetingHistory, MeetingListItem, ProjectListItem, TeamMeetingReport, Transcript
 
 
 def _utc_now() -> str:
@@ -34,6 +34,14 @@ class Database:
         connection.execute("PRAGMA busy_timeout=10000")
         return connection
 
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection, table: str, column: str, definition: str
+    ) -> None:
+        columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def initialize(self, team_tokens: Dict[str, str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as connection:
@@ -52,17 +60,23 @@ class Database:
                     name TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS projects(
+                    id TEXT PRIMARY KEY,
+                    team_id INTEGER NOT NULL REFERENCES teams(id),
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(team_id, name)
+                );
                 CREATE TABLE IF NOT EXISTS meetings(
                     id TEXT PRIMARY KEY,
                     team_id INTEGER NOT NULL REFERENCES teams(id),
                     title TEXT NOT NULL,
+                    project_id TEXT REFERENCES projects(id),
                     audio_path TEXT,
                     duration_seconds REAL NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_meetings_team_created
-                    ON meetings(team_id, created_at DESC);
                 CREATE TABLE IF NOT EXISTS transcripts(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
@@ -77,6 +91,17 @@ class Database:
                     json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                """
+            )
+            self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
+            connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_projects_team_created
+                    ON projects(team_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_meetings_team_created
+                    ON meetings(team_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_meetings_team_project_created
+                    ON meetings(team_id, project_id, created_at DESC);
                 """
             )
             for name, token in team_tokens.items():
@@ -102,11 +127,58 @@ class Database:
                 return team_id
         return None
 
-    def create_meeting(self, meeting_id: str, team_id: int, title: str, audio_path: Path) -> None:
+    def create_project(self, project_id: str, team_id: int, name: str) -> ProjectListItem:
         with self._lock, self._connect() as connection:
             connection.execute(
-                "INSERT INTO meetings(id,team_id,title,audio_path,status,created_at) VALUES(?,?,?,?,?,?)",
-                (meeting_id, team_id, title, str(audio_path), "排队中", _utc_now()),
+                "INSERT INTO projects(id,team_id,name,created_at) VALUES(?,?,?,?)",
+                (project_id, team_id, name, _utc_now()),
+            )
+        created = self.get_project(project_id, team_id)
+        if created is None:
+            raise RuntimeError("project was not persisted")
+        return created
+
+    def get_project(self, project_id: str, team_id: int) -> Optional[ProjectListItem]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT p.id,p.name,p.created_at,COUNT(m.id) AS meeting_count
+                   FROM projects p LEFT JOIN meetings m ON m.project_id=p.id
+                   WHERE p.id=? AND p.team_id=? GROUP BY p.id""",
+                (project_id, team_id),
+            ).fetchone()
+        return ProjectListItem.model_validate(dict(row)) if row else None
+
+    def project_owner_team_id(self, project_id: str) -> Optional[int]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT team_id FROM projects WHERE id=?", (project_id,)).fetchone()
+        return int(row["team_id"]) if row else None
+
+    def list_projects(self, team_id: int) -> list[ProjectListItem]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT p.id,p.name,p.created_at,COUNT(m.id) AS meeting_count
+                   FROM projects p LEFT JOIN meetings m ON m.project_id=p.id
+                   WHERE p.team_id=? GROUP BY p.id ORDER BY p.created_at DESC""",
+                (team_id,),
+            ).fetchall()
+        return [ProjectListItem.model_validate(dict(row)) for row in rows]
+
+    def rename_project(self, project_id: str, team_id: int, name: str) -> Optional[ProjectListItem]:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET name=? WHERE id=? AND team_id=?", (name, project_id, team_id)
+            )
+        return self.get_project(project_id, team_id) if cursor.rowcount else None
+
+    def create_meeting(
+        self, meeting_id: str, team_id: int, title: str, audio_path: Path,
+        project_id: Optional[str] = None,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO meetings(id,team_id,title,project_id,audio_path,status,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (meeting_id, team_id, title, project_id, str(audio_path), "排队中", _utc_now()),
             )
 
     def delete_meeting(self, meeting_id: str, team_id: int) -> None:
@@ -161,19 +233,28 @@ class Database:
             row = connection.execute("SELECT team_id FROM meetings WHERE id=?", (meeting_id,)).fetchone()
             return int(row["team_id"]) if row else None
 
-    def list_meetings(self, team_id: int) -> list[MeetingListItem]:
+    def list_meetings(
+        self, team_id: int, project_id: Optional[str] = None, unclassified: bool = False
+    ) -> list[MeetingListItem]:
+        conditions = ["team_id=?"]
+        parameters: list[object] = [team_id]
+        if project_id is not None:
+            conditions.append("project_id=?")
+            parameters.append(project_id)
+        elif unclassified:
+            conditions.append("project_id IS NULL")
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                """SELECT id,title,duration_seconds,status,created_at FROM meetings
-                   WHERE team_id=? ORDER BY created_at DESC""",
-                (team_id,),
+                """SELECT id,title,project_id,duration_seconds,status,created_at FROM meetings
+                   WHERE {} ORDER BY created_at DESC""".format(" AND ".join(conditions)),
+                tuple(parameters),
             ).fetchall()
         return [MeetingListItem.model_validate(dict(row)) for row in rows]
 
     def get_history(self, meeting_id: str, team_id: int) -> Optional[MeetingHistory]:
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                """SELECT m.id,m.title,m.duration_seconds,m.status,m.created_at,r.json
+                """SELECT m.id,m.title,m.project_id,m.duration_seconds,m.status,m.created_at,r.json
                    FROM meetings m JOIN reports r ON r.meeting_id=m.id
                    WHERE m.id=? AND m.team_id=?""",
                 (meeting_id, team_id),
@@ -181,7 +262,8 @@ class Database:
         if not row:
             return None
         return MeetingHistory(
-            id=row["id"], title=row["title"], duration_seconds=row["duration_seconds"],
+            id=row["id"], title=row["title"], project_id=row["project_id"],
+            duration_seconds=row["duration_seconds"],
             status=row["status"], created_at=row["created_at"],
             report=TeamMeetingReport.model_validate_json(row["json"]),
         )

@@ -2,13 +2,14 @@
 
 > 当前 10 天产品化迭代的状态、风险和每日验收入口见 [PROJECT_CONTROL.md](PROJECT_CONTROL.md)，详细路线见 [docs/ROADMAP_10_DAYS.md](docs/ROADMAP_10_DAYS.md)。
 
-`meeting-review` 面向产品项目组的连续内部会议，参会人数不设产品层硬限制，同一项目不同会议可以有不同参会者。团队上传 MP3、M4A 或 WAV 录音，服务在本机完成带时间戳转写，再生成会议要点、带原话证据的决策清单和结构化行动项。转写稿、报告与会议元数据按团队隔离并长期保存在 SQLite；原始音频在转写完成或处理失败后删除。
+`meeting-review` 面向需要沉淀连续内部会议的团队，不限定团队职能或参会人数，同一系列不同会议可以有不同参会者。团队上传 MP3、M4A 或 WAV 录音，服务在本机完成带时间戳转写，再生成会议要点、带原话证据的决策清单和结构化行动项。转写稿、报告与会议元数据按团队隔离并长期保存在 SQLite；原始音频在转写完成或处理失败后删除。
 
 页面使用团队口令登录。口令保存在浏览器 `localStorage`，全部业务请求通过 `X-Access-Token` 发送，不使用 Cookie。上传后页面每 2 秒查询任务状态；会议完成后也可从团队历史页重新打开报告。
 
 ## 页面与团队报告
 
 - 上传：可填写会议标题，支持 MP3/M4A/WAV，默认最大 300 MB、60 分钟。
+- 项目文件夹：新上传先选择人工创建的文件夹，标题仍可不填；历史会议可按文件夹或未分类筛选。
 - 处理进度：排队中、转写中、AI 分析中、完成或失败；超过 30 分钟的已知音频会提示用户可以关闭页面，完成后从历史记录查看。
 - 会议历史：仅列出当前团队的会议标题、日期、时长，可点击读取历史报告。
 - 报告：①会议要点；②决策清单（内容、决策人、逐字引文、时间戳）；③行动项（任务、负责人、截止时间）；④发言统计占位“说话人识别将于下一版本支持”。本版本不生成任何说话人统计数字。
@@ -44,6 +45,7 @@ meeting-review/
 ```text
 浏览器单页
   |-- GET /api/auth/check（团队口令）
+  |-- GET/POST/PATCH /api/projects（团队文件夹）
   |-- POST /api/review（标题 + 音频）
   |-- GET /api/tasks/{id}（仅处理中/短期任务）
   `-- GET /api/meetings[/{id}]（当前团队历史）
@@ -102,9 +104,11 @@ curl http://127.0.0.1:8000/health
 
 - `GET /health`：免鉴权健康检查。
 - `GET /api/auth/check`：校验团队口令并返回团队 ID，错误为 403。
-- `POST /api/review`：multipart 字段 `file` 和可选 `title`，成功返回 HTTP 202 与任务 ID。
+- `GET /api/projects`：列出当前团队项目文件夹及会议数量。
+- `POST /api/projects`：创建项目文件夹；`PATCH /api/projects/{id}` 修改名称。
+- `POST /api/review`：multipart 字段 `file`、可选 `title` 和可选 `project_id`，成功返回 HTTP 202 与任务 ID；新版页面要求先选文件夹，API 保留未分类兼容能力。
 - `GET /api/tasks/{task_id}`：只查询内存中的处理中或 30 分钟内终态任务；跨团队访问返回 403。
-- `GET /api/meetings`：当前团队会议列表。
+- `GET /api/meetings`：当前团队会议列表，可用 `project_id` 或 `unclassified=true` 过滤。
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告；跨团队访问返回 403。
 
 业务 API 都要带 `X-Access-Token`。每个响应包含 `X-Request-ID`。只有 `POST /api/review` 计入限频和每日名额；健康检查、鉴权检查、任务轮询和历史查询不计数。门禁顺序为：鉴权 → 限频 → 每日上限 → 队列上限 → 至少 1 GB 空闲磁盘 → 保存文件 → 入队，拒绝时不会留下上传文件。

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -649,8 +650,109 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "音频转写完成后即删除" in html
     assert "请输入你的团队口令" in html
     assert "/api/meetings" in html
+    assert "/api/projects" in html
+    assert "projectSelect" in html
+    assert "data.append('project_id'" in html
+    assert "先选择项目文件夹" in html
+    assert "面向产品项目组" not in html
     assert "innerHTML" not in html
     assert html.count("window.fetch(") == 1
+
+
+def test_existing_database_adds_project_column_without_losing_meetings(tmp_path) -> None:
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE teams(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                token_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE meetings(
+                id TEXT PRIMARY KEY,
+                team_id INTEGER NOT NULL REFERENCES teams(id),
+                title TEXT NOT NULL,
+                audio_path TEXT,
+                duration_seconds REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO teams(id,name,token_hash,created_at)
+            VALUES(1,'旧团队','old-hash','2026-01-01T00:00:00+00:00');
+            INSERT INTO meetings(id,team_id,title,audio_path,status,created_at)
+            VALUES('legacy-meeting',1,'旧会议',NULL,'完成','2026-01-01T00:00:00+00:00');
+            """
+        )
+
+    database = Database(path)
+    database.initialize({"旧团队": "new-token"})
+
+    meetings = database.list_meetings(1)
+    assert [item.id for item in meetings] == ["legacy-meeting"]
+    assert meetings[0].project_id is None
+    with sqlite3.connect(path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(meetings)")}
+    assert "project_id" in columns
+
+
+def test_project_folders_are_created_listed_and_isolated_by_team() -> None:
+    with TestClient(main_module.app) as client:
+        created = client.post(
+            "/api/projects", headers=AUTH_HEADERS, json={"name": "年度规划"}
+        )
+        assert created.status_code == 201
+        project = created.json()
+        assert project["name"] == "年度规划"
+        assert project["meeting_count"] == 0
+
+        listed = client.get("/api/projects", headers=AUTH_HEADERS)
+        assert [item["id"] for item in listed.json()] == [project["id"]]
+        duplicate = client.post(
+            "/api/projects", headers=AUTH_HEADERS, json={"name": "年度规划"}
+        )
+        assert duplicate.status_code == 409
+
+        other_headers = {"X-Access-Token": "other-team-token"}
+        assert client.get("/api/projects", headers=other_headers).json() == []
+        denied = client.patch(
+            f"/api/projects/{project['id']}", headers=other_headers,
+            json={"name": "越权改名"},
+        )
+        assert denied.status_code == 403
+        denied_filter = client.get(
+            f"/api/meetings?project_id={project['id']}", headers=other_headers
+        )
+        assert denied_filter.status_code == 403
+
+
+def test_review_can_be_assigned_to_project_folder(monkeypatch) -> None:
+    monkeypatch.setattr(main_module, "probe_audio_duration", lambda path: 60)
+
+    async def fake_submit(path, request_id, task_id, team_id, long_meeting):
+        return TaskAccepted(
+            task_id=task_id, status="排队中", queue_position=0,
+            message="已进入处理队列", long_meeting=long_meeting,
+        )
+
+    monkeypatch.setattr(main_module.task_manager, "submit", fake_submit)
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        project = client.post("/api/projects", json={"name": "产品发布"}).json()
+        response = client.post(
+            "/api/review",
+            data={"project_id": project["id"], "title": "发布准备会"},
+            files={"file": ("meeting.wav", b"fake", "audio/wav")},
+        )
+        assert response.status_code == 202
+
+        meetings = client.get(
+            f"/api/meetings?project_id={project['id']}"
+        ).json()
+        assert len(meetings) == 1
+        assert meetings[0]["title"] == "发布准备会"
+        assert meetings[0]["project_id"] == project["id"]
+        assert client.get("/api/meetings?unclassified=true").json() == []
 
 
 def test_chunk_evidence_outside_chunk_is_retried_without_logging_quotes(caplog) -> None:

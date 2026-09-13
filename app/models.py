@@ -129,9 +129,21 @@ class ChunkSummary(StrictModel):
     evidence_quotes: List[EvidenceQuote]
 
 
+class ProjectCreate(StrictModel):
+    name: str = Field(min_length=1, max_length=50)
+
+
+class ProjectListItem(StrictModel):
+    id: str
+    name: str
+    meeting_count: int = Field(ge=0)
+    created_at: str
+
+
 class MeetingListItem(StrictModel):
     id: str
     title: str
+    project_id: Optional[str] = None
     duration_seconds: float
     status: str
     created_at: str

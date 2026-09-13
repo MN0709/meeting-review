@@ -2,20 +2,24 @@ import logging
 import math
 import re
 import shutil
+import sqlite3
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Set
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.config import get_settings
 from app.db import Database
 from app.llm import AnalysisError, LLMAnalyzer
-from app.models import MeetingHistory, MeetingListItem, TaskAccepted, TaskStatus, TeamMeetingReport
+from app.models import (
+    MeetingHistory, MeetingListItem, ProjectCreate, ProjectListItem,
+    TaskAccepted, TaskStatus, TeamMeetingReport,
+)
 from app.pipeline import build_team_report
 from app.security import AdmissionController, AdmissionError, AdmissionReservation
 from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
@@ -186,11 +190,17 @@ async def _save_upload(upload: UploadFile, path: Path) -> None:
 
 
 @app.post("/api/review", response_model=TaskAccepted, status_code=status.HTTP_202_ACCEPTED)
-async def review(request: Request, file: UploadFile = File(...), title: str = Form(default="")) -> TaskAccepted:
+async def review(
+    request: Request, file: UploadFile = File(...), title: str = Form(default=""),
+    project_id: str = Form(default=""),
+) -> TaskAccepted:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="仅支持 mp3、m4a 和 wav 文件")
     clean_title = title.strip()[:100] or "未命名会议"
+    clean_project_id = project_id.strip() or None
+    if clean_project_id is not None:
+        _assert_team_owns_project(clean_project_id, request.state.team_id)
     submitted = False
     created = False
     temp_path: Optional[Path] = None
@@ -203,7 +213,9 @@ async def review(request: Request, file: UploadFile = File(...), title: str = Fo
             actual_minutes = math.ceil(metadata_duration / 6) / 10
             raise HTTPException(status_code=422, detail=f"当前版本支持 {settings.max_audio_minutes:g} 分钟以内的录音，你的录音约 {actual_minutes:.1f} 分钟")
         long_meeting = metadata_duration is not None and metadata_duration > 30 * 60
-        database.create_meeting(task_id, request.state.team_id, clean_title, temp_path)
+        database.create_meeting(
+            task_id, request.state.team_id, clean_title, temp_path, clean_project_id
+        )
         created = True
         accepted = await task_manager.submit(
             temp_path, request.state.request_id, task_id=task_id,
@@ -234,6 +246,47 @@ def _assert_team_owns_meeting(meeting_id: str, team_id: int) -> None:
         raise HTTPException(status_code=403, detail="无权访问其他团队的会议")
 
 
+def _assert_team_owns_project(project_id: str, team_id: int) -> None:
+    owner = database.project_owner_team_id(project_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="项目文件夹不存在")
+    if owner != team_id:
+        raise HTTPException(status_code=403, detail="无权访问其他团队的项目文件夹")
+
+
+@app.get("/api/projects", response_model=list[ProjectListItem])
+async def project_list(request: Request) -> list[ProjectListItem]:
+    return database.list_projects(request.state.team_id)
+
+
+@app.post("/api/projects", response_model=ProjectListItem, status_code=status.HTTP_201_CREATED)
+async def project_create(request: Request, payload: ProjectCreate = Body(...)) -> ProjectListItem:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="项目文件夹名称不能为空")
+    try:
+        return database.create_project(uuid4().hex, request.state.team_id, name)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="同名项目文件夹已经存在") from exc
+
+
+@app.patch("/api/projects/{project_id}", response_model=ProjectListItem)
+async def project_rename(
+    request: Request, project_id: str, payload: ProjectCreate = Body(...)
+) -> ProjectListItem:
+    _assert_team_owns_project(project_id, request.state.team_id)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="项目文件夹名称不能为空")
+    try:
+        updated = database.rename_project(project_id, request.state.team_id, name)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="同名项目文件夹已经存在") from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail="项目文件夹不存在")
+    return updated
+
+
 @app.get("/api/tasks/{task_id}", response_model=TaskStatus)
 async def task_status(request: Request, task_id: str) -> TaskStatus:
     _assert_team_owns_meeting(task_id, request.state.team_id)
@@ -244,8 +297,13 @@ async def task_status(request: Request, task_id: str) -> TaskStatus:
 
 
 @app.get("/api/meetings", response_model=list[MeetingListItem])
-async def meeting_list(request: Request) -> list[MeetingListItem]:
-    return database.list_meetings(request.state.team_id)
+async def meeting_list(
+    request: Request, project_id: Optional[str] = Query(default=None),
+    unclassified: bool = Query(default=False),
+) -> list[MeetingListItem]:
+    if project_id is not None:
+        _assert_team_owns_project(project_id, request.state.team_id)
+    return database.list_meetings(request.state.team_id, project_id, unclassified)
 
 
 @app.get("/api/meetings/{meeting_id}", response_model=MeetingHistory)
