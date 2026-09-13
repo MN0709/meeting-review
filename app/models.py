@@ -140,6 +140,12 @@ class ProjectListItem(StrictModel):
     created_at: str
 
 
+class ProjectDeleteResult(StrictModel):
+    project_id: str
+    affected_meetings: int = Field(ge=0)
+    meetings_deleted: bool
+
+
 class MeetingListItem(StrictModel):
     id: str
     title: str

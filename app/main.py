@@ -14,10 +14,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.config import get_settings
-from app.db import Database
+from app.db import Database, ProjectHasActiveMeetingsError
 from app.llm import AnalysisError, LLMAnalyzer
 from app.models import (
-    MeetingHistory, MeetingListItem, ProjectCreate, ProjectListItem,
+    MeetingHistory, MeetingListItem, ProjectCreate, ProjectDeleteResult, ProjectListItem,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
@@ -285,6 +285,27 @@ async def project_rename(
     if updated is None:
         raise HTTPException(status_code=404, detail="项目文件夹不存在")
     return updated
+
+
+@app.delete("/api/projects/{project_id}", response_model=ProjectDeleteResult)
+async def project_delete(
+    request: Request, project_id: str, delete_meetings: bool = Query(default=False)
+) -> ProjectDeleteResult:
+    _assert_team_owns_project(project_id, request.state.team_id)
+    try:
+        affected = database.delete_project(
+            project_id, request.state.team_id, delete_meetings=delete_meetings
+        )
+    except ProjectHasActiveMeetingsError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="文件夹中有正在处理的会议，请处理完成后再选择连同会议删除",
+        ) from exc
+    return ProjectDeleteResult(
+        project_id=project_id,
+        affected_meetings=affected,
+        meetings_deleted=delete_meetings,
+    )
 
 
 @app.get("/api/tasks/{task_id}", response_model=TaskStatus)

@@ -654,6 +654,9 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "projectSelect" in html
     assert "data.append('project_id'" in html
     assert "先选择项目文件夹" in html
+    assert "只删除文件夹，会议移入“未分类”" in html
+    assert "删除文件夹及其中全部会议" in html
+    assert "delete_meetings=${deleteMeetings}" in html
     assert "面向产品项目组" not in html
     assert "innerHTML" not in html
     assert html.count("window.fetch(") == 1
@@ -753,6 +756,82 @@ def test_review_can_be_assigned_to_project_folder(monkeypatch) -> None:
         assert meetings[0]["title"] == "发布准备会"
         assert meetings[0]["project_id"] == project["id"]
         assert client.get("/api/meetings?unclassified=true").json() == []
+
+
+def test_deleting_project_can_move_meetings_to_unclassified() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        project = client.post("/api/projects", json={"name": "待归档"}).json()
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        main_module.database.create_meeting(
+            "move-meeting", team_id, "需要保留的会议", Path("/tmp/move.wav"), project["id"]
+        )
+
+        response = client.delete(f"/api/projects/{project['id']}")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "project_id": project["id"],
+            "affected_meetings": 1,
+            "meetings_deleted": False,
+        }
+        unclassified = client.get("/api/meetings?unclassified=true").json()
+        assert [meeting["id"] for meeting in unclassified] == ["move-meeting"]
+
+
+def test_deleting_project_and_terminal_meetings_cascades_private_data() -> None:
+    transcript = Transcript.model_validate(load_json("mock_transcript.json"))
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        project = client.post("/api/projects", json={"name": "全部删除"}).json()
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        main_module.database.create_meeting(
+            "delete-meeting", team_id, "删除的会议", Path("/tmp/delete.wav"), project["id"]
+        )
+        main_module.database.save_transcript("delete-meeting", team_id, transcript)
+        main_module.database.save_report("delete-meeting", team_id, team_report())
+        main_module.database.clear_audio_path("delete-meeting", team_id)
+        main_module.database.update_status("delete-meeting", team_id, "完成")
+
+        response = client.delete(
+            f"/api/projects/{project['id']}?delete_meetings=true"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["meetings_deleted"] is True
+        assert response.json()["affected_meetings"] == 1
+        assert main_module.database.owner_team_id("delete-meeting") is None
+        assert main_module.database.transcript_rows("delete-meeting") == []
+        assert main_module.database.get_history("delete-meeting", team_id) is None
+
+
+def test_project_with_processing_meeting_cannot_be_deleted_with_meetings() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        project = client.post("/api/projects", json={"name": "处理中"}).json()
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        main_module.database.create_meeting(
+            "active-meeting", team_id, "正在处理", Path("/tmp/active.wav"), project["id"]
+        )
+
+        response = client.delete(
+            f"/api/projects/{project['id']}?delete_meetings=true"
+        )
+
+        assert response.status_code == 409
+        assert "正在处理" in response.json()["detail"]
+        assert main_module.database.get_project(project["id"], team_id) is not None
+
+
+def test_project_delete_is_forbidden_across_teams() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        project = client.post("/api/projects", json={"name": "甲团队项目"}).json()
+        response = client.delete(
+            f"/api/projects/{project['id']}",
+            headers={"X-Access-Token": "other-team-token"},
+        )
+
+        assert response.status_code == 403
 
 
 def test_chunk_evidence_outside_chunk_is_retried_without_logging_quotes(caplog) -> None:

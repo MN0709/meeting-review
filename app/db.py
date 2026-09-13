@@ -19,6 +19,10 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+class ProjectHasActiveMeetingsError(RuntimeError):
+    pass
+
+
 class Database:
     """Small SQLite repository. Every public resource read is team-scoped."""
 
@@ -169,6 +173,33 @@ class Database:
                 "UPDATE projects SET name=? WHERE id=? AND team_id=?", (name, project_id, team_id)
             )
         return self.get_project(project_id, team_id) if cursor.rowcount else None
+
+    def delete_project(self, project_id: str, team_id: int, delete_meetings: bool) -> int:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id,status,audio_path FROM meetings WHERE team_id=? AND project_id=?",
+                (team_id, project_id),
+            ).fetchall()
+            if delete_meetings and any(
+                row["audio_path"] is not None or row["status"] not in {"完成", "失败"}
+                for row in rows
+            ):
+                raise ProjectHasActiveMeetingsError()
+            if delete_meetings:
+                connection.execute(
+                    "DELETE FROM meetings WHERE team_id=? AND project_id=?", (team_id, project_id)
+                )
+            else:
+                connection.execute(
+                    "UPDATE meetings SET project_id=NULL WHERE team_id=? AND project_id=?",
+                    (team_id, project_id),
+                )
+            deleted = connection.execute(
+                "DELETE FROM projects WHERE id=? AND team_id=?", (project_id, team_id)
+            )
+            if deleted.rowcount != 1:
+                raise PermissionError("project does not belong to team")
+        return len(rows)
 
     def create_meeting(
         self, meeting_id: str, team_id: int, title: str, audio_path: Path,
