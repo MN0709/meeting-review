@@ -8,7 +8,7 @@ GitHub：<https://github.com/MN0709/meeting-review>（private）
 
 让固定团队在会议结束后 3 分钟内看清“决定了什么、谁承诺了什么、还有什么没解决”，并能回到带时间戳的原话核对。
 
-Demo 主场景：5-6 人产品/创业团队的连续周会，详见 `docs/DEMO_SCENARIO.md`。
+Demo 主场景：5-6 人普通产品项目组的连续周会，详见 `docs/DEMO_SCENARIO.md`。
 
 ## 定版方案
 
@@ -46,7 +46,7 @@ Demo 主场景：5-6 人产品/创业团队的连续周会，详见 `docs/DEMO_S
 - [x] 建立 9 次后续执行心跳：每天上午 9:00 自动继续当天路线并汇报。
 - [x] 创建私有 GitHub 仓库并推送 `main` 与开发分支。
 - [x] 核查 Read AI 连续会议模式及 Vexa、Meetily、sqlite-vec、Amurex 的许可证与适配性。
-- [x] 宁确认 Demo 主场景为产品/创业团队周会。
+- [x] 宁确认 Demo 主场景为普通产品项目组周会；不使用创业团队设定。
 
 ## 当前风险
 
