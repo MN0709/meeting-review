@@ -161,5 +161,9 @@ class MeetingListItem(StrictModel):
     created_at: str
 
 
+class MeetingMoveRequest(StrictModel):
+    project_id: str
+
+
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport

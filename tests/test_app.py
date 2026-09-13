@@ -661,6 +661,9 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "会议元数据、转写稿和报告都会删除，且不可恢复" in html
     assert "confirmPermanentDelete" in html
     assert "$('permanentDeleteDialog').showModal()" in html
+    assert "moveMeetingDialog" in html
+    assert "会议报告和历史记录会完整保留" in html
+    assert "/project`" in html
     assert "delete_meetings=${deleteMeetings}" in html
     assert "面向产品项目组" not in html
     assert "innerHTML" not in html
@@ -808,6 +811,57 @@ def test_review_can_be_assigned_to_project_folder(monkeypatch) -> None:
         assert meetings[0]["title"] == "发布准备会"
         assert meetings[0]["project_id"] == project["id"]
         assert client.get("/api/meetings?unclassified=true").json() == []
+
+
+def test_meeting_can_move_between_projects_without_losing_report_or_transcript() -> None:
+    transcript = Transcript.model_validate(load_json("mock_transcript.json"))
+    report = team_report()
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        source = client.post("/api/projects", json={"name": "原文件夹"}).json()
+        target = client.post("/api/projects", json={"name": "目标文件夹"}).json()
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        main_module.database.create_meeting(
+            "movable-meeting", team_id, "可移动会议", Path("/tmp/movable.wav"), source["id"]
+        )
+        main_module.database.save_transcript("movable-meeting", team_id, transcript)
+        main_module.database.save_report("movable-meeting", team_id, report)
+        main_module.database.clear_audio_path("movable-meeting", team_id)
+        main_module.database.update_status("movable-meeting", team_id, "完成")
+
+        response = client.patch(
+            "/api/meetings/movable-meeting/project",
+            json={"project_id": target["id"]},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["project_id"] == target["id"]
+        assert main_module.database.transcript_rows("movable-meeting")
+        history = client.get("/api/meetings/movable-meeting")
+        assert history.status_code == 200
+        assert history.json()["report"] == report.model_dump()
+
+
+def test_meeting_move_rejects_cross_team_target_project() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        source = client.post("/api/projects", json={"name": "本团队目录"}).json()
+        other_headers = {"X-Access-Token": "other-team-token"}
+        target = client.post(
+            "/api/projects", headers=other_headers, json={"name": "其他团队目录"}
+        ).json()
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        main_module.database.create_meeting(
+            "isolated-move", team_id, "不能越权移动", Path("/tmp/isolated.wav"), source["id"]
+        )
+
+        response = client.patch(
+            "/api/meetings/isolated-move/project", json={"project_id": target["id"]}
+        )
+
+        assert response.status_code == 403
+        current = main_module.database.list_meetings(team_id, project_id=source["id"])
+        assert [item.id for item in current] == ["isolated-move"]
 
 
 def test_deleting_project_can_move_meetings_to_unclassified() -> None:

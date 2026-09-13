@@ -238,6 +238,14 @@ class Database:
                 "UPDATE meetings SET status=? WHERE id=? AND team_id=?", (status, meeting_id, team_id)
             )
 
+    def move_meeting(self, meeting_id: str, team_id: int, project_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE meetings SET project_id=? WHERE id=? AND team_id=?",
+                (project_id, meeting_id, team_id),
+            )
+        return cursor.rowcount == 1
+
     def clear_audio_path(self, meeting_id: str, team_id: int) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(

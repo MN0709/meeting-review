@@ -17,7 +17,8 @@ from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.llm import AnalysisError, LLMAnalyzer
 from app.models import (
-    MeetingHistory, MeetingListItem, ProjectCreate, ProjectDeleteResult, ProjectListItem,
+    MeetingHistory, MeetingListItem, MeetingMoveRequest, ProjectCreate, ProjectDeleteResult,
+    ProjectListItem,
     ProjectRename,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
@@ -349,3 +350,32 @@ async def meeting_history(request: Request, meeting_id: str) -> MeetingHistory:
     if history is None:
         raise HTTPException(status_code=404, detail="历史报告不存在或尚未生成")
     return history
+
+
+@app.patch("/api/meetings/{meeting_id}/project", response_model=MeetingListItem)
+async def meeting_move(
+    request: Request, meeting_id: str, payload: MeetingMoveRequest = Body(...)
+) -> MeetingListItem:
+    _assert_team_owns_meeting(meeting_id, request.state.team_id)
+    _assert_team_owns_project(payload.project_id, request.state.team_id)
+    current = next(
+        (
+            item
+            for item in database.list_meetings(request.state.team_id)
+            if item.id == meeting_id
+        ),
+        None,
+    )
+    if current is None:
+        raise HTTPException(status_code=404, detail="会议不存在")
+    if current.project_id == payload.project_id:
+        raise HTTPException(status_code=409, detail="会议已经在该文件夹中")
+    if not database.move_meeting(
+        meeting_id, request.state.team_id, payload.project_id
+    ):
+        raise HTTPException(status_code=404, detail="会议不存在")
+    return next(
+        item
+        for item in database.list_meetings(request.state.team_id)
+        if item.id == meeting_id
+    )
