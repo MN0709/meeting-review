@@ -23,6 +23,7 @@
 - 核查 Read AI 的周期会议/历史搜索模式，以及 Vexa、Meetily、sqlite-vec、Amurex 的代码许可证与架构适配性。
 - 调整协作方式：每天交付可打开页面、3 步验收路径和一个真实产品判断，不再只发技术文档。
 - 建立 [GitHub #2](https://github.com/MN0709/meeting-review/issues/2)，把历史搜索和周期回顾纳入 Day 6-7 验收。
+- 宁完成今日产品选择：Demo 主场景确定为 5-6 人产品/创业团队周会。
 
 ### 风险与阻塞
 
