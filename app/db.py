@@ -289,13 +289,21 @@ class Database:
             return int(row["team_id"]) if row else None
 
     def list_meetings(
-        self, team_id: int, project_id: Optional[str] = None, unclassified: bool = False
+        self, team_id: int, project_id: Optional[str] = None, unclassified: bool = False,
+        include_children: bool = False,
     ) -> list[MeetingListItem]:
         conditions = ["team_id=?"]
         parameters: list[object] = [team_id]
         if project_id is not None:
-            conditions.append("project_id=?")
-            parameters.append(project_id)
+            if include_children:
+                conditions.append(
+                    "(project_id=? OR project_id IN "
+                    "(SELECT id FROM projects WHERE team_id=? AND parent_id=?))"
+                )
+                parameters.extend((project_id, team_id, project_id))
+            else:
+                conditions.append("project_id=?")
+                parameters.append(project_id)
         elif unclassified:
             conditions.append("project_id IS NULL")
         with self._lock, self._connect() as connection:

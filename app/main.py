@@ -337,10 +337,13 @@ async def task_status(request: Request, task_id: str) -> TaskStatus:
 async def meeting_list(
     request: Request, project_id: Optional[str] = Query(default=None),
     unclassified: bool = Query(default=False),
+    include_children: bool = Query(default=False),
 ) -> list[MeetingListItem]:
     if project_id is not None:
         _assert_team_owns_project(project_id, request.state.team_id)
-    return database.list_meetings(request.state.team_id, project_id, unclassified)
+    return database.list_meetings(
+        request.state.team_id, project_id, unclassified, include_children
+    )
 
 
 @app.get("/api/meetings/{meeting_id}", response_model=MeetingHistory)

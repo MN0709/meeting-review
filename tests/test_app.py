@@ -667,6 +667,8 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "folder-tree-item" in html
     assert "history-workspace" in html
     assert "当前：${projectLabel(project)}" in html
+    assert "include_children=true" in html
+    assert "（含子文件夹）" in html
     assert "projectFilter" not in html
     assert "/project`" in html
     assert "delete_meetings=${deleteMeetings}" in html
@@ -760,6 +762,34 @@ def test_project_folders_support_two_levels_but_reject_a_third() -> None:
         )
         assert third.status_code == 422
         assert "最多支持两级" in third.json()["detail"]
+
+
+def test_root_project_filter_can_include_child_folder_meetings() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        root = client.post("/api/projects", json={"name": "汇总根目录"}).json()
+        child = client.post(
+            "/api/projects", json={"name": "二级目录", "parent_id": root["id"]}
+        ).json()
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        main_module.database.create_meeting(
+            "root-meeting", team_id, "一级会议", Path("/tmp/root.wav"), root["id"]
+        )
+        main_module.database.create_meeting(
+            "child-meeting", team_id, "二级会议", Path("/tmp/child.wav"), child["id"]
+        )
+
+        direct = client.get(f"/api/meetings?project_id={root['id']}")
+        combined = client.get(
+            f"/api/meetings?project_id={root['id']}&include_children=true"
+        )
+        child_only = client.get(f"/api/meetings?project_id={child['id']}")
+
+        assert [item["id"] for item in direct.json()] == ["root-meeting"]
+        assert {item["id"] for item in combined.json()} == {
+            "root-meeting", "child-meeting",
+        }
+        assert [item["id"] for item in child_only.json()] == ["child-meeting"]
 
 
 def test_project_parent_must_belong_to_current_team() -> None:
