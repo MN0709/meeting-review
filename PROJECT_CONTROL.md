@@ -14,7 +14,7 @@ GitHub：<https://github.com/MN0709/meeting-review>（private）
 - 报告结构：参考 Fellow 的“要点 → 决策 → 行动项 → 遗留问题”，所有关键结论附原话证据。
 - 中文体验：参考飞书妙记的信息密度、中文措辞、历史浏览和任务表达。
 - 分类策略：用户先选项目，AI 根据转写内容推荐标题与标签，由用户确认；不做不可见的全自动移动。
-- 说话人策略：本轮只做可校正的说话人名称映射，不把自动声纹作为 10 天主线。
+- 说话人策略：本轮只做可校正的说话人名称映射；自动声纹作为独立 Post-MVP 项目保留，扩展设计见 `docs/FUTURE_SPEAKER_IDENTITY.md`。
 - 音频策略：转写后删除，因此时间戳跳转到转写上下文，不承诺历史音频回放。
 
 ## 当前状态
@@ -29,6 +29,7 @@ GitHub：<https://github.com/MN0709/meeting-review>（private）
 | 内容分类 | 未开始 | Day 4 |
 | 文件夹级跨会议记忆 | 未开始 | Day 6-7 |
 | 中文界面重排 | 未开始 | Day 5、Day 8 |
+| 说话人身份/声纹 | Post-MVP 已预留 | `members`、`speaker_label`、扩展设计与 [GitHub #1](https://github.com/MN0709/meeting-review/issues/1) |
 | 公网部署与作品集材料 | 待复核 | Day 9-10 |
 
 ## 今日进度（Day 1）
