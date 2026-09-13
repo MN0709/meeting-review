@@ -663,6 +663,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "$('permanentDeleteDialog').showModal()" in html
     assert "moveMeetingDialog" in html
     assert "会议报告和历史记录会完整保留" in html
+    assert "projectTree" in html
+    assert "folder-tree-item" in html
+    assert "history-workspace" in html
+    assert "当前：${projectLabel(project)}" in html
+    assert "projectFilter" not in html
     assert "/project`" in html
     assert "delete_meetings=${deleteMeetings}" in html
     assert "面向产品项目组" not in html
