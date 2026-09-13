@@ -653,11 +653,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "/api/projects" in html
     assert "projectSelect" in html
     assert "data.append('project_id'" in html
-    assert "先选择项目文件夹" in html
-    assert "只删除文件夹，会议移入“未分类”" in html
-    assert "删除文件夹及其中全部会议" in html
-    assert "parentProjectSelect" in html
-    assert "最多两级" in html
+    assert "选择项目" in html
+    assert "只删除项目，会议移入“未分类”" in html
+    assert "删除项目及其中全部会议" in html
+    assert "parentProjectSelect" not in html
+    assert "最多两级" not in html
     assert "会议元数据、转写稿和报告都会删除，且不可恢复" in html
     assert "confirmPermanentDelete" in html
     assert "$('permanentDeleteDialog').showModal()" in html
@@ -666,9 +666,12 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "projectTree" in html
     assert "folder-tree-item" in html
     assert "history-workspace" in html
-    assert "当前：${projectLabel(project)}" in html
+    assert "showCreateProject" in html
+    assert "manageProjectDialog" in html
+    assert "saveProjectName" in html
+    assert "当前：${project.name}" in html
     assert "include_children=true" in html
-    assert "（含子文件夹）" in html
+    assert "（含子文件夹）" not in html
     assert "projectFilter" not in html
     assert "/project`" in html
     assert "delete_meetings=${deleteMeetings}" in html
