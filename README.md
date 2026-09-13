@@ -1,5 +1,7 @@
 # 团队长会复盘器
 
+> 当前 10 天产品化迭代的状态、风险和每日验收入口见 [PROJECT_CONTROL.md](PROJECT_CONTROL.md)，详细路线见 [docs/ROADMAP_10_DAYS.md](docs/ROADMAP_10_DAYS.md)。
+
 `meeting-review` 面向 5-6 人固定团队的内部正式会议。团队上传 MP3、M4A 或 WAV 录音，服务在本机完成带时间戳转写，再生成会议要点、带原话证据的决策清单和结构化行动项。转写稿、报告与会议元数据按团队隔离并长期保存在 SQLite；原始音频在转写完成或处理失败后删除。
 
 页面使用团队口令登录。口令保存在浏览器 `localStorage`，全部业务请求通过 `X-Access-Token` 发送，不使用 Cookie。上传后页面每 2 秒查询任务状态；会议完成后也可从团队历史页重新打开报告。
