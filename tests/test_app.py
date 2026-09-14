@@ -713,16 +713,26 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "moveMeetingDialog" in html
     assert "会议报告和历史记录会完整保留" in html
     assert "projectTree" in html
-    assert "folder-tree-item" in html
-    assert "history-workspace" in html
+    assert 'data-view="home"' in html
+    assert 'data-view="meetings"' in html
+    assert 'data-view="projects"' in html
+    assert html.index('data-view="home"') < html.index('data-view="meetings"') < html.index('data-view="projects"')
+    assert 'id="homeView"' in html
+    assert 'id="meetingsView"' in html
+    assert 'id="projectsView"' in html
+    assert 'id="projectDetailView"' in html
+    assert "folder-tree-item" not in html
+    assert "history-workspace" not in html
+    assert "每个文件夹就是一个项目，不再分二级" in html
+    assert "openProject(root.id)" in html
+    assert "单层项目文件夹" in html
     assert "showCreateProject" in html
     assert "manageProjectDialog" in html
     assert "saveProjectName" in html
     assert "当前：${project.name}" in html
     assert "include_children=true" in html
-    assert "还没有项目，点击上方“＋”创建第一个项目" in html
-    assert "还没有会议。先选择项目并上传一段录音" in html
-    assert "没有未分类会议" in html
+    assert "还没有项目，点击上方“＋ 新建项目”创建第一个项目" in html
+    assert "还没有会议。回到首页选择项目并上传一段录音" in html
     assert "localStorage.setItem(PROJECT_STORAGE_KEY" in html
     assert "localStorage.setItem(HISTORY_SCOPE_STORAGE_KEY" in html
     assert "① 会议总览" in html
