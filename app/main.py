@@ -17,8 +17,8 @@ from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.llm import AnalysisError, LLMAnalyzer
 from app.models import (
-    MeetingHistory, MeetingListItem, MeetingMoveRequest, ProjectCreate, ProjectDeleteResult,
-    ProjectListItem,
+    ActionItemStatusResult, ActionItemStatusUpdate, MeetingHistory, MeetingListItem,
+    MeetingMoveRequest, ProjectCreate, ProjectDeleteResult, ProjectListItem, ProjectMemory,
     ProjectRename,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
@@ -256,9 +256,36 @@ def _assert_team_owns_project(project_id: str, team_id: int) -> None:
         raise HTTPException(status_code=403, detail="无权访问其他团队的项目文件夹")
 
 
+def _assert_team_owns_action(action_id: int, team_id: int) -> None:
+    owner = database.action_owner_team_id(action_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="行动项不存在")
+    if owner != team_id:
+        raise HTTPException(status_code=403, detail="无权访问其他团队的行动项")
+
+
 @app.get("/api/projects", response_model=list[ProjectListItem])
 async def project_list(request: Request) -> list[ProjectListItem]:
     return database.list_projects(request.state.team_id)
+
+
+@app.get("/api/projects/{project_id}/memory", response_model=ProjectMemory)
+async def project_memory(request: Request, project_id: str) -> ProjectMemory:
+    _assert_team_owns_project(project_id, request.state.team_id)
+    memory = database.get_project_memory(project_id, request.state.team_id, meeting_limit=3)
+    if memory is None:
+        raise HTTPException(status_code=404, detail="项目文件夹不存在")
+    return memory
+
+
+@app.patch("/api/action-items/{action_id}", response_model=ActionItemStatusResult)
+async def action_status_update(
+    request: Request, action_id: int, payload: ActionItemStatusUpdate = Body(...)
+) -> ActionItemStatusResult:
+    _assert_team_owns_action(action_id, request.state.team_id)
+    if not database.update_action_status(action_id, request.state.team_id, payload.status):
+        raise HTTPException(status_code=404, detail="行动项不存在")
+    return ActionItemStatusResult(id=action_id, status=payload.status)
 
 
 @app.post("/api/projects", response_model=ProjectListItem, status_code=status.HTTP_201_CREATED)

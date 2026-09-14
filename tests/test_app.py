@@ -693,6 +693,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "你打开的是本地网页文件，无法连接后端服务" in html
     assert "无法连接后端服务，请确认服务已经启动后再重试" in html
     assert "response.status===403" in html
+    assert "项目连续回顾" in html
+    assert "/memory`" in html
+    assert "/api/action-items/" in html
+    assert "['待确认','进行中','已完成','已取消']" in html
+    assert "最近 ${memory.recent_meetings.length} 场 · ${openCount} 项未完成" in html
     assert "/api/meetings" in html
     assert "/api/projects" in html
     assert "projectSelect" in html
@@ -1457,6 +1462,36 @@ def test_legacy_team_report_gets_safe_defaults_and_transcript_context(tmp_path) 
     assert [segment.text for segment in history.transcript] == ["我们本周上线内测"]
 
 
+def test_startup_backfills_action_status_for_existing_reports(tmp_path) -> None:
+    path = tmp_path / "action-backfill.db"
+    database = Database(path)
+    database.initialize({"测试团队": "token"})
+    team_id = database.authenticate("token")
+    assert team_id is not None
+    project = database.create_project("legacy-project", team_id, "旧项目")
+    database.create_meeting(
+        "legacy-action-meeting", team_id, "旧周会", Path("/tmp/legacy-action.wav"), project.id
+    )
+    database.update_status("legacy-action-meeting", team_id, "完成")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO reports(meeting_id,json,created_at) VALUES(?,?,?)",
+            (
+                "legacy-action-meeting", team_report().model_dump_json(),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+    restarted = Database(path)
+    restarted.initialize({"测试团队": "token"})
+    memory = restarted.get_project_memory(project.id, team_id)
+
+    assert memory is not None
+    assert len(memory.action_items) == 1
+    assert memory.action_items[0].task == "准备发布清单"
+    assert memory.action_items[0].status == "待确认"
+
+
 def test_transcribed_audio_is_deleted_and_transcript_and_report_are_persisted(monkeypatch, tmp_path) -> None:
     team_id = main_module.database.authenticate("test-access-token")
     meeting_id = "a" * 32
@@ -1518,3 +1553,83 @@ def test_history_and_task_access_are_isolated_by_team() -> None:
         assert client.get(f"/api/meetings/{first_meeting}").status_code == 200
         assert client.get(f"/api/meetings/{second_meeting}").status_code == 403
         assert client.get(f"/api/tasks/{second_meeting}").status_code == 403
+
+
+def test_project_memory_uses_latest_three_meetings_and_updates_action_status() -> None:
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        project = client.post("/api/projects", json={"name": "连续项目"}).json()
+        team_id = main_module.database.authenticate("test-access-token")
+        assert team_id is not None
+        for index in range(4):
+            meeting_id = f"memory-meeting-{index}"
+            main_module.database.create_meeting(
+                meeting_id, team_id, f"第{index + 1}次周会", Path(f"/tmp/{meeting_id}.wav"),
+                project["id"],
+            )
+            payload = team_report().model_dump()
+            payload["overview"] = f"第{index + 1}次周会总览"
+            payload["action_items"] = [{
+                "task": f"任务{index + 1}", "owner": "小宁", "deadline": "周五"
+            }]
+            main_module.database.save_report(
+                meeting_id, team_id, TeamMeetingReport.model_validate(payload)
+            )
+            main_module.database.update_status(meeting_id, team_id, "完成")
+            with sqlite3.connect(main_module.database.path) as connection:
+                connection.execute(
+                    "UPDATE meetings SET created_at=? WHERE id=?",
+                    (f"2026-09-{index + 1:02d}T09:00:00+00:00", meeting_id),
+                )
+
+        response = client.get(f"/api/projects/{project['id']}/memory")
+
+        assert response.status_code == 200
+        memory = response.json()
+        assert [item["title"] for item in memory["recent_meetings"]] == [
+            "第4次周会", "第3次周会", "第2次周会"
+        ]
+        assert [item["task"] for item in memory["action_items"]] == ["任务4", "任务3", "任务2"]
+        assert all(item["status"] == "待确认" for item in memory["action_items"])
+        assert all(item["source"]["title"].endswith("次周会") for item in memory["decisions"])
+
+        action_id = memory["action_items"][0]["id"]
+        updated = client.patch(
+            f"/api/action-items/{action_id}", json={"status": "已完成"}
+        )
+        assert updated.status_code == 200
+        assert updated.json() == {"id": action_id, "status": "已完成"}
+        refreshed = client.get(f"/api/projects/{project['id']}/memory").json()
+        assert refreshed["action_items"][0]["status"] == "已完成"
+        assert client.patch(
+            f"/api/action-items/{action_id}", json={"status": "假的状态"}
+        ).status_code == 422
+
+
+def test_project_memory_and_action_status_are_isolated_by_team() -> None:
+    other_headers = {"X-Access-Token": "other-team-token"}
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        other_project = client.post(
+            "/api/projects", headers=other_headers, json={"name": "乙团队连续项目"}
+        ).json()
+        other_team_id = main_module.database.authenticate("other-team-token")
+        assert other_team_id is not None
+        meeting_id = "other-memory-meeting"
+        main_module.database.create_meeting(
+            meeting_id, other_team_id, "乙团队周会", Path("/tmp/other-memory.wav"),
+            other_project["id"],
+        )
+        main_module.database.save_report(meeting_id, other_team_id, team_report())
+        main_module.database.update_status(meeting_id, other_team_id, "完成")
+        other_memory = client.get(
+            f"/api/projects/{other_project['id']}/memory", headers=other_headers
+        ).json()
+        action_id = other_memory["action_items"][0]["id"]
+
+        assert client.get(f"/api/projects/{other_project['id']}/memory").status_code == 403
+        assert client.patch(
+            f"/api/action-items/{action_id}", json={"status": "已完成"}
+        ).status_code == 403
+        assert client.patch(
+            f"/api/action-items/{action_id}", headers=other_headers,
+            json={"status": "已完成"},
+        ).status_code == 200

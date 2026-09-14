@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 from app.models import (
-    MeetingHistory, MeetingListItem, ProjectListItem, TeamMeetingReport, Transcript,
-    TranscriptSegment,
+    ActionStatus, MeetingHistory, MeetingListItem, MeetingSource, ProjectListItem,
+    ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
+    TeamMeetingReport, Transcript, TranscriptSegment,
 )
 
 
@@ -103,6 +104,20 @@ class Database:
                     json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS meeting_action_items(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    team_id INTEGER NOT NULL REFERENCES teams(id),
+                    item_index INTEGER NOT NULL,
+                    task TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    deadline TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT '待确认'
+                        CHECK(status IN ('待确认','进行中','已完成','已取消')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(meeting_id, item_index)
+                );
                 """
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
@@ -117,6 +132,8 @@ class Database:
                     ON meetings(team_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_meetings_team_project_created
                     ON meetings(team_id, project_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_action_items_team_status
+                    ON meeting_action_items(team_id, status, updated_at DESC);
                 """
             )
             for name, token in team_tokens.items():
@@ -133,6 +150,38 @@ class Database:
             ).fetchall()
             by_name = {row["name"]: row["id"] for row in rows}
             self._tokens = {token: by_name[name] for name, token in team_tokens.items()}
+            self._backfill_action_items(connection)
+
+    @staticmethod
+    def _report_payload(raw_json: str) -> dict:
+        payload = json.loads(raw_json)
+        if not isinstance(payload, dict):
+            raise ValueError("report JSON must be an object")
+        # 历史报告可能由旧版本生成；只补展示字段，不伪造会议内容。
+        payload.setdefault("overview", "该报告生成于旧版本，暂无会议总览。")
+        payload.setdefault("unresolved_issues", [])
+        return payload
+
+    def _backfill_action_items(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """SELECT r.meeting_id,r.json,r.created_at,m.team_id
+               FROM reports r JOIN meetings m ON m.id=r.meeting_id"""
+        ).fetchall()
+        for row in rows:
+            try:
+                report = TeamMeetingReport.model_validate(self._report_payload(row["json"]))
+            except (ValueError, TypeError):
+                continue
+            for index, item in enumerate(report.action_items):
+                connection.execute(
+                    """INSERT OR IGNORE INTO meeting_action_items(
+                           meeting_id,team_id,item_index,task,owner,deadline,status,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,'待确认',?,?)""",
+                    (
+                        row["meeting_id"], row["team_id"], index, item.task, item.owner,
+                        item.deadline, row["created_at"], row["created_at"],
+                    ),
+                )
 
     def authenticate(self, candidate: str) -> Optional[int]:
         import hmac
@@ -274,6 +323,8 @@ class Database:
 
     def save_report(self, meeting_id: str, team_id: int, report: TeamMeetingReport) -> None:
         payload = report.model_dump_json()
+        report_action_items = getattr(report, "action_items", [])
+        now = _utc_now()
         with self._lock, self._connect() as connection:
             owned = connection.execute(
                 "SELECT 1 FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id)
@@ -283,7 +334,21 @@ class Database:
             connection.execute(
                 """INSERT INTO reports(meeting_id,json,created_at) VALUES(?,?,?)
                    ON CONFLICT(meeting_id) DO UPDATE SET json=excluded.json, created_at=excluded.created_at""",
-                (meeting_id, payload, _utc_now()),
+                (meeting_id, payload, now),
+            )
+            for index, item in enumerate(report_action_items):
+                connection.execute(
+                    """INSERT INTO meeting_action_items(
+                           meeting_id,team_id,item_index,task,owner,deadline,status,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,'待确认',?,?)
+                       ON CONFLICT(meeting_id,item_index) DO UPDATE SET
+                           task=excluded.task,owner=excluded.owner,deadline=excluded.deadline,
+                           updated_at=excluded.updated_at""",
+                    (meeting_id, team_id, index, item.task, item.owner, item.deadline, now, now),
+                )
+            connection.execute(
+                "DELETE FROM meeting_action_items WHERE meeting_id=? AND item_index>=?",
+                (meeting_id, len(report_action_items)),
             )
 
     def owner_team_id(self, meeting_id: str) -> Optional[int]:
@@ -333,10 +398,7 @@ class Database:
             ).fetchall() if row else []
         if not row:
             return None
-        report_payload = json.loads(row["json"])
-        # 历史报告可能由旧版本生成；只补展示字段，不伪造会议内容。
-        report_payload.setdefault("overview", "该报告生成于旧版本，暂无会议总览。")
-        report_payload.setdefault("unresolved_issues", [])
+        report_payload = self._report_payload(row["json"])
         return MeetingHistory(
             id=row["id"], title=row["title"], project_id=row["project_id"],
             duration_seconds=row["duration_seconds"],
@@ -344,6 +406,92 @@ class Database:
             report=TeamMeetingReport.model_validate(report_payload),
             transcript=[TranscriptSegment.model_validate(dict(item)) for item in transcript_rows],
         )
+
+    def get_project_memory(
+        self, project_id: str, team_id: int, meeting_limit: int = 3
+    ) -> Optional[ProjectMemory]:
+        project = self.get_project(project_id, team_id)
+        if project is None:
+            return None
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT m.id,m.title,m.project_id,m.duration_seconds,m.status,m.created_at,r.json
+                   FROM meetings m JOIN reports r ON r.meeting_id=m.id
+                   WHERE m.team_id=? AND m.status='完成'
+                     AND (m.project_id=? OR m.project_id IN (
+                         SELECT id FROM projects WHERE team_id=? AND parent_id=?
+                     ))
+                   ORDER BY m.created_at DESC LIMIT ?""",
+                (team_id, project_id, team_id, project_id, meeting_limit),
+            ).fetchall()
+            meeting_ids = [row["id"] for row in rows]
+            if meeting_ids:
+                action_rows = connection.execute(
+                    """SELECT id,meeting_id,item_index,status FROM meeting_action_items
+                       WHERE team_id=? AND meeting_id IN ({})""".format(
+                        ",".join("?" for _ in meeting_ids)
+                    ),
+                    (team_id, *meeting_ids),
+                ).fetchall()
+            else:
+                action_rows = []
+
+        actions_by_position = {
+            (row["meeting_id"], row["item_index"]): row for row in action_rows
+        }
+        recent_meetings: list[MeetingListItem] = []
+        decisions: list[ProjectMemoryDecision] = []
+        action_items: list[ProjectMemoryAction] = []
+        unresolved_issues: list[ProjectMemoryIssue] = []
+        for row in rows:
+            recent_meetings.append(MeetingListItem.model_validate({
+                key: row[key]
+                for key in ("id", "title", "project_id", "duration_seconds", "status", "created_at")
+            }))
+            source = MeetingSource(id=row["id"], title=row["title"], created_at=row["created_at"])
+            report = TeamMeetingReport.model_validate(self._report_payload(row["json"]))
+            decisions.extend(
+                ProjectMemoryDecision(**item.model_dump(), source=source)
+                for item in report.decisions
+            )
+            unresolved_issues.extend(
+                ProjectMemoryIssue(**item.model_dump(), source=source)
+                for item in report.unresolved_issues
+            )
+            for index, item in enumerate(report.action_items):
+                action_row = actions_by_position.get((row["id"], index))
+                if action_row is None:
+                    continue
+                action_items.append(ProjectMemoryAction(
+                    id=action_row["id"], task=item.task, owner=item.owner,
+                    deadline=item.deadline, status=action_row["status"], source=source,
+                ))
+        return ProjectMemory(
+            project_id=project.id,
+            project_name=project.name,
+            recent_meetings=recent_meetings,
+            decisions=decisions,
+            action_items=action_items,
+            unresolved_issues=unresolved_issues,
+        )
+
+    def action_owner_team_id(self, action_id: int) -> Optional[int]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT team_id FROM meeting_action_items WHERE id=?", (action_id,)
+            ).fetchone()
+        return int(row["team_id"]) if row else None
+
+    def update_action_status(
+        self, action_id: int, team_id: int, action_status: ActionStatus
+    ) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE meeting_action_items SET status=?,updated_at=?
+                   WHERE id=? AND team_id=?""",
+                (action_status, _utc_now(), action_id, team_id),
+            )
+        return cursor.rowcount == 1
 
     def transcript_rows(self, meeting_id: str) -> Iterable[sqlite3.Row]:
         with self._lock, self._connect() as connection:

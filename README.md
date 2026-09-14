@@ -14,6 +14,7 @@
 - 删除项目时必须选择：保留会议并移入“未分类”，或连同会议、转写稿和报告一起删除。永久删除前会二次警告且不可恢复；含处理中会议的项目禁止连带删除。
 - 处理进度：排队中、转写中、AI 分析中、完成或失败；超过 30 分钟的已知音频会提示用户可以关闭页面，完成后从历史记录查看。
 - 会议历史：左侧是一层项目列表及新建、改名、删除入口，右侧列出当前项目的会议标题、日期、时长。数据库保留的旧二级数据会自动归并到所属项目，不单独展示。
+- 项目连续回顾：选择项目后聚合最近 3 场已完成会议的决策、行动项和遗留问题；每项标明来源会议，行动项可人工设置为待确认、进行中、已完成或已取消。“未完成”只统计待确认和进行中。
 - 报告：①会议总览；②会议要点；③决策清单（内容、决策人、逐字引文、时间戳）；④行动项（任务、负责人、截止时间）；⑤遗留问题（内容、逐字引文、时间戳）；⑥发言统计占位“说话人识别将于下一版本支持”。点击决策或遗留问题的时间戳可展开前后转写上下文。本版本不生成任何说话人统计数字。
 
 旧的个人表现模型仍在 `models.py` 中标记为 legacy，以保留已有代码契约与测试；团队 UI 不呈现个人评分、口头禅或个人表现模块。
@@ -48,6 +49,8 @@ meeting-review/
 浏览器单页
   |-- GET /api/auth/check（团队口令）
   |-- GET/POST/PATCH /api/projects（团队文件夹）
+  |-- GET /api/projects/{id}/memory（最近 3 场连续回顾）
+  |-- PATCH /api/action-items/{id}（人工更新状态）
   |-- POST /api/review（标题 + 音频）
   |-- GET /api/tasks/{id}（仅处理中/短期任务）
   `-- GET /api/meetings[/{id}]（当前团队历史）
@@ -109,6 +112,7 @@ curl http://127.0.0.1:8000/health
 - `GET /health`：免鉴权健康检查。
 - `GET /api/auth/check`：校验团队口令并返回团队 ID，错误为 403。
 - `GET /api/projects`：列出当前团队项目文件夹及会议数量。
+- `GET /api/projects/{id}/memory`：聚合当前团队当前项目最近 3 场已完成会议的决策、行动项和遗留问题；包含来源会议。
 - `POST /api/projects`：创建项目文件夹，可传 `parent_id` 创建第二级；第三层会被拒绝。`PATCH /api/projects/{id}` 修改名称。
 - `DELETE /api/projects/{id}`：默认把会议移入未分类；显式传入 `delete_meetings=true` 才连同终态会议、转写稿和报告删除。
 - `POST /api/review`：multipart 字段 `file`、可选 `title` 和可选 `project_id`，成功返回 HTTP 202 与任务 ID；新版页面要求先选文件夹，API 保留未分类兼容能力。
@@ -116,6 +120,7 @@ curl http://127.0.0.1:8000/health
 - `GET /api/meetings`：当前团队会议列表，可用 `project_id` 或 `unclassified=true` 过滤；一级目录查询可传 `include_children=true` 汇总二级目录。
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
 - `PATCH /api/meetings/{id}/project`：经用户确认后移动到当前团队的另一文件夹，保留转写稿和报告。
+- `PATCH /api/action-items/{id}`：把行动项状态更新为待确认、进行中、已完成或已取消；跨团队访问返回 403。
 
 业务 API 都要带 `X-Access-Token`。每个响应包含 `X-Request-ID`。只有 `POST /api/review` 计入限频和每日名额；健康检查、鉴权检查、任务轮询和历史查询不计数。门禁顺序为：鉴权 → 限频 → 每日上限 → 队列上限 → 至少 1 GB 空闲磁盘 → 保存文件 → 入队，拒绝时不会留下上传文件。
 

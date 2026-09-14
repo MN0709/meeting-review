@@ -176,3 +176,44 @@ class MeetingMoveRequest(StrictModel):
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
     transcript: List[TranscriptSegment]
+
+
+ActionStatus = Literal["待确认", "进行中", "已完成", "已取消"]
+
+
+class ActionItemStatusUpdate(StrictModel):
+    status: ActionStatus
+
+
+class ActionItemStatusResult(StrictModel):
+    id: int
+    status: ActionStatus
+
+
+class MeetingSource(StrictModel):
+    id: str
+    title: str
+    created_at: str
+
+
+class ProjectMemoryDecision(DecisionItem):
+    source: MeetingSource
+
+
+class ProjectMemoryAction(ActionItem):
+    id: int
+    status: ActionStatus
+    source: MeetingSource
+
+
+class ProjectMemoryIssue(UnresolvedIssue):
+    source: MeetingSource
+
+
+class ProjectMemory(StrictModel):
+    project_id: str
+    project_name: str
+    recent_meetings: List[MeetingListItem]
+    decisions: List[ProjectMemoryDecision]
+    action_items: List[ProjectMemoryAction]
+    unresolved_issues: List[ProjectMemoryIssue]
