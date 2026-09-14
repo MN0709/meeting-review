@@ -638,6 +638,8 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "说话人识别将于下一版本支持" not in html  # comes from the API contract
     assert "setTimeout(resolve,ms)" in html
     assert "meeting-review-task-id" in html
+    assert "meeting-review-project-id" in html
+    assert "meeting-review-history-scope" in html
     assert "/api/tasks/" in html
     assert "await sleep(2000)" in html
     assert "最大 300 MB、60 分钟" in html
@@ -671,6 +673,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "saveProjectName" in html
     assert "当前：${project.name}" in html
     assert "include_children=true" in html
+    assert "还没有项目，点击上方“＋”创建第一个项目" in html
+    assert "还没有会议。先选择项目并上传一段录音" in html
+    assert "没有未分类会议" in html
+    assert "localStorage.setItem(PROJECT_STORAGE_KEY" in html
+    assert "localStorage.setItem(HISTORY_SCOPE_STORAGE_KEY" in html
     assert "（含子文件夹）" not in html
     assert "projectFilter" not in html
     assert "/project`" in html
