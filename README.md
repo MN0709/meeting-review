@@ -2,7 +2,7 @@
 
 > 当前 10 天产品化迭代的状态、风险和每日验收入口见 [PROJECT_CONTROL.md](PROJECT_CONTROL.md)，详细路线见 [docs/ROADMAP_10_DAYS.md](docs/ROADMAP_10_DAYS.md)。
 
-`meeting-review` 面向需要沉淀连续内部会议的团队，不限定团队职能或参会人数，同一系列不同会议可以有不同参会者。团队上传 MP3、M4A 或 WAV 录音，服务在本机完成带时间戳转写，再生成会议总览、会议要点、带原话证据的决策与遗留问题，以及结构化行动项。转写稿、报告与会议元数据按团队隔离并长期保存在 SQLite；原始音频在转写完成或处理失败后删除。
+`meeting-review` 面向需要沉淀连续内部会议的团队，不限定团队职能、固定成员或参会人数。服务在本机完成转写、说话人分离与声纹匹配，再生成带原话证据的团队报告。用户首次把“说话人 1”确认为真实姓名并授权保存声纹后，后续会议会自动尝试识别；低置信度或多个候选过于接近时必须回退为“待确认”。
 
 页面使用团队口令登录。口令保存在浏览器 `localStorage`，全部业务请求通过 `X-Access-Token` 发送，不使用 Cookie。上传后页面每 2 秒查询任务状态；会议完成后也可从团队历史页重新打开报告。
 
@@ -15,8 +15,10 @@
 - 删除项目时必须选择：保留会议并移入“未分类”，或连同会议、转写稿和报告一起删除。永久删除前会二次警告且不可恢复；含处理中会议的项目禁止连带删除。
 - 处理进度：排队中、转写中、AI 分析中、完成或失败；超过 30 分钟的已知音频会提示用户可以关闭页面，完成后从历史记录查看。
 - 会议历史：“全部会议”页按时间列出团队历史；项目详情页只列出该项目的会议。数据库保留的旧二级数据会自动归并到所属项目，不单独展示。
-- 项目连续回顾：选择项目后聚合最近 3 场已完成会议的决策、行动项和遗留问题；每项标明来源会议，行动项可人工设置为待确认、进行中、已完成或已取消。“未完成”只统计待确认和进行中。
-- 报告：①会议总览；②会议要点；③决策清单（内容、决策人、逐字引文、时间戳）；④行动项（任务、负责人、截止时间）；⑤遗留问题（内容、逐字引文、时间戳）；⑥发言统计占位“说话人识别将于下一版本支持”。点击决策或遗留问题的时间戳可展开前后转写上下文。本版本不生成任何说话人统计数字。
+- 项目连续回顾：选择项目后聚合最近 3 场已完成会议的决策、行动项和遗留问题；每项标明来源会议，行动项可人工设置状态。
+- 说话人确认：报告中展示本场说话人、发言片段、时长、自动匹配置信度和状态。用户可保存本场名称，或在勾选“已取得参会者同意”后把声纹保存到团队身份库。
+- 团队声纹身份库：身份跨项目共享；姓名、角色和“关键决策人”由用户维护，声纹可单独删除。
+- 报告：①会议总览；②会议要点；③决策清单；④行动项；⑤遗留问题；⑥说话人确认；⑦识别状态。点击引文时间戳可展开带说话人标签的转写上下文。
 
 旧的个人表现模型仍在 `models.py` 中标记为 legacy，以保留已有代码契约与测试；团队 UI 不呈现个人评分、口头禅或个人表现模块。
 
@@ -32,6 +34,7 @@ meeting-review/
 │   ├── models.py          # 团队报告、任务与 legacy 数据契约
 │   ├── pipeline.py        # 团队与 legacy 报告编排
 │   ├── security.py        # IP 小时限频与上海自然日额度
+│   ├── speaker.py         # WeSpeaker 分离、embedding 和安全身份匹配
 │   ├── stats.py           # legacy 个人精确统计
 │   ├── tasks.py           # 单 worker FIFO 队列、超时与清理
 │   └── transcription.py   # PyAV 预检和 faster-whisper 转写
@@ -54,7 +57,9 @@ meeting-review/
   |-- PATCH /api/action-items/{id}（人工更新状态）
   |-- POST /api/review（标题 + 音频）
   |-- GET /api/tasks/{id}（仅处理中/短期任务）
-  `-- GET /api/meetings[/{id}]（当前团队历史）
+  |-- GET /api/meetings[/{id}]（当前团队历史）
+  |-- POST /api/meetings/{id}/speakers/{label}/confirm
+  `-- GET/PATCH /api/members + DELETE /api/members/{id}/voiceprint
                          |
 鉴权 -> IP 限频 -> 每日上限 -> 队列上限 -> 磁盘检查
                          |
@@ -63,7 +68,10 @@ meeting-review/
                    FIFO 单 worker
                          |
               faster-whisper 带时间戳转写
-                         |-- 立即删除原始音频
+                         |
+              WeSpeaker 本地说话人分离
+              团队声纹匹配（阈值 + 候选差值）
+                         |-- 然后删除原始音频
                          |-- segments 写入 SQLite
                          `-- 代码层二次时长检查
                                   |
@@ -80,6 +88,7 @@ meeting-review/
 - **FastAPI + Pydantic**：接口与模型共享严格契约。
 - **SQLite**：MVP 单机部署无需额外服务，会议、转写和报告可跨重启保留；所有资源查询都带 `team_id`。
 - **PyAV + faster-whisper**：先读容器元数据秒拒超长音频，再在本机完成中文转写；转写后的真实时长仍会二次校验。
+- **WeSpeaker**：选用 Apache-2.0 官方项目的中文模型，在本地完成说话人分离和 embedding 提取；只在阈值与区分度同时达标时自动识别。
 - **OpenAI 兼容协议**：Key、Base URL、模型名全部由环境变量提供；不支持 JSON Schema 时降级 JSON Object 并注入字段契约。
 - **严格证据校验**：决策和遗留问题的引文必须是某个原始 segment 的完整子串，时间戳须在该 segment 范围内（允许 5 秒容差），失败会触发修复重试。
 - **单进程 FIFO**：同一时刻只处理一个音频，避免本地 Whisper 在小服务器上并发挤爆内存。
@@ -122,6 +131,10 @@ curl http://127.0.0.1:8000/health
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
 - `PATCH /api/meetings/{id}/project`：经用户确认后移动到当前团队的另一文件夹，保留转写稿和报告。
 - `PATCH /api/action-items/{id}`：把行动项状态更新为待确认、进行中、已完成或已取消；跨团队访问返回 403。
+- `POST /api/meetings/{id}/speakers/{label}/confirm`：确认本场说话人；`remember_voice=true` 时必须同时传 `consent_confirmed=true`。
+- `GET /api/members`：列出当前团队身份库；`PATCH /api/members/{id}` 修改姓名、角色和关键决策人标记。
+- `DELETE /api/members/{id}/voiceprint`：只删除该成员声纹，保留姓名与历史会议。
+- `POST /api/members/{id}/merge`：把重复身份合并进同团队的目标成员，并同步明确匹配的历史责任人名称。
 
 业务 API 都要带 `X-Access-Token`。每个响应包含 `X-Request-ID`。只有 `POST /api/review` 计入限频和每日名额；健康检查、鉴权检查、任务轮询和历史查询不计数。门禁顺序为：鉴权 → 限频 → 每日上限 → 队列上限 → 至少 1 GB 空闲磁盘 → 保存文件 → 入队，拒绝时不会留下上传文件。
 
@@ -136,6 +149,10 @@ curl http://127.0.0.1:8000/health
 | `WHISPER_MODEL` | 否 | `small` | faster-whisper 模型或本地路径；4 GB 内存服务器建议 `base` |
 | `WHISPER_DEVICE` | 否 | `cpu` | `cpu` / `cuda` |
 | `WHISPER_COMPUTE_TYPE` | 否 | `int8` | CPU 常用 `int8`，CUDA 可选 `float16` |
+| `SPEAKER_RECOGNITION_ENABLED` | 否 | `true` | 是否执行本地说话人分离与声纹匹配 |
+| `SPEAKER_MODEL` | 否 | `chinese` | WeSpeaker 中文模型名或本地模型目录 |
+| `SPEAKER_MATCH_THRESHOLD` | 否 | `0.72` | 自动身份匹配的最低置信度，需真实录音校准 |
+| `SPEAKER_MATCH_MARGIN` | 否 | `0.05` | 第一与第二候选的最小分差，防止相似声音误认 |
 | `DATABASE_PATH` | 否 | `data/meeting-review.db` | SQLite 路径；Compose 使用 `/data/meeting-review.db` |
 | `MAX_UPLOAD_MB` | 否 | `300` | 上传大小上限（MB） |
 | `MAX_AUDIO_MINUTES` | 否 | `60` | PyAV 与转写后双重时长上限 |
@@ -180,10 +197,11 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ## 隐私与已知限制
 
-- 音频转写完成后即删除；转写失败、分析失败、超时和优雅停机也会清理临时音频。文件以任务 ID 随机命名，原文件名不落盘。
+- 音频在转写和本地声纹特征提取完成后即删除；转写失败、分析失败、超时和优雅停机也会清理临时音频。文件以任务 ID 随机命名，原文件名不落盘。
+- 经用户确认和授权的声纹 embedding 仅保存在本服务器 SQLite，按团队隔离，可在“团队声纹身份库”单独删除。未确认的本场候选特征会随会议数据保存，用于原音频删除后仍能完成人工确认；删除会议时一并删除。
 - 转写文本与报告仅保存在本服务器 SQLite，按团队隔离，不会用于其他用途；分析时文本会发送给运营方配置的 AI 服务，其数据政策取决于服务商。
 - 日志不记录原文件名、转写文本、模型引文、团队口令或 API Key，仅保留请求 ID、任务 ID、阶段、错误类型和 Token 用量。
-- 本轮 `speaker_label` 存 `NULL`，不做说话人识别或发言统计；“与上次会议待办衔接”待说话人分离上线后再做。
+- 声纹阈值 `0.72/0.05` 是安全初值，不是已校准的准确率承诺；设备、距离、噪声、重叠说话和太短片段都会影响识别，上线前必须用同人跨会议真实录音校准。
 - 参会人数没有人为上限，但更多人、重叠发言、远场收音和噪声会降低转写与责任人判断质量；上线前需用不同人数的真实录音验证，不能把“人数不限”理解为准确率不受影响。
 - Whisper 噪声会传导到要点、行动项和引用，例如专有名词识别错误；后续方向是术语词表注入与可追溯纠错 pass。
 - 团队口令适合固定小团队 MVP，不等价于完整账号、成员权限和口令自助轮换体系。
@@ -204,6 +222,8 @@ docker compose config
 ```
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏。LLM 每次调用会记录 `stage/model/prompt_tokens/completion_tokens/total_tokens`，后续用真实会议填写成本：
+
+声纹真实录音验收按 [docs/VOICEPRINT_TEST_SCRIPT.md](docs/VOICEPRINT_TEST_SCRIPT.md) 录制两场会议：第一场确认身份，第二场验证同人自动识别和新人待确认。
 
 | 场景 | 输入 Token | 输出 Token | 单次成本 |
 |---|---:|---:|---:|

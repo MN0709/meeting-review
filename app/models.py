@@ -11,6 +11,7 @@ class TranscriptSegment(StrictModel):
     start: float = Field(ge=0)
     end: float = Field(ge=0)
     text: str
+    speaker_label: Optional[str] = None
 
 
 class Transcript(StrictModel):
@@ -101,7 +102,7 @@ class TeamMeetingReport(StrictModel):
     decisions: List[DecisionItem]
     action_items: List[ActionItem]
     unresolved_issues: List[UnresolvedIssue]
-    speaker_stats_note: Literal["说话人识别将于下一版本支持"] = "说话人识别将于下一版本支持"
+    speaker_stats_note: str = "说话人识别未启用"
 
 
 class TeamChunkSummary(StrictModel):
@@ -111,7 +112,7 @@ class TeamChunkSummary(StrictModel):
     unresolved_issues: List[UnresolvedIssue]
 
 
-TaskStage = Literal["排队中", "上传完成", "转写中", "AI 分析中", "完成", "失败"]
+TaskStage = Literal["排队中", "上传完成", "转写中", "说话人识别中", "AI 分析中", "完成", "失败"]
 
 
 class TaskAccepted(StrictModel):
@@ -176,6 +177,60 @@ class MeetingMoveRequest(StrictModel):
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
     transcript: List[TranscriptSegment]
+    speakers: List["MeetingSpeaker"] = Field(default_factory=list)
+
+
+SpeakerIdentityStatus = Literal["待确认", "已识别", "已确认", "仅本场"]
+
+
+class MeetingSpeaker(StrictModel):
+    local_label: str
+    display_name: str
+    member_id: Optional[int] = None
+    confidence: Optional[float] = Field(default=None, ge=0, le=1)
+    status: SpeakerIdentityStatus
+    speech_seconds: float = Field(ge=0)
+    excerpts: List[str] = Field(default_factory=list)
+    has_voice_sample: bool = False
+
+
+class SpeakerConfirmRequest(StrictModel):
+    name: str = Field(min_length=1, max_length=50)
+    role: str = Field(default="", max_length=50)
+    is_key_decision_maker: bool = False
+    remember_voice: bool = True
+    consent_confirmed: bool = False
+
+
+class SpeakerConfirmResult(StrictModel):
+    member_id: int
+    display_name: str
+    voiceprint_saved: bool
+    reanalysis_recommended: bool
+
+
+class MemberIdentity(StrictModel):
+    id: int
+    name: str
+    role: str = ""
+    is_key_decision_maker: bool = False
+    has_voiceprint: bool = False
+    created_at: str
+
+
+class MemberUpdate(StrictModel):
+    name: str = Field(min_length=1, max_length=50)
+    role: str = Field(default="", max_length=50)
+    is_key_decision_maker: bool = False
+
+
+class MemberMergeRequest(StrictModel):
+    target_member_id: int = Field(gt=0)
+
+
+class MemberMergeResult(StrictModel):
+    target_member_id: int
+    merged_meetings: int = Field(ge=0)
 
 
 ActionStatus = Literal["待确认", "进行中", "已完成", "已取消"]

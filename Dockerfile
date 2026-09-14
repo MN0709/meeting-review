@@ -6,12 +6,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_HOST=0.0.0.0 \
     APP_PORT=8000 \
     HF_HOME=/models/huggingface \
+    WESPEAKER_HOME=/models/wespeaker \
     DATABASE_PATH=/data/meeting-review.db
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -21,12 +22,11 @@ COPY app ./app
 COPY static ./static
 COPY run.py ./run.py
 
-# faster-whisper 会在首次转写时下载模型。生产环境请把此目录挂载为持久卷，
-# 或将预下载的模型目录通过 WHISPER_MODEL 指向挂载路径。
+# faster-whisper 和 WeSpeaker 都会在首次使用时下载模型，模型目录必须挂载持久卷。
 RUN useradd --create-home --uid 10001 appuser \
-    && mkdir -p /models/huggingface /data \
-    && chown -R appuser:appuser /models/huggingface /data
-VOLUME ["/models/huggingface", "/data"]
+    && mkdir -p /models/huggingface /models/wespeaker /data \
+    && chown -R appuser:appuser /models/huggingface /models/wespeaker /data
+VOLUME ["/models/huggingface", "/models/wespeaker", "/data"]
 
 USER appuser
 

@@ -26,6 +26,10 @@ from app.db import Database
 from app.models import ChunkSummary, ReviewReport, SemanticAnalysis, TaskAccepted, TeamMeetingReport, Transcript, TranscriptSegment
 from app.pipeline import build_report
 from app.security import AdmissionController, AdmissionError, SHANGHAI_TZ
+from app.speaker import (
+    KnownVoiceProfile, SpeakerObservation, SpeakerRecognitionResult, SpeakerRecognizer,
+    best_profile_match,
+)
 from app.stats import compute_speech_stats
 from app.tasks import InMemoryTaskManager
 from app.transcription import probe_audio_duration
@@ -45,6 +49,9 @@ def reset_admission_controller(monkeypatch, tmp_path):
     test_database = Database(tmp_path / "meeting-review.db")
     test_database.initialize(main_module.settings.parsed_team_tokens())
     monkeypatch.setattr(main_module, "database", test_database)
+    # Unit tests use deterministic speaker doubles where recognition matters;
+    # never download or load the real model during unrelated endpoint tests.
+    monkeypatch.setattr(main_module.speaker_recognizer, "enabled", False)
     main_module.task_manager.records.clear()
     main_module.task_manager._queue.clear()
 
@@ -221,6 +228,10 @@ def test_team_long_meeting_defaults() -> None:
     assert settings.rate_limit_per_hour == 10
     assert settings.daily_task_limit == 30
     assert settings.queue_max == 5
+    assert settings.speaker_recognition_enabled is True
+    assert settings.speaker_model == "chinese"
+    assert settings.speaker_match_threshold == 0.72
+    assert settings.speaker_match_margin == 0.05
 
 
 def test_duration_probe_reads_metadata_without_decoding(monkeypatch, tmp_path) -> None:
@@ -687,6 +698,10 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "POLL_LIMIT_MS=15*60*1000" in html
     assert "处理时间较长，请稍后刷新重试" in html
     assert "音频转写完成后即删除" in html
+    assert "确认并记住此声音" in html
+    assert "/speakers/" in html
+    assert "/voiceprint" in html
+    assert "innerHTML" not in html
     assert "请输入你的团队口令" in html
     assert "location.protocol==='file:'" in html
     assert "打开正确服务地址" in html
@@ -1651,3 +1666,193 @@ def test_project_memory_and_action_status_are_isolated_by_team() -> None:
             f"/api/action-items/{action_id}", headers=other_headers,
             json={"status": "已完成"},
         ).status_code == 200
+
+
+def test_voice_match_requires_threshold_and_clear_margin() -> None:
+    ning = KnownVoiceProfile(member_id=1, name="宁总", embedding=[1.0, 0.0])
+    li = KnownVoiceProfile(member_id=2, name="李总", embedding=[0.0, 1.0])
+
+    match, confidence = best_profile_match([0.99, 0.01], [ning, li], 0.72, 0.05)
+    assert match == ning
+    assert confidence is not None and confidence > 0.99
+
+    ambiguous, _ = best_profile_match([1.0, 1.0], [ning, li], 0.72, 0.05)
+    assert ambiguous is None
+    rejected, _ = best_profile_match([-1.0, 0.0], [ning], 0.72, 0.05)
+    assert rejected is None
+
+
+def test_unknown_speaker_model_falls_back_without_stopping_service(monkeypatch, tmp_path) -> None:
+    recognizer = SpeakerRecognizer(Settings(_env_file=None))
+    monkeypatch.setattr(recognizer, "_load_model", lambda: (_ for _ in ()).throw(SystemExit(1)))
+    transcript = Transcript(
+        duration_seconds=3,
+        segments=[TranscriptSegment(start=0, end=3, text="测试发言")],
+    )
+
+    result = recognizer.process(tmp_path / "missing.wav", transcript)
+
+    assert result.available is False
+    assert result.transcript == transcript
+    assert "声纹模型不可用" in result.message
+
+
+def test_speaker_recognition_runs_before_audio_deletion_and_persists_labels(monkeypatch, tmp_path) -> None:
+    team_id = main_module.database.authenticate("test-access-token")
+    meeting_id = "speaker-processing-meeting"
+    audio_path = tmp_path / f"{meeting_id}.wav"
+    audio_path.write_bytes(b"private audio")
+    main_module.database.create_meeting(meeting_id, team_id, "多人会议", audio_path)
+    raw = Transcript(
+        duration_seconds=8,
+        segments=[TranscriptSegment(start=0, end=4, text="我同意今天上线")],
+    )
+    labeled = raw.model_copy(update={
+        "segments": [raw.segments[0].model_copy(update={"speaker_label": "说话人 1"})]
+    })
+    monkeypatch.setattr(main_module.transcriber, "transcribe", lambda path: raw)
+
+    def fake_speaker(path, transcript, profiles):
+        assert path.exists(), "声纹特征必须在原始音频删除前提取"
+        assert transcript is raw
+        return SpeakerRecognitionResult(
+            transcript=labeled, analysis_transcript=labeled,
+            observations=[SpeakerObservation(
+                local_label="说话人 1", embedding=[1.0, 0.0], speech_seconds=4,
+                excerpts=["我同意今天上线"],
+            )],
+            available=True, message="已区分 1 位说话人",
+        )
+
+    monkeypatch.setattr(main_module.speaker_recognizer, "process", fake_speaker)
+
+    async def fake_report(received, analyzer):
+        assert received.segments[0].speaker_label == "说话人 1"
+        assert not audio_path.exists()
+        return team_report()
+
+    monkeypatch.setattr(main_module, "build_team_report", fake_report)
+    result = asyncio.run(main_module._process_audio(audio_path, lambda status, message: True))
+
+    assert result.speaker_stats_note == "已区分 1 位说话人"
+    assert not audio_path.exists()
+    history = main_module.database.get_history(meeting_id, team_id)
+    assert history is not None
+    assert history.transcript[0].speaker_label == "说话人 1"
+    assert history.speakers[0].status == "待确认"
+    assert history.speakers[0].has_voice_sample is True
+
+
+def test_confirm_voice_once_enables_team_profile_and_enforces_consent_and_isolation() -> None:
+    team_id = main_module.database.authenticate("test-access-token")
+    meeting_id = "voice-confirm-meeting"
+    main_module.database.create_meeting(
+        meeting_id, team_id, "声纹确认", Path("/tmp/voice-confirm.wav")
+    )
+    transcript = Transcript(
+        duration_seconds=6,
+        segments=[TranscriptSegment(
+            start=0, end=6, text="我来做最终决策", speaker_label="说话人 1",
+        )],
+    )
+    main_module.database.save_transcript(meeting_id, team_id, transcript)
+    main_module.database.save_meeting_speakers(meeting_id, team_id, [SpeakerObservation(
+        local_label="说话人 1", embedding=[0.8, 0.2], speech_seconds=6,
+        excerpts=["我来做最终决策"],
+    )])
+    payload = team_report().model_dump()
+    payload["decisions"][0]["decision_maker"] = "说话人 1"
+    payload["action_items"][0]["owner"] = "说话人 1"
+    main_module.database.save_report(
+        meeting_id, team_id, TeamMeetingReport.model_validate(payload)
+    )
+
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        no_consent = client.post(
+            f"/api/meetings/{meeting_id}/speakers/%E8%AF%B4%E8%AF%9D%E4%BA%BA%201/confirm",
+            json={"name": "宁总", "remember_voice": True, "consent_confirmed": False},
+        )
+        assert no_consent.status_code == 422
+
+        confirmed = client.post(
+            f"/api/meetings/{meeting_id}/speakers/%E8%AF%B4%E8%AF%9D%E4%BA%BA%201/confirm",
+            json={
+                "name": "宁总", "role": "老板", "is_key_decision_maker": True,
+                "remember_voice": True, "consent_confirmed": True,
+            },
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json()["voiceprint_saved"] is True
+        assert confirmed.json()["reanalysis_recommended"] is True
+
+        history = client.get(f"/api/meetings/{meeting_id}").json()
+        assert history["speakers"][0]["display_name"] == "宁总"
+        assert history["speakers"][0]["status"] == "已确认"
+        assert history["report"]["decisions"][0]["decision_maker"] == "宁总"
+        members = client.get("/api/members").json()
+        assert members[0]["name"] == "宁总"
+        assert members[0]["is_key_decision_maker"] is True
+        assert members[0]["has_voiceprint"] is True
+        profile = main_module.database.voice_profiles(team_id)[0]
+        assert profile["embedding"] == [0.8, 0.2]
+        future_match, _ = best_profile_match(
+            [0.81, 0.19], [KnownVoiceProfile(**profile)], 0.72, 0.05
+        )
+        assert future_match is not None and future_match.name == "宁总"
+
+        other = client.post(
+            f"/api/meetings/{meeting_id}/speakers/%E8%AF%B4%E8%AF%9D%E4%BA%BA%201/confirm",
+            headers={"X-Access-Token": "other-team-token"},
+            json={"name": "其他人", "remember_voice": False},
+        )
+        assert other.status_code == 403
+
+        deleted = client.delete(f"/api/members/{members[0]['id']}/voiceprint")
+        assert deleted.status_code == 200
+        assert client.get("/api/members").json()[0]["has_voiceprint"] is False
+
+
+def test_duplicate_speaker_identities_can_be_merged_within_team() -> None:
+    team_id = main_module.database.authenticate("test-access-token")
+    meeting_id = "voice-merge-meeting"
+    main_module.database.create_meeting(
+        meeting_id, team_id, "身份合并", Path("/tmp/voice-merge.wav")
+    )
+    main_module.database.save_transcript(meeting_id, team_id, Transcript(
+        duration_seconds=8,
+        segments=[
+            TranscriptSegment(start=0, end=4, text="第一段", speaker_label="说话人 1"),
+            TranscriptSegment(start=4, end=8, text="第二段", speaker_label="说话人 2"),
+        ],
+    ))
+    main_module.database.save_meeting_speakers(meeting_id, team_id, [
+        SpeakerObservation("说话人 1", [1.0, 0.0], 4, ["第一段"]),
+        SpeakerObservation("说话人 2", [0.9, 0.1], 4, ["第二段"]),
+    ])
+    main_module.database.save_report(meeting_id, team_id, team_report())
+
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        ids = []
+        for label, name in (("说话人 1", "宁总"), ("说话人 2", "宁老师")):
+            response = client.post(
+                f"/api/meetings/{meeting_id}/speakers/{label.replace(' ', '%20')}/confirm",
+                json={"name": name, "remember_voice": False},
+            )
+            assert response.status_code == 200
+            ids.append(response.json()["member_id"])
+
+        merged = client.post(
+            f"/api/members/{ids[1]}/merge", json={"target_member_id": ids[0]}
+        )
+        assert merged.status_code == 200
+        assert merged.json()["merged_meetings"] == 1
+        assert [item["name"] for item in client.get("/api/members").json()] == ["宁总"]
+        speakers = client.get(f"/api/meetings/{meeting_id}").json()["speakers"]
+        assert [item["display_name"] for item in speakers] == ["宁总", "宁总"]
+
+        other_team_attempt = client.post(
+            f"/api/members/{ids[0]}/merge",
+            headers={"X-Access-Token": "other-team-token"},
+            json={"target_member_id": ids[0]},
+        )
+        assert other_team_attempt.status_code == 403

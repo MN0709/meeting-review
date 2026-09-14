@@ -18,14 +18,16 @@ from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenEr
 from app.llm import AnalysisError, LLMAnalyzer
 from app.models import (
     ActionItemStatusResult, ActionItemStatusUpdate, MeetingHistory, MeetingListItem,
-    MeetingMoveRequest, ProjectCreate, ProjectDeleteResult, ProjectListItem, ProjectMemory,
-    ProjectRename,
+    MeetingMoveRequest, MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
+    ProjectCreate, ProjectDeleteResult,
+    ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
 from app.security import AdmissionController, AdmissionError, AdmissionReservation
 from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
 from app.transcription import WhisperTranscriber, probe_audio_duration
+from app.speaker import KnownVoiceProfile, SpeakerRecognizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ settings = get_settings()
 database = Database(settings.database_path)
 transcriber = WhisperTranscriber(settings)
 analyzer = LLMAnalyzer(settings)
+speaker_recognizer = SpeakerRecognizer(settings)
 admission = AdmissionController(settings.rate_limit_per_hour, settings.daily_task_limit)
 
 
@@ -56,24 +59,42 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
     team_id = database.owner_team_id(path.stem)
     if not progress("转写中", "正在转写，长会议可能需要较长时间…"):
         raise TaskAborted()
+    speaker_result = None
     try:
         transcript = await run_in_threadpool(transcriber.transcribe, path)
+        duration = transcript.duration_seconds
+        if not math.isfinite(duration) or duration > settings.max_audio_minutes * 60:
+            raise TaskProcessingError(
+                422, f"当前版本支持 {settings.max_audio_minutes:g} 分钟以内的录音"
+            )
+        if not transcript.segments:
+            raise TaskProcessingError(422, "未检测到可转写的语音")
+        if not progress("说话人识别中", "转写完成，正在区分说话人并匹配已记住的声音…"):
+            raise TaskAborted()
+        profiles = [
+            KnownVoiceProfile(**item)
+            for item in database.voice_profiles(team_id, settings.speaker_model)
+        ] if team_id else []
+        speaker_result = await run_in_threadpool(
+            speaker_recognizer.process, path, transcript, profiles
+        )
     finally:
         path.unlink(missing_ok=True)
         if team_id:
             database.clear_audio_path(path.stem, team_id)
 
-    duration = transcript.duration_seconds
-    if not math.isfinite(duration) or duration > settings.max_audio_minutes * 60:
-        raise TaskProcessingError(422, f"当前版本支持 {settings.max_audio_minutes:g} 分钟以内的录音")
-    if not transcript.segments:
-        raise TaskProcessingError(422, "未检测到可转写的语音")
+    persisted_transcript = speaker_result.transcript if speaker_result else transcript
+    analysis_transcript = speaker_result.analysis_transcript if speaker_result else transcript
     if team_id:
-        database.save_transcript(path.stem, team_id, transcript)
+        database.save_transcript(path.stem, team_id, persisted_transcript)
+        if speaker_result:
+            database.save_meeting_speakers(path.stem, team_id, speaker_result.observations)
     if not progress("AI 分析中", "转写完成，正在进行 AI 分析…"):
         raise TaskAborted()
     try:
-        report = await build_team_report(transcript, analyzer)
+        report = await build_team_report(analysis_transcript, analyzer)
+        if speaker_result and speaker_result.available:
+            report = report.model_copy(update={"speaker_stats_note": speaker_result.message})
         if team_id:
             database.save_report(path.stem, team_id, report)
         return report
@@ -380,6 +401,101 @@ async def meeting_history(request: Request, meeting_id: str) -> MeetingHistory:
     if history is None:
         raise HTTPException(status_code=404, detail="历史报告不存在或尚未生成")
     return history
+
+
+@app.get("/api/members", response_model=list[MemberIdentity])
+async def member_list(request: Request) -> list[MemberIdentity]:
+    return database.list_members(request.state.team_id)
+
+
+@app.patch("/api/members/{member_id}", response_model=MemberIdentity)
+async def member_update(
+    request: Request, member_id: int, payload: MemberUpdate = Body(...),
+) -> MemberIdentity:
+    owner = database.member_owner_team_id(member_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="成员不存在")
+    if owner != request.state.team_id:
+        raise HTTPException(status_code=403, detail="无权修改其他团队的成员")
+    updated = database.update_member(
+        member_id, request.state.team_id, payload.name.strip(), payload.role.strip(),
+        payload.is_key_decision_maker,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="成员不存在")
+    return updated
+
+
+@app.delete("/api/members/{member_id}/voiceprint")
+async def voiceprint_delete(request: Request, member_id: int) -> dict:
+    owner = database.member_owner_team_id(member_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="成员不存在")
+    if owner != request.state.team_id:
+        raise HTTPException(status_code=403, detail="无权删除其他团队的声纹")
+    if not database.delete_voiceprint(member_id, request.state.team_id):
+        raise HTTPException(status_code=404, detail="该成员尚未保存声纹")
+    return {"status": "ok"}
+
+
+@app.post("/api/members/{member_id}/merge", response_model=MemberMergeResult)
+async def member_merge(
+    request: Request, member_id: int, payload: MemberMergeRequest = Body(...),
+) -> MemberMergeResult:
+    for candidate in (member_id, payload.target_member_id):
+        owner = database.member_owner_team_id(candidate)
+        if owner is None:
+            raise HTTPException(status_code=404, detail="成员不存在")
+        if owner != request.state.team_id:
+            raise HTTPException(status_code=403, detail="无权合并其他团队的身份")
+    try:
+        affected = database.merge_members(
+            member_id, payload.target_member_id, request.state.team_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="不能将身份合并到自己") from exc
+    if affected is None:
+        raise HTTPException(status_code=404, detail="成员不存在")
+    return MemberMergeResult(
+        target_member_id=payload.target_member_id, merged_meetings=affected,
+    )
+
+
+@app.post(
+    "/api/meetings/{meeting_id}/speakers/{local_label}/confirm",
+    response_model=SpeakerConfirmResult,
+)
+async def speaker_confirm(
+    request: Request, meeting_id: str, local_label: str,
+    payload: SpeakerConfirmRequest = Body(...),
+) -> SpeakerConfirmResult:
+    _assert_team_owns_meeting(meeting_id, request.state.team_id)
+    if payload.remember_voice and not payload.consent_confirmed:
+        raise HTTPException(
+            status_code=422,
+            detail="记住他人声音前，请确认已取得该参会者同意",
+        )
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="说话人名称不能为空")
+    try:
+        result = database.confirm_meeting_speaker(
+            meeting_id, request.state.team_id, local_label, name, payload.role.strip(),
+            payload.is_key_decision_maker, payload.remember_voice, settings.speaker_model,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail="本场没有可用的声音样本，只能保存本场名称",
+        ) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="待确认说话人不存在")
+    member_id, saved, affected = result
+    if payload.remember_voice and not saved:
+        raise HTTPException(status_code=422, detail="本场没有可用的声音样本，只能保存本场名称")
+    return SpeakerConfirmResult(
+        member_id=member_id, display_name=name, voiceprint_saved=saved,
+        reanalysis_recommended=affected,
+    )
 
 
 @app.patch("/api/meetings/{meeting_id}/project", response_model=MeetingListItem)

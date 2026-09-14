@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 from app.models import (
-    ActionStatus, MeetingHistory, MeetingListItem, MeetingSource, ProjectListItem,
+    ActionStatus, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
+    MemberIdentity, ProjectListItem,
     ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
     TeamMeetingReport, Transcript, TranscriptSegment,
 )
@@ -70,7 +71,18 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     team_id INTEGER NOT NULL REFERENCES teams(id),
                     name TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT '',
+                    is_key_decision_maker INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS speaker_profiles(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL REFERENCES teams(id),
+                    member_id INTEGER NOT NULL UNIQUE REFERENCES members(id) ON DELETE CASCADE,
+                    embedding_json TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    consented_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS projects(
                     id TEXT PRIMARY KEY,
@@ -98,6 +110,21 @@ class Database:
                     speaker_label TEXT,
                     text TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS meeting_speakers(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    team_id INTEGER NOT NULL REFERENCES teams(id),
+                    local_label TEXT NOT NULL,
+                    member_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+                    confidence REAL,
+                    status TEXT NOT NULL CHECK(status IN ('待确认','已识别','已确认','仅本场')),
+                    embedding_json TEXT,
+                    speech_seconds REAL NOT NULL DEFAULT 0,
+                    excerpts_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(meeting_id, local_label)
+                );
                 CREATE TABLE IF NOT EXISTS reports(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     meeting_id TEXT NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE,
@@ -122,6 +149,10 @@ class Database:
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
             self._ensure_column(connection, "projects", "parent_id", "TEXT REFERENCES projects(id)")
+            self._ensure_column(connection, "members", "role", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(
+                connection, "members", "is_key_decision_maker", "INTEGER NOT NULL DEFAULT 0"
+            )
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_projects_team_created
@@ -134,6 +165,10 @@ class Database:
                     ON meetings(team_id, project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_action_items_team_status
                     ON meeting_action_items(team_id, status, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_members_team_name ON members(team_id, name);
+                CREATE INDEX IF NOT EXISTS idx_speaker_profiles_team ON speaker_profiles(team_id);
+                CREATE INDEX IF NOT EXISTS idx_meeting_speakers_team_meeting
+                    ON meeting_speakers(team_id, meeting_id);
                 """
             )
             for name, token in team_tokens.items():
@@ -314,12 +349,248 @@ class Database:
             connection.execute("DELETE FROM transcripts WHERE meeting_id=?", (meeting_id,))
             connection.executemany(
                 "INSERT INTO transcripts(meeting_id,start,end,speaker_label,text) VALUES(?,?,?,?,?)",
-                [(meeting_id, segment.start, segment.end, None, segment.text) for segment in transcript.segments],
+                [
+                    (meeting_id, segment.start, segment.end, segment.speaker_label, segment.text)
+                    for segment in transcript.segments
+                ],
             )
             connection.execute(
                 "UPDATE meetings SET duration_seconds=? WHERE id=? AND team_id=?",
                 (transcript.duration_seconds, meeting_id, team_id),
             )
+
+    def voice_profiles(self, team_id: int, model_version: Optional[str] = None) -> list[dict]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT m.id AS member_id,m.name,p.embedding_json
+                   FROM speaker_profiles p JOIN members m ON m.id=p.member_id
+                   WHERE p.team_id=? AND m.team_id=?
+                     AND (? IS NULL OR p.model_version=?) ORDER BY m.id""",
+                (team_id, team_id, model_version, model_version),
+            ).fetchall()
+        return [
+            {
+                "member_id": int(row["member_id"]),
+                "name": row["name"],
+                "embedding": json.loads(row["embedding_json"]),
+            }
+            for row in rows
+        ]
+
+    def save_meeting_speakers(self, meeting_id: str, team_id: int, observations) -> None:
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id)
+            ).fetchone()
+            if not owned:
+                raise PermissionError("meeting does not belong to team")
+            connection.execute("DELETE FROM meeting_speakers WHERE meeting_id=?", (meeting_id,))
+            connection.executemany(
+                """INSERT INTO meeting_speakers(
+                       meeting_id,team_id,local_label,member_id,confidence,status,
+                       embedding_json,speech_seconds,excerpts_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (
+                        meeting_id, team_id, item.local_label, item.matched_member_id,
+                        item.confidence, "已识别" if item.matched_member_id else "待确认",
+                        json.dumps(item.embedding) if item.embedding is not None else None,
+                        item.speech_seconds, json.dumps(item.excerpts, ensure_ascii=False), now, now,
+                    )
+                    for item in observations
+                ],
+            )
+
+    def list_members(self, team_id: int) -> list[MemberIdentity]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT m.id,m.name,m.role,m.is_key_decision_maker,m.created_at,
+                          CASE WHEN p.id IS NULL THEN 0 ELSE 1 END AS has_voiceprint
+                   FROM members m LEFT JOIN speaker_profiles p ON p.member_id=m.id
+                   WHERE m.team_id=? ORDER BY m.name,m.id""",
+                (team_id,),
+            ).fetchall()
+        return [MemberIdentity(
+            id=row["id"], name=row["name"], role=row["role"],
+            is_key_decision_maker=bool(row["is_key_decision_maker"]),
+            has_voiceprint=bool(row["has_voiceprint"]), created_at=row["created_at"],
+        ) for row in rows]
+
+    def member_owner_team_id(self, member_id: int) -> Optional[int]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT team_id FROM members WHERE id=?", (member_id,)).fetchone()
+        return int(row["team_id"]) if row else None
+
+    def update_member(
+        self, member_id: int, team_id: int, name: str, role: str,
+        is_key_decision_maker: bool,
+    ) -> Optional[MemberIdentity]:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE members SET name=?,role=?,is_key_decision_maker=?
+                   WHERE id=? AND team_id=?""",
+                (name, role, int(is_key_decision_maker), member_id, team_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return next(item for item in self.list_members(team_id) if item.id == member_id)
+
+    def delete_voiceprint(self, member_id: int, team_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM speaker_profiles WHERE member_id=? AND team_id=?",
+                (member_id, team_id),
+            )
+        return cursor.rowcount == 1
+
+    def merge_members(self, source_id: int, target_id: int, team_id: int) -> Optional[int]:
+        if source_id == target_id:
+            raise ValueError("source and target must differ")
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id,name FROM members WHERE team_id=? AND id IN (?,?)",
+                (team_id, source_id, target_id),
+            ).fetchall()
+            members = {int(row["id"]): row["name"] for row in rows}
+            if source_id not in members or target_id not in members:
+                return None
+            source_profile = connection.execute(
+                "SELECT id FROM speaker_profiles WHERE member_id=?", (source_id,)
+            ).fetchone()
+            target_profile = connection.execute(
+                "SELECT id FROM speaker_profiles WHERE member_id=?", (target_id,)
+            ).fetchone()
+            if source_profile and not target_profile:
+                connection.execute(
+                    "UPDATE speaker_profiles SET member_id=?,team_id=?,updated_at=? WHERE member_id=?",
+                    (target_id, team_id, now, source_id),
+                )
+            elif source_profile:
+                connection.execute("DELETE FROM speaker_profiles WHERE member_id=?", (source_id,))
+            meeting_rows = connection.execute(
+                "SELECT DISTINCT meeting_id FROM meeting_speakers WHERE team_id=? AND member_id=?",
+                (team_id, source_id),
+            ).fetchall()
+            connection.execute(
+                "UPDATE meeting_speakers SET member_id=?,updated_at=? WHERE team_id=? AND member_id=?",
+                (target_id, now, team_id, source_id),
+            )
+            report_rows = connection.execute(
+                """SELECT r.meeting_id,r.json FROM reports r
+                   JOIN meetings m ON m.id=r.meeting_id WHERE m.team_id=?""",
+                (team_id,),
+            ).fetchall()
+            for row in report_rows:
+                payload = json.loads(row["json"])
+                changed = False
+                for item in payload.get("decisions", []):
+                    if item.get("decision_maker") == members[source_id]:
+                        item["decision_maker"] = members[target_id]
+                        changed = True
+                for item in payload.get("action_items", []):
+                    if item.get("owner") == members[source_id]:
+                        item["owner"] = members[target_id]
+                        changed = True
+                if changed:
+                    connection.execute(
+                        "UPDATE reports SET json=?,created_at=? WHERE meeting_id=?",
+                        (json.dumps(payload, ensure_ascii=False), now, row["meeting_id"]),
+                    )
+            connection.execute(
+                "UPDATE meeting_action_items SET owner=?,updated_at=? WHERE team_id=? AND owner=?",
+                (members[target_id], now, team_id, members[source_id]),
+            )
+            connection.execute("DELETE FROM members WHERE id=? AND team_id=?", (source_id, team_id))
+        return len(meeting_rows)
+
+    def meeting_speaker_owner_team_id(self, meeting_id: str, local_label: str) -> Optional[int]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT team_id FROM meeting_speakers WHERE meeting_id=? AND local_label=?",
+                (meeting_id, local_label),
+            ).fetchone()
+        return int(row["team_id"]) if row else None
+
+    def confirm_meeting_speaker(
+        self, meeting_id: str, team_id: int, local_label: str, name: str, role: str,
+        is_key_decision_maker: bool, remember_voice: bool, model_version: str,
+    ) -> Optional[tuple[int, bool, bool]]:
+        """Map a local label and optionally persist its embedding. Returns member, saved, affected."""
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            speaker = connection.execute(
+                """SELECT embedding_json FROM meeting_speakers
+                   WHERE meeting_id=? AND team_id=? AND local_label=?""",
+                (meeting_id, team_id, local_label),
+            ).fetchone()
+            if speaker is None:
+                return None
+            if remember_voice and not speaker["embedding_json"]:
+                raise ValueError("voice sample unavailable")
+            member = connection.execute(
+                "SELECT id FROM members WHERE team_id=? AND name=? ORDER BY id LIMIT 1",
+                (team_id, name),
+            ).fetchone()
+            if member:
+                member_id = int(member["id"])
+                connection.execute(
+                    """UPDATE members SET role=?,is_key_decision_maker=? WHERE id=? AND team_id=?""",
+                    (role, int(is_key_decision_maker), member_id, team_id),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO members(team_id,name,role,is_key_decision_maker,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (team_id, name, role, int(is_key_decision_maker), now),
+                )
+                member_id = int(cursor.lastrowid)
+            saved = bool(remember_voice and speaker["embedding_json"])
+            if saved:
+                connection.execute(
+                    """INSERT INTO speaker_profiles(
+                           team_id,member_id,embedding_json,model_version,consented_at,updated_at
+                       ) VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(member_id) DO UPDATE SET
+                           embedding_json=excluded.embedding_json,
+                           model_version=excluded.model_version,
+                           consented_at=excluded.consented_at,updated_at=excluded.updated_at""",
+                    (team_id, member_id, speaker["embedding_json"], model_version, now, now),
+                )
+            connection.execute(
+                """UPDATE meeting_speakers SET member_id=?,status=?,updated_at=?
+                   WHERE meeting_id=? AND team_id=? AND local_label=?""",
+                (
+                    member_id, "已确认" if remember_voice else "仅本场", now,
+                    meeting_id, team_id, local_label,
+                ),
+            )
+            report_row = connection.execute(
+                "SELECT json FROM reports WHERE meeting_id=?", (meeting_id,)
+            ).fetchone()
+            affected = False
+            if report_row:
+                payload = json.loads(report_row["json"])
+                for item in payload.get("decisions", []):
+                    if item.get("decision_maker") == local_label:
+                        item["decision_maker"] = name
+                        affected = True
+                for item in payload.get("action_items", []):
+                    if item.get("owner") == local_label:
+                        item["owner"] = name
+                        affected = True
+                if affected:
+                    connection.execute(
+                        "UPDATE reports SET json=?,created_at=? WHERE meeting_id=?",
+                        (json.dumps(payload, ensure_ascii=False), now, meeting_id),
+                    )
+                    connection.execute(
+                        """UPDATE meeting_action_items SET owner=?,updated_at=?
+                           WHERE meeting_id=? AND owner=?""",
+                        (name, now, meeting_id, local_label),
+                    )
+        return member_id, saved, affected
 
     def save_report(self, meeting_id: str, team_id: int, report: TeamMeetingReport) -> None:
         payload = report.model_dump_json()
@@ -391,9 +662,16 @@ class Database:
                 (meeting_id, team_id),
             ).fetchone()
             transcript_rows = connection.execute(
-                """SELECT t.start,t.end,t.text FROM transcripts t
+                """SELECT t.start,t.end,t.speaker_label,t.text FROM transcripts t
                    JOIN meetings m ON m.id=t.meeting_id
                    WHERE t.meeting_id=? AND m.team_id=? ORDER BY t.id""",
+                (meeting_id, team_id),
+            ).fetchall() if row else []
+            speaker_rows = connection.execute(
+                """SELECT s.local_label,s.member_id,s.confidence,s.status,s.speech_seconds,
+                          s.excerpts_json,s.embedding_json,m.name
+                   FROM meeting_speakers s LEFT JOIN members m ON m.id=s.member_id
+                   WHERE s.meeting_id=? AND s.team_id=? ORDER BY s.id""",
                 (meeting_id, team_id),
             ).fetchall() if row else []
         if not row:
@@ -405,6 +683,14 @@ class Database:
             status=row["status"], created_at=row["created_at"],
             report=TeamMeetingReport.model_validate(report_payload),
             transcript=[TranscriptSegment.model_validate(dict(item)) for item in transcript_rows],
+            speakers=[MeetingSpeaker(
+                local_label=item["local_label"],
+                display_name=item["name"] or item["local_label"],
+                member_id=item["member_id"], confidence=item["confidence"],
+                status=item["status"], speech_seconds=item["speech_seconds"],
+                excerpts=json.loads(item["excerpts_json"]),
+                has_voice_sample=item["embedding_json"] is not None,
+            ) for item in speaker_rows],
         )
 
     def get_project_memory(

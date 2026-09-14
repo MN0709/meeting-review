@@ -18,6 +18,7 @@ Read AI、Granola 和 Fellow 是闭源商业产品。我们可以复现公开可
 | [Meetily](https://github.com/Zackriya-Solutions/meetily) | MIT | 本地转写、音频导入、可切换 AI 服务、桌面端体验 | 保留为本地音频与未来说话人能力参考；Rust/Tauri 与当前 FastAPI 架构不同，不直接搬运 |
 | [sqlite-vec](https://github.com/asg017/sqlite-vec) | Apache-2.0 | SQLite 内向量检索 | 列为语义搜索升级候选；MVP 先用结构化字段＋SQLite FTS5，避免增加原生扩展部署风险 |
 | [Amurex](https://github.com/thepersonalaicompany/amurex) | AGPL-3.0 | 实时会议助手、摘要和跟进 | 不复制代码，避免 AGPL 对产品发布方式产生连带约束；只观察公开体验 |
+| [WeSpeaker](https://github.com/wenet-e2e/wespeaker) | Apache-2.0 | 中文说话人分离、embedding、相似度 | 已固定官方提交 `dfa7419`，通过懒加载接入；真实阈值待录音校准 |
 
 ## 已采用的产品模式
 
@@ -61,4 +62,4 @@ Read AI、Granola 和 Fellow 是闭源商业产品。我们可以复现公开可
 5. 新依赖有测试、Docker 构建验证和安全检查。
 6. 在 README 的第三方声明中记录归属。
 
-当前没有复制任何上述项目源码；现阶段采用的是经过核查的产品模式与技术取舍。
+会脉没有复制闭源竞品源码。WeSpeaker 以带版本锁定的依赖方式使用，其 Apache-2.0 许可证与引用信息在 README 中保留。

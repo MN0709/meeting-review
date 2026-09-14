@@ -37,7 +37,7 @@ TEAM_SYSTEM_PROMPT = """
 先用不超过 300 字概括会议目标、进展和结果，再输出会议要点、决策清单、行动项与遗留问题。
 每条决策和遗留问题必须包含输入中完全一致的原话和时间戳，不得改写引文；无法确认决策人时填“未明确”。
 遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
-行动项的负责人或截止时间不明确时填“未明确”。speaker_stats_note 必须固定为“说话人识别将于下一版本支持”。
+行动项的负责人或截止时间不明确时填“未明确”。speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
 只输出符合指定 JSON Schema 的 JSON，不输出 Markdown 或解释。
 """.strip()
 
@@ -86,14 +86,14 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
                 "content": "尚未解决的问题",
                 "evidence": {"quote": "原话", "timestamp": "00:00:00"},
             }],
-            "speaker_stats_note": "说话人识别将于下一版本支持",
+            "speaker_stats_note": "",
         }
         fields = (
             "overview(必填字符串，不超过 300 字)；meeting_points(必填字符串数组)；"
             "decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
             "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline)；"
             "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
-            "speaker_stats_note(必填固定字符串：说话人识别将于下一版本支持)"
+            "speaker_stats_note(必填空字符串，由后端覆盖)"
         )
     elif issubclass(model_type, TeamChunkSummary):
         example = {
@@ -315,7 +315,7 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
             )
             if overview is not None:
                 normalized["overview"] = str(overview)
-            normalized["speaker_stats_note"] = "说话人识别将于下一版本支持"
+            normalized["speaker_stats_note"] = ""
         return normalized
 
     if not issubclass(model_type, SemanticAnalysis):
@@ -371,7 +371,10 @@ def format_timestamp(seconds: float) -> str:
 
 def format_segments(segments: Sequence[TranscriptSegment]) -> str:
     return "\n".join(
-        "[{}-{}] {}".format(format_timestamp(item.start), format_timestamp(item.end), item.text)
+        "[{}-{}]{} {}".format(
+            format_timestamp(item.start), format_timestamp(item.end),
+            f"[{item.speaker_label}]" if item.speaker_label else "", item.text,
+        )
         for item in segments
     )
 

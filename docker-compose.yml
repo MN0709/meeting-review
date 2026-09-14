@@ -6,11 +6,13 @@ services:
     environment:
       APP_HOST: 0.0.0.0
       HF_HOME: /models/huggingface
+      WESPEAKER_HOME: /models/wespeaker
       DATABASE_PATH: /data/meeting-review.db
     ports:
       - "${APP_PORT:-8000}:${APP_PORT:-8000}"
     volumes:
       - whisper-models:/models/huggingface
+      - speaker-models:/models/wespeaker
       - meeting-data:/data
     read_only: true
     tmpfs:
@@ -23,4 +25,5 @@ services:
 
 volumes:
   whisper-models:
+  speaker-models:
   meeting-data:
