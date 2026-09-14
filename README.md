@@ -1,4 +1,4 @@
-# 团队长会复盘器
+# 会脉 · 团队会议记忆
 
 > 当前 10 天产品化迭代的状态、风险和每日验收入口见 [PROJECT_CONTROL.md](PROJECT_CONTROL.md)，详细路线见 [docs/ROADMAP_10_DAYS.md](docs/ROADMAP_10_DAYS.md)。
 

@@ -721,6 +721,10 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert 'id="meetingsView"' in html
     assert 'id="projectsView"' in html
     assert 'id="projectDetailView"' in html
+    assert "会脉 · 团队会议记忆" in html
+    assert '<div class="brand">团队复盘</div>' not in html
+    assert "@media(max-width:760px){.app-shell{grid-template-columns:104px minmax(0,1fr)}" in html
+    assert ".app-sidebar{position:sticky;z-index:10;top:0;height:100vh" in html
     assert "folder-tree-item" not in html
     assert "history-workspace" not in html
     assert "每个文件夹就是一个项目，不再分二级" in html
@@ -747,6 +751,10 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "面向产品项目组" not in html
     assert "innerHTML" not in html
     assert html.count("window.fetch(") == 1
+
+
+def test_fastapi_uses_product_name() -> None:
+    assert main_module.app.title == "会脉 · 团队会议记忆"
 
 
 def test_existing_database_adds_project_column_without_losing_meetings(tmp_path) -> None:

@@ -99,7 +99,7 @@ async def lifespan(_: FastAPI):
     await task_manager.stop()
 
 
-app = FastAPI(title="团队长会复盘器", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="会脉 · 团队会议记忆", version="0.3.0", lifespan=lifespan)
 
 
 @app.middleware("http")
