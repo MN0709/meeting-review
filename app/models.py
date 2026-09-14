@@ -90,10 +90,17 @@ class DecisionItem(StrictModel):
     evidence: EvidenceQuote
 
 
+class UnresolvedIssue(StrictModel):
+    content: str
+    evidence: EvidenceQuote
+
+
 class TeamMeetingReport(StrictModel):
+    overview: str = Field(min_length=1, max_length=300)
     meeting_points: List[str]
     decisions: List[DecisionItem]
     action_items: List[ActionItem]
+    unresolved_issues: List[UnresolvedIssue]
     speaker_stats_note: Literal["说话人识别将于下一版本支持"] = "说话人识别将于下一版本支持"
 
 
@@ -101,6 +108,7 @@ class TeamChunkSummary(StrictModel):
     meeting_points: List[str]
     decisions: List[DecisionItem]
     action_items: List[ActionItem]
+    unresolved_issues: List[UnresolvedIssue]
 
 
 TaskStage = Literal["排队中", "上传完成", "转写中", "AI 分析中", "完成", "失败"]
@@ -167,3 +175,4 @@ class MeetingMoveRequest(StrictModel):
 
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
+    transcript: List[TranscriptSegment]

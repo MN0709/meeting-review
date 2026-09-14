@@ -55,6 +55,7 @@ def load_json(name: str) -> dict:
 
 def team_report() -> TeamMeetingReport:
     return TeamMeetingReport(
+        overview="会议确认本周上线内测，并明确了发布准备工作的负责人和截止时间。",
         meeting_points=["确定本周上线内测"],
         decisions=[{
             "content": "本周上线内测",
@@ -62,6 +63,7 @@ def team_report() -> TeamMeetingReport:
             "evidence": {"quote": "我们本周上线内测", "timestamp": "00:00:02"},
         }],
         action_items=[{"task": "准备发布清单", "owner": "小宁", "deadline": "周五"}],
+        unresolved_issues=[],
     )
 
 
@@ -631,6 +633,41 @@ def test_json_object_mode_injects_chinese_contract_and_minimal_example() -> None
     assert "dimension/score/assessment/evidence" in prompt
     assert "字段名必须与示例完全一致，不要输出多余字段" in prompt
 
+    analyzer._request_sync(TeamMeetingReport, "system", "team prompt", "test", "json_object")
+    team_prompt = completions.request["messages"][1]["content"]
+    assert "overview(必填字符串，不超过 300 字)" in team_prompt
+    assert "unresolved_issues" in team_prompt
+    assert '"content":"尚未解决的问题"' in team_prompt
+
+
+def test_team_payload_normalizes_overview_and_unresolved_issue_shape() -> None:
+    payload = {
+        "meeting_overview": "会议讨论内测上线安排。",
+        "meeting_points": ["本周上线"],
+        "decisions": [{
+            "decision": "本周上线",
+            "owner": "小宁",
+            "evidence": {"quote": "我们本周上线内测", "timestamp": "00:00:02"},
+            "extra": "discard",
+        }],
+        "action_items": [{"item": "准备清单"}],
+        "unresolved_issues": [{
+            "question": "监控阈值尚未确定",
+            "evidence": {"quote": "监控阈值还没定", "timestamp": "00:00:08"},
+            "extra": "discard",
+        }],
+        "extra": "discard",
+    }
+
+    normalized = normalize_llm_payload(payload, TeamMeetingReport)
+    report = TeamMeetingReport.model_validate(normalized)
+
+    assert report.overview == "会议讨论内测上线安排。"
+    assert report.decisions[0].content == "本周上线"
+    assert report.decisions[0].decision_maker == "小宁"
+    assert report.action_items[0].owner == "未明确"
+    assert report.unresolved_issues[0].content == "监控阈值尚未确定"
+
 
 def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     html = (Path(__file__).parent.parent / "static" / "index.html").read_text(encoding="utf-8")
@@ -678,6 +715,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "没有未分类会议" in html
     assert "localStorage.setItem(PROJECT_STORAGE_KEY" in html
     assert "localStorage.setItem(HISTORY_SCOPE_STORAGE_KEY" in html
+    assert "① 会议总览" in html
+    assert "⑤ 遗留问题" in html
+    assert "查看 ${evidence.timestamp} 附近的转写原文" in html
+    assert "body.transcript||[]" in html
+    assert "textContent=report.overview" in html
     assert "（含子文件夹）" not in html
     assert "projectFilter" not in html
     assert "/project`" in html
@@ -1357,6 +1399,57 @@ def test_team_report_rejects_hallucinated_decision_quote() -> None:
     report.decisions[0].evidence.quote = "下周上线"
     with pytest.raises(ValueError):
         validate_team_evidence(report, transcript.segments)
+
+
+def test_team_report_rejects_hallucinated_unresolved_issue_quote_or_timestamp() -> None:
+    from app.llm import validate_team_evidence
+
+    transcript = Transcript(
+        duration_seconds=20,
+        segments=[TranscriptSegment(
+            start=0, end=10, text="我们本周上线内测，但是监控阈值还没定"
+        )],
+    )
+    payload = team_report().model_dump()
+    payload["unresolved_issues"] = [{
+        "content": "监控阈值尚未确定",
+        "evidence": {"quote": "监控阈值还没定", "timestamp": "00:00:08"},
+    }]
+    report = TeamMeetingReport.model_validate(payload)
+    validate_team_evidence(report, transcript.segments)
+
+    report.unresolved_issues[0].evidence.timestamp = "00:00:20"
+    with pytest.raises(ValueError):
+        validate_team_evidence(report, transcript.segments)
+
+
+def test_legacy_team_report_gets_safe_defaults_and_transcript_context(tmp_path) -> None:
+    database = Database(tmp_path / "legacy-report.db")
+    database.initialize({"测试团队": "token"})
+    team_id = database.authenticate("token")
+    assert team_id is not None
+    meeting_id = "legacy-report"
+    database.create_meeting(meeting_id, team_id, "旧报告", Path("/tmp/legacy.wav"))
+    transcript = Transcript(
+        duration_seconds=10,
+        segments=[TranscriptSegment(start=0, end=10, text="我们本周上线内测")],
+    )
+    database.save_transcript(meeting_id, team_id, transcript)
+    legacy_payload = team_report().model_dump()
+    legacy_payload.pop("overview")
+    legacy_payload.pop("unresolved_issues")
+    with sqlite3.connect(database.path) as connection:
+        connection.execute(
+            "INSERT INTO reports(meeting_id,json,created_at) VALUES(?,?,?)",
+            (meeting_id, json.dumps(legacy_payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+        )
+
+    history = database.get_history(meeting_id, team_id)
+
+    assert history is not None
+    assert history.report.overview == "该报告生成于旧版本，暂无会议总览。"
+    assert history.report.unresolved_issues == []
+    assert [segment.text for segment in history.transcript] == ["我们本周上线内测"]
 
 
 def test_transcribed_audio_is_deleted_and_transcript_and_report_are_persisted(monkeypatch, tmp_path) -> None:

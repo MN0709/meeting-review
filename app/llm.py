@@ -34,14 +34,17 @@ CHUNK_SYSTEM_PROMPT = """
 
 TEAM_SYSTEM_PROMPT = """
 你是严谨的团队正式会议分析助手。只能根据转写内容提炼信息，不得补写。
-输出会议要点、决策清单与行动项。每条决策必须包含决策内容、决策人以及输入中完全一致的原话和时间戳；无法确认决策人时填“未明确”。
+先用不超过 300 字概括会议目标、进展和结果，再输出会议要点、决策清单、行动项与遗留问题。
+每条决策和遗留问题必须包含输入中完全一致的原话和时间戳，不得改写引文；无法确认决策人时填“未明确”。
+遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
 行动项的负责人或截止时间不明确时填“未明确”。speaker_stats_note 必须固定为“说话人识别将于下一版本支持”。
 只输出符合指定 JSON Schema 的 JSON，不输出 Markdown 或解释。
 """.strip()
 
 TEAM_CHUNK_SYSTEM_PROMPT = """
-你负责从团队正式会议的一个转写分块中提取会议要点、明确决策和行动项。
-每条决策必须保留决策内容、决策人、完全一致的逐字原话及时间戳，不得改写引文；无法确认决策人、负责人或截止时间时填“未明确”。
+你负责从团队正式会议的一个转写分块中提取会议要点、明确决策、行动项和遗留问题。
+每条决策和遗留问题必须保留完全一致的逐字原话及时间戳，不得改写引文；无法确认决策人、负责人或截止时间时填“未明确”。
+遗留问题只记录明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
 不要分析个人表现，不要补写分块中不存在的信息。只输出符合指定 JSON Schema 的 JSON。
 """.strip()
 
@@ -72,17 +75,24 @@ class AnalysisError(RuntimeError):
 def _json_mode_contract(model_type: Type[BaseModel]) -> str:
     if issubclass(model_type, TeamMeetingReport):
         example = {
+            "overview": "会议围绕内测上线安排展开，明确了发布时间和准备工作。",
             "meeting_points": ["会议要点"],
             "decisions": [{
                 "content": "决策内容", "decision_maker": "未明确",
                 "evidence": {"quote": "原话", "timestamp": "00:00:00"},
             }],
             "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确"}],
+            "unresolved_issues": [{
+                "content": "尚未解决的问题",
+                "evidence": {"quote": "原话", "timestamp": "00:00:00"},
+            }],
             "speaker_stats_note": "说话人识别将于下一版本支持",
         }
         fields = (
-            "meeting_points(必填字符串数组)；decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
+            "overview(必填字符串，不超过 300 字)；meeting_points(必填字符串数组)；"
+            "decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
             "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline)；"
+            "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
             "speaker_stats_note(必填固定字符串：说话人识别将于下一版本支持)"
         )
     elif issubclass(model_type, TeamChunkSummary):
@@ -90,10 +100,12 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
             "meeting_points": ["会议要点"],
             "decisions": [{"content": "决策内容", "decision_maker": "未明确", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确"}],
+            "unresolved_issues": [{"content": "尚未解决的问题", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
         }
         fields = (
             "meeting_points(必填字符串数组)；decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
-            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline)"
+            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline)；"
+            "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)"
         )
     elif issubclass(model_type, SemanticAnalysis):
         example = {
@@ -237,7 +249,11 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
         return payload
 
     if issubclass(model_type, (TeamMeetingReport, TeamChunkSummary)):
-        normalized = copy.deepcopy(payload)
+        normalized: Dict[str, Any] = {
+            key: copy.deepcopy(payload[key])
+            for key in ("meeting_points", "decisions", "action_items", "unresolved_issues")
+            if key in payload
+        }
         actions = normalized.get("action_items")
         if isinstance(actions, list):
             cleaned = []
@@ -248,7 +264,57 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
                     task = next((item.get(key) for key in ("task", "item", "content", "description") if item.get(key) is not None), "")
                     cleaned.append({"task": str(task), "owner": str(item.get("owner") or "未明确"), "deadline": str(item.get("deadline") or "未明确")})
             normalized["action_items"] = cleaned
+
+        decisions = normalized.get("decisions")
+        if isinstance(decisions, list):
+            cleaned_decisions = []
+            for item in decisions:
+                if not isinstance(item, dict):
+                    continue
+                evidence = item.get("evidence")
+                if not isinstance(evidence, dict):
+                    continue
+                content = next(
+                    (item.get(key) for key in ("content", "decision", "item", "description") if item.get(key)),
+                    "",
+                )
+                cleaned_decisions.append({
+                    "content": str(content),
+                    "decision_maker": str(item.get("decision_maker") or item.get("owner") or "未明确"),
+                    "evidence": {
+                        "quote": evidence.get("quote", ""),
+                        "timestamp": evidence.get("timestamp", ""),
+                    },
+                })
+            normalized["decisions"] = cleaned_decisions
+
+        issues = normalized.get("unresolved_issues")
+        if isinstance(issues, list):
+            cleaned_issues = []
+            for item in issues:
+                if not isinstance(item, dict) or not isinstance(item.get("evidence"), dict):
+                    continue
+                evidence = item["evidence"]
+                content = next(
+                    (item.get(key) for key in ("content", "question", "item", "description") if item.get(key)),
+                    "",
+                )
+                cleaned_issues.append({
+                    "content": str(content),
+                    "evidence": {
+                        "quote": evidence.get("quote", ""),
+                        "timestamp": evidence.get("timestamp", ""),
+                    },
+                })
+            normalized["unresolved_issues"] = cleaned_issues
+
         if issubclass(model_type, TeamMeetingReport):
+            overview = next(
+                (payload.get(key) for key in ("overview", "meeting_overview", "summary") if payload.get(key)),
+                None,
+            )
+            if overview is not None:
+                normalized["overview"] = str(overview)
             normalized["speaker_stats_note"] = "说话人识别将于下一版本支持"
         return normalized
 
@@ -392,11 +458,19 @@ def validate_chunk_evidence(summary: ChunkSummary, segments: Sequence[Transcript
 
 
 def validate_team_evidence(report: TeamMeetingReport, segments: Sequence[TranscriptSegment]) -> None:
-    _validate_quotes([decision.evidence for decision in report.decisions], segments)
+    _validate_quotes(
+        [decision.evidence for decision in report.decisions]
+        + [issue.evidence for issue in report.unresolved_issues],
+        segments,
+    )
 
 
 def validate_team_chunk_evidence(report: TeamChunkSummary, segments: Sequence[TranscriptSegment]) -> None:
-    _validate_quotes([decision.evidence for decision in report.decisions], segments)
+    _validate_quotes(
+        [decision.evidence for decision in report.decisions]
+        + [issue.evidence for issue in report.unresolved_issues],
+        segments,
+    )
 
 
 class LLMAnalyzer:
@@ -606,7 +680,7 @@ class LLMAnalyzer:
         result = await self._validated_call(
             TeamMeetingReport,
             TEAM_SYSTEM_PROMPT,
-            "以下分块按原顺序排列。去重归并；决策引文只能从各 decisions.evidence 原样选取。\n\n"
+            "以下分块按原顺序排列。去重归并；决策和遗留问题的引文只能从各分块 evidence 原样选取。\n\n"
             + json.dumps(summaries, ensure_ascii=False),
             "team_final_merge",
             transcript.segments,

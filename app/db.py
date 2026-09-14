@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
-from app.models import MeetingHistory, MeetingListItem, ProjectListItem, TeamMeetingReport, Transcript
+from app.models import (
+    MeetingHistory, MeetingListItem, ProjectListItem, TeamMeetingReport, Transcript,
+    TranscriptSegment,
+)
 
 
 def _utc_now() -> str:
@@ -322,13 +325,24 @@ class Database:
                    WHERE m.id=? AND m.team_id=?""",
                 (meeting_id, team_id),
             ).fetchone()
+            transcript_rows = connection.execute(
+                """SELECT t.start,t.end,t.text FROM transcripts t
+                   JOIN meetings m ON m.id=t.meeting_id
+                   WHERE t.meeting_id=? AND m.team_id=? ORDER BY t.id""",
+                (meeting_id, team_id),
+            ).fetchall() if row else []
         if not row:
             return None
+        report_payload = json.loads(row["json"])
+        # 历史报告可能由旧版本生成；只补展示字段，不伪造会议内容。
+        report_payload.setdefault("overview", "该报告生成于旧版本，暂无会议总览。")
+        report_payload.setdefault("unresolved_issues", [])
         return MeetingHistory(
             id=row["id"], title=row["title"], project_id=row["project_id"],
             duration_seconds=row["duration_seconds"],
             status=row["status"], created_at=row["created_at"],
-            report=TeamMeetingReport.model_validate_json(row["json"]),
+            report=TeamMeetingReport.model_validate(report_payload),
+            transcript=[TranscriptSegment.model_validate(dict(item)) for item in transcript_rows],
         )
 
     def transcript_rows(self, meeting_id: str) -> Iterable[sqlite3.Row]:
