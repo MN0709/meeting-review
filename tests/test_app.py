@@ -688,6 +688,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "处理时间较长，请稍后刷新重试" in html
     assert "音频转写完成后即删除" in html
     assert "请输入你的团队口令" in html
+    assert "location.protocol==='file:'" in html
+    assert "打开正确服务地址" in html
+    assert "你打开的是本地网页文件，无法连接后端服务" in html
+    assert "无法连接后端服务，请确认服务已经启动后再重试" in html
+    assert "response.status===403" in html
     assert "/api/meetings" in html
     assert "/api/projects" in html
     assert "projectSelect" in html

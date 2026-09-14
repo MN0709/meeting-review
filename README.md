@@ -97,6 +97,8 @@ python run.py
 
 打开 <http://127.0.0.1:8000>。健康检查无需团队口令：
 
+不要直接双击 `static/index.html` 使用 `file://` 地址；该页面无法连接 FastAPI 后端。若误开，本地页面会显示原因并提供正确服务地址。
+
 ```bash
 curl http://127.0.0.1:8000/health
 # {"status":"ok"}
