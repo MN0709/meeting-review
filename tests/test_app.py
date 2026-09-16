@@ -32,7 +32,7 @@ from app.speaker import (
 )
 from app.stats import compute_speech_stats
 from app.tasks import InMemoryTaskManager
-from app.transcription import probe_audio_duration
+from app.transcription import WhisperTranscriber, probe_audio_duration
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -223,8 +223,8 @@ def test_polling_and_health_do_not_consume_review_rate_limit(monkeypatch) -> Non
 def test_team_long_meeting_defaults() -> None:
     settings = Settings(_env_file=None)
     assert settings.max_upload_mb == 300
-    assert settings.max_audio_minutes == 60
-    assert settings.processing_timeout_seconds == 5400
+    assert settings.max_audio_minutes == 240
+    assert settings.processing_timeout_seconds == 21600
     assert settings.rate_limit_per_hour == 10
     assert settings.daily_task_limit == 30
     assert settings.queue_max == 5
@@ -262,8 +262,42 @@ def test_duration_probe_failure_returns_none_for_transcription_fallback(monkeypa
     assert probe_audio_duration(tmp_path / "damaged.wav") is None
 
 
+def test_multi_hour_transcription_uses_bounded_chunks_and_preserves_timestamps(
+    monkeypatch, tmp_path,
+) -> None:
+    transcriber = WhisperTranscriber(Settings(_env_file=None))
+    calls = []
+
+    class FakeModel:
+        def transcribe(self, audio, **kwargs):
+            calls.append(audio)
+            index = len(calls)
+            return iter([
+                SimpleNamespace(start=0.2, end=0.8, text=f" 第{index}段 "),
+            ]), SimpleNamespace(language="zh")
+
+    monkeypatch.setattr(
+        "app.transcription.probe_audio_duration", lambda path: 2 * 60 * 60,
+    )
+    monkeypatch.setattr(transcriber, "_get_model", lambda: FakeModel())
+    monkeypatch.setattr(
+        transcriber,
+        "_decode_audio_chunks",
+        lambda path: iter([[0.0] * 16000, [0.0] * 32000]),
+    )
+
+    transcript = transcriber.transcribe(tmp_path / "two-hours.m4a")
+
+    assert len(calls) == 2
+    assert transcript.duration_seconds == 2 * 60 * 60
+    assert [(item.start, item.end, item.text) for item in transcript.segments] == [
+        (0.2, 0.8, "第1段"),
+        (1.2, 1.8, "第2段"),
+    ]
+
+
 def test_preflight_rejects_long_audio_before_it_enters_queue(monkeypatch) -> None:
-    monkeypatch.setattr(main_module, "probe_audio_duration", lambda path: 62 * 60)
+    monkeypatch.setattr(main_module, "probe_audio_duration", lambda path: 242 * 60)
     submitted = False
 
     async def unexpected_submit(*args, **kwargs):
@@ -277,7 +311,7 @@ def test_preflight_rejects_long_audio_before_it_enters_queue(monkeypatch) -> Non
         response = client.post("/api/review", files={"file": ("long.wav", b"fake", "audio/wav")})
 
     assert response.status_code == 422
-    assert response.json()["detail"] == "当前版本支持 60 分钟以内的录音，你的录音约 62.0 分钟"
+    assert response.json()["detail"] == "当前版本支持 240 分钟以内的录音，你的录音约 242.0 分钟"
     assert submitted is False
 
 
@@ -399,17 +433,22 @@ def test_startup_cleanup_removes_stale_upload_files(tmp_path) -> None:
 
 
 def test_preflight_rounds_just_over_limit_up_in_error_message(monkeypatch) -> None:
-    monkeypatch.setattr(main_module, "probe_audio_duration", lambda path: 3600.1)
+    monkeypatch.setattr(main_module, "probe_audio_duration", lambda path: 14400.1)
 
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
         response = client.post("/api/review", files={"file": ("long.wav", b"fake", "audio/wav")})
 
     assert response.status_code == 422
-    assert "你的录音约 60.1 分钟" in response.json()["detail"]
+    assert "你的录音约 240.1 分钟" in response.json()["detail"]
 
 
-@pytest.mark.parametrize("metadata_duration", [5 * 60, None])
-def test_preflight_allows_duration_and_randomizes_server_filename(monkeypatch, metadata_duration) -> None:
+@pytest.mark.parametrize(
+    ("metadata_duration", "expected_long_meeting"),
+    [(5 * 60, False), (4 * 60 * 60, True), (None, False)],
+)
+def test_preflight_allows_duration_and_randomizes_server_filename(
+    monkeypatch, metadata_duration, expected_long_meeting,
+) -> None:
     monkeypatch.setattr(main_module, "probe_audio_duration", lambda path: metadata_duration)
     submitted_paths = []
 
@@ -417,6 +456,7 @@ def test_preflight_allows_duration_and_randomizes_server_filename(monkeypatch, m
         assert path.exists()
         assert path.stem == task_id
         assert "normal" not in path.name
+        assert long_meeting is expected_long_meeting
         submitted_paths.append(path)
         path.unlink()
         return TaskAccepted(task_id=task_id, status="排队中", queue_position=0, message="排队中")
@@ -690,13 +730,13 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "meeting-review-history-scope" in html
     assert "/api/tasks/" in html
     assert "await sleep(2000)" in html
-    assert "最大 300 MB、60 分钟" in html
+    assert "最大 300 MB、4 小时" in html
     assert "/api/auth/check" in html
     assert "X-Access-Token" in html
     assert "meeting-review-access-token" in html
     assert "credentials:'omit'" in html
-    assert "POLL_LIMIT_MS=15*60*1000" in html
-    assert "处理时间较长，请稍后刷新重试" in html
+    assert "POLL_LIMIT_MS=6*60*60*1000" in html
+    assert "长会议仍在后台处理" in html
     assert "音频转写完成后即删除" in html
     assert "确认并记住此声音" in html
     assert "/speakers/" in html

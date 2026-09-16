@@ -11,6 +11,8 @@ from app.models import Transcript, TranscriptSegment
 
 
 logger = logging.getLogger(__name__)
+WHISPER_SAMPLE_RATE = 16000
+LONG_AUDIO_CHUNK_SECONDS = 30 * 60
 
 
 def probe_audio_duration(audio_path: Path) -> Optional[float]:
@@ -60,6 +62,9 @@ class WhisperTranscriber:
 
     def transcribe(self, audio_path: Path) -> Transcript:
         model = self._get_model()
+        metadata_duration = probe_audio_duration(audio_path)
+        if metadata_duration is not None and metadata_duration > LONG_AUDIO_CHUNK_SECONDS:
+            return self._transcribe_long_audio(model, audio_path, metadata_duration)
         raw_segments, info = model.transcribe(
             str(audio_path),
             language="zh",
@@ -79,3 +84,68 @@ class WhisperTranscriber:
             duration_seconds=duration,
             segments=segments,
         )
+
+    @staticmethod
+    def _decode_audio_chunks(audio_path: Path):
+        """Decode at most 30 minutes at once so multi-hour input does not occupy ~1 GB RAM."""
+        import numpy as np
+
+        chunk_bytes = LONG_AUDIO_CHUNK_SECONDS * WHISPER_SAMPLE_RATE * 2
+        pending = bytearray()
+        with av.open(str(audio_path), mode="r") as container:
+            if not container.streams.audio:
+                return
+            resampler = av.AudioResampler(
+                format="s16", layout="mono", rate=WHISPER_SAMPLE_RATE,
+            )
+
+            def append_frames(frames) -> None:
+                for frame in frames or []:
+                    pending.extend(frame.to_ndarray().reshape(-1).tobytes())
+
+            for frame in container.decode(audio=0):
+                append_frames(resampler.resample(frame))
+                while len(pending) >= chunk_bytes:
+                    raw = bytes(pending[:chunk_bytes])
+                    del pending[:chunk_bytes]
+                    yield np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+            append_frames(resampler.resample(None))
+            if pending:
+                yield np.frombuffer(bytes(pending), dtype="<i2").astype(np.float32) / 32768.0
+
+    def _transcribe_long_audio(
+        self, model: Any, audio_path: Path, metadata_duration: float,
+    ) -> Transcript:
+        segments: list[TranscriptSegment] = []
+        offset = 0.0
+        language = "zh"
+        chunk_count = 0
+        for audio in self._decode_audio_chunks(audio_path):
+            chunk_count += 1
+            raw_segments, info = model.transcribe(
+                audio,
+                language="zh",
+                vad_filter=True,
+                beam_size=5,
+            )
+            language = str(getattr(info, "language", language) or language)
+            chunk_duration = len(audio) / WHISPER_SAMPLE_RATE
+            segments.extend(
+                TranscriptSegment(
+                    start=offset + item.start,
+                    end=offset + item.end,
+                    text=item.text.strip(),
+                )
+                for item in raw_segments
+                if item.text.strip()
+            )
+            offset += chunk_duration
+        logger.info(
+            "long_audio_transcribed duration_seconds=%.1f chunks=%d",
+            metadata_duration,
+            chunk_count,
+        )
+        duration = max(metadata_duration, offset)
+        if segments:
+            duration = max(duration, segments[-1].end)
+        return Transcript(language=language, duration_seconds=duration, segments=segments)
