@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import tempfile
+import threading
 import wave
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -13,6 +15,7 @@ from app.config import Settings
 from app.models import Transcript, TranscriptSegment
 
 logger = logging.getLogger(__name__)
+_TORCHAUDIO_LOAD_LOCK = threading.RLock()
 
 
 @dataclass
@@ -157,6 +160,52 @@ class SpeakerRecognizer:
         finally:
             normalized_path.unlink(missing_ok=True)
 
+    @staticmethod
+    @contextmanager
+    def _torchaudio_wav_fallback():
+        """Read our PCM WAV even when torchaudio ships without an I/O backend."""
+        import torch
+        import torchaudio
+
+        with _TORCHAUDIO_LOAD_LOCK:
+            original_load = torchaudio.load
+
+            def load_with_wave_fallback(uri, *args, **kwargs):
+                try:
+                    return original_load(uri, *args, **kwargs)
+                except RuntimeError:
+                    path = Path(os.fspath(uri))
+                    if path.suffix.lower() != ".wav":
+                        raise
+                    with wave.open(str(path), "rb") as source:
+                        if source.getcomptype() != "NONE" or source.getsampwidth() != 2:
+                            raise
+                        channels = source.getnchannels()
+                        sample_rate = source.getframerate()
+                        frame_offset = int(kwargs.get("frame_offset", 0))
+                        num_frames = int(kwargs.get("num_frames", -1))
+                        if frame_offset:
+                            source.setpos(min(frame_offset, source.getnframes()))
+                        raw = source.readframes(
+                            source.getnframes() if num_frames < 0 else num_frames
+                        )
+                    pcm = torch.frombuffer(bytearray(raw), dtype=torch.int16)
+                    if channels > 1:
+                        pcm = pcm.reshape(-1, channels).transpose(0, 1).contiguous()
+                    else:
+                        pcm = pcm.reshape(1, -1)
+                    if kwargs.get("normalize", True):
+                        pcm = pcm.to(torch.float32).div_(32768.0)
+                    if not kwargs.get("channels_first", True):
+                        pcm = pcm.transpose(0, 1)
+                    return pcm, sample_rate
+
+            torchaudio.load = load_with_wave_fallback
+            try:
+                yield
+            finally:
+                torchaudio.load = original_load
+
     def process(
         self, audio_path: Path, transcript: Transcript,
         profiles: Sequence[KnownVoiceProfile] = (),
@@ -181,7 +230,8 @@ class SpeakerRecognizer:
             )
         try:
             with self._normalized_wav(audio_path) as normalized_path:
-                return self._process_supported_audio(normalized_path, transcript, profiles)
+                with self._torchaudio_wav_fallback():
+                    return self._process_supported_audio(normalized_path, transcript, profiles)
         except Exception as exc:
             logger.warning(
                 "speaker_audio_normalization_failed error_type=%s", type(exc).__name__,

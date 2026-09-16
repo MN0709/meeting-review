@@ -1823,6 +1823,34 @@ def test_speaker_input_is_normalized_to_mono_16khz_wav(tmp_path) -> None:
     assert not normalized.exists()
 
 
+def test_speaker_wav_fallback_works_without_torchaudio_backend(monkeypatch, tmp_path) -> None:
+    import torch
+    import torchaudio
+
+    source = tmp_path / "mono-16k.wav"
+    with wave.open(str(source), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(b"\x00\x40" * 16000)
+
+    def unavailable_backend(*args, **kwargs):
+        raise RuntimeError("no audio backend")
+
+    monkeypatch.setattr(torchaudio, "load", unavailable_backend)
+    recognizer = SpeakerRecognizer(Settings(_env_file=None))
+    with recognizer._torchaudio_wav_fallback():
+        normalized, sample_rate = torchaudio.load(str(source))
+        integer_pcm, _ = torchaudio.load(str(source), normalize=False)
+
+    assert sample_rate == 16000
+    assert normalized.shape == (1, 16000)
+    assert normalized.dtype == torch.float32
+    assert normalized[0, 0].item() == pytest.approx(0.5)
+    assert integer_pcm.dtype == torch.int16
+    assert integer_pcm[0, 0].item() == 16384
+
+
 def test_speaker_recognition_runs_before_audio_deletion_and_persists_labels(monkeypatch, tmp_path) -> None:
     team_id = main_module.database.authenticate("test-access-token")
     meeting_id = "speaker-processing-meeting"
