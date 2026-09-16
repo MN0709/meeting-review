@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
+import wave
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -126,6 +129,34 @@ class SpeakerRecognizer:
             return None
         return [float(value) for value in embedding.detach().cpu().flatten().tolist()]
 
+    @staticmethod
+    @contextmanager
+    def _normalized_wav(audio_path: Path):
+        """Give WeSpeaker a predictable mono 16 kHz WAV for MP3/M4A/WAV uploads."""
+        import av
+
+        temporary = tempfile.NamedTemporaryFile(
+            prefix="meeting-review-speaker-", suffix=".wav", delete=False,
+        )
+        normalized_path = Path(temporary.name)
+        temporary.close()
+        try:
+            with av.open(str(audio_path), mode="r") as container, wave.open(
+                str(normalized_path), "wb"
+            ) as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16000)
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+                for frame in container.decode(audio=0):
+                    for converted in resampler.resample(frame) or []:
+                        output.writeframes(converted.to_ndarray().reshape(-1).tobytes())
+                for converted in resampler.resample(None) or []:
+                    output.writeframes(converted.to_ndarray().reshape(-1).tobytes())
+            yield normalized_path
+        finally:
+            normalized_path.unlink(missing_ok=True)
+
     def process(
         self, audio_path: Path, transcript: Transcript,
         profiles: Sequence[KnownVoiceProfile] = (),
@@ -134,6 +165,36 @@ class SpeakerRecognizer:
             return SpeakerRecognitionResult(
                 transcript, transcript, [], False, "说话人识别未启用",
             )
+        try:
+            self._load_model()
+        except (ImportError, ModuleNotFoundError):
+            logger.warning("speaker_runtime_unavailable model=%s", self.model_name)
+            return SpeakerRecognitionResult(
+                transcript, transcript, [], False,
+                "声纹运行时未安装，本场暂不识别说话人",
+            )
+        except SystemExit:
+            logger.warning("speaker_model_unavailable model=%s", self.model_name)
+            return SpeakerRecognitionResult(
+                transcript, transcript, [], False,
+                "声纹模型不可用，本场暂不识别说话人",
+            )
+        try:
+            with self._normalized_wav(audio_path) as normalized_path:
+                return self._process_supported_audio(normalized_path, transcript, profiles)
+        except Exception as exc:
+            logger.warning(
+                "speaker_audio_normalization_failed error_type=%s", type(exc).__name__,
+            )
+            return SpeakerRecognitionResult(
+                transcript, transcript, [], False,
+                "本场音频无法进入说话人识别，已保留完整转写和报告",
+            )
+
+    def _process_supported_audio(
+        self, audio_path: Path, transcript: Transcript,
+        profiles: Sequence[KnownVoiceProfile] = (),
+    ) -> SpeakerRecognitionResult:
         try:
             model = self._load_model()
             turns = self._normalize_turns(model.diarize(str(audio_path), audio_path.stem))
@@ -167,7 +228,7 @@ class SpeakerRecognizer:
         try:
             import torchaudio
 
-            pcm, sample_rate = torchaudio.load(str(audio_path), normalize=False)
+            pcm, sample_rate = torchaudio.load(str(audio_path), normalize=True)
             if pcm.size(0) > 1:
                 pcm = pcm.mean(dim=0, keepdim=True)
         except Exception as exc:

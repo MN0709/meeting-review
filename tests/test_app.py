@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -686,6 +687,7 @@ def test_json_object_mode_injects_chinese_contract_and_minimal_example() -> None
 
     analyzer._request_sync(TeamMeetingReport, "system", "team prompt", "test", "json_object")
     team_prompt = completions.request["messages"][1]["content"]
+    assert "suggested_title" in team_prompt
     assert "overview(必填字符串，不超过 300 字)" in team_prompt
     assert "unresolved_issues" in team_prompt
     assert '"content":"尚未解决的问题"' in team_prompt
@@ -693,6 +695,7 @@ def test_json_object_mode_injects_chinese_contract_and_minimal_example() -> None
 
 def test_team_payload_normalizes_overview_and_unresolved_issue_shape() -> None:
     payload = {
+        "meeting_title": "内测上线安排确认",
         "meeting_overview": "会议讨论内测上线安排。",
         "meeting_points": ["本周上线"],
         "decisions": [{
@@ -713,6 +716,7 @@ def test_team_payload_normalizes_overview_and_unresolved_issue_shape() -> None:
     normalized = normalize_llm_payload(payload, TeamMeetingReport)
     report = TeamMeetingReport.model_validate(normalized)
 
+    assert report.suggested_title == "内测上线安排确认"
     assert report.overview == "会议讨论内测上线安排。"
     assert report.decisions[0].content == "本周上线"
     assert report.decisions[0].decision_maker == "小宁"
@@ -739,6 +743,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "长会议仍在后台处理" in html
     assert "音频转写完成后即删除" in html
     assert "确认并记住此声音" in html
+    assert "organizeMeetingDialog" in html
+    assert "整理本次会议" in html
+    assert "suggestedMeetingTitle" in html
+    assert "/title`" in html
+    assert "openHistory(id,completedReport,true)" in html
     assert "/speakers/" in html
     assert "/voiceprint" in html
     assert "innerHTML" not in html
@@ -1595,6 +1604,37 @@ def test_transcribed_audio_is_deleted_and_transcript_and_report_are_persisted(mo
     assert history.report == expected
 
 
+def test_speaker_recognition_failure_is_visible_in_report(monkeypatch, tmp_path) -> None:
+    team_id = main_module.database.authenticate("test-access-token")
+    meeting_id = "speaker-failure-visible"
+    audio_path = tmp_path / f"{meeting_id}.m4a"
+    audio_path.write_bytes(b"private audio")
+    main_module.database.create_meeting(meeting_id, team_id, "声纹失败提示", audio_path)
+    transcript = Transcript(
+        duration_seconds=5,
+        segments=[TranscriptSegment(start=0, end=5, text="这是一段会议发言")],
+    )
+    monkeypatch.setattr(main_module.transcriber, "transcribe", lambda path: transcript)
+    monkeypatch.setattr(
+        main_module.speaker_recognizer,
+        "process",
+        lambda path, received, profiles: SpeakerRecognitionResult(
+            received, received, [], False, "说话人识别失败，请稍后重试",
+        ),
+    )
+
+    async def fake_team_report(received, analyzer):
+        return team_report()
+
+    monkeypatch.setattr(main_module, "build_team_report", fake_team_report)
+    result = asyncio.run(main_module._process_audio(audio_path, lambda status, message: True))
+
+    assert result.speaker_stats_note == "说话人识别失败，请稍后重试"
+    history = main_module.database.get_history(meeting_id, team_id)
+    assert history is not None
+    assert history.report.speaker_stats_note == result.speaker_stats_note
+
+
 def test_failed_transcription_also_deletes_audio(monkeypatch, tmp_path) -> None:
     path = tmp_path / ("f" * 32 + ".wav")
     path.write_bytes(b"private audio")
@@ -1626,6 +1666,33 @@ def test_history_and_task_access_are_isolated_by_team() -> None:
         assert client.get(f"/api/meetings/{first_meeting}").status_code == 200
         assert client.get(f"/api/meetings/{second_meeting}").status_code == 403
         assert client.get(f"/api/tasks/{second_meeting}").status_code == 403
+
+
+def test_ai_suggested_title_can_be_confirmed_or_edited_with_team_isolation() -> None:
+    team_id = main_module.database.authenticate("test-access-token")
+    other_team_id = main_module.database.authenticate("other-team-token")
+    meeting_id = "title-confirm-meeting"
+    main_module.database.create_meeting(
+        meeting_id, team_id, "未命名会议", Path("/tmp/title-confirm.wav")
+    )
+    report = team_report().model_copy(update={"suggested_title": "AI 项目上线决策"})
+    main_module.database.save_report(meeting_id, team_id, report)
+
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        updated = client.patch(
+            f"/api/meetings/{meeting_id}/title", json={"title": "AI 项目上线会"}
+        )
+        assert updated.status_code == 200
+        assert updated.json()["title"] == "AI 项目上线会"
+        assert updated.json()["report"]["suggested_title"] == "AI 项目上线决策"
+
+        denied = client.patch(
+            f"/api/meetings/{meeting_id}/title",
+            headers={"X-Access-Token": "other-team-token"},
+            json={"title": "越权修改"},
+        )
+        assert denied.status_code == 403
+        assert main_module.database.owner_team_id(meeting_id) != other_team_id
 
 
 def test_project_memory_uses_latest_three_meetings_and_updates_action_status() -> None:
@@ -1735,6 +1802,25 @@ def test_unknown_speaker_model_falls_back_without_stopping_service(monkeypatch, 
     assert result.available is False
     assert result.transcript == transcript
     assert "声纹模型不可用" in result.message
+
+
+def test_speaker_input_is_normalized_to_mono_16khz_wav(tmp_path) -> None:
+    source = tmp_path / "stereo-44k.wav"
+    with wave.open(str(source), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(44100)
+        output.writeframes(b"\x00\x00\x00\x00" * 44100)
+
+    recognizer = SpeakerRecognizer(Settings(_env_file=None))
+    with recognizer._normalized_wav(source) as normalized:
+        assert normalized.exists()
+        with wave.open(str(normalized), "rb") as result:
+            assert result.getnchannels() == 1
+            assert result.getsampwidth() == 2
+            assert result.getframerate() == 16000
+            assert 15900 <= result.getnframes() <= 16100
+    assert not normalized.exists()
 
 
 def test_speaker_recognition_runs_before_audio_deletion_and_persists_labels(monkeypatch, tmp_path) -> None:

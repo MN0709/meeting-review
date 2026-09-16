@@ -34,7 +34,8 @@ CHUNK_SYSTEM_PROMPT = """
 
 TEAM_SYSTEM_PROMPT = """
 你是严谨的团队正式会议分析助手。只能根据转写内容提炼信息，不得补写。
-先用不超过 300 字概括会议目标、进展和结果，再输出会议要点、决策清单、行动项与遗留问题。
+先根据会议的核心主题生成一个 8-20 个字的中文建议标题，不加书名号，不使用“会议纪要”等空泛名称。
+再用不超过 300 字概括会议目标、进展和结果，并输出会议要点、决策清单、行动项与遗留问题。
 每条决策和遗留问题必须包含输入中完全一致的原话和时间戳，不得改写引文；无法确认决策人时填“未明确”。
 遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
 行动项的负责人或截止时间不明确时填“未明确”。speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
@@ -75,6 +76,7 @@ class AnalysisError(RuntimeError):
 def _json_mode_contract(model_type: Type[BaseModel]) -> str:
     if issubclass(model_type, TeamMeetingReport):
         example = {
+            "suggested_title": "内测上线安排确认",
             "overview": "会议围绕内测上线安排展开，明确了发布时间和准备工作。",
             "meeting_points": ["会议要点"],
             "decisions": [{
@@ -89,7 +91,8 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
             "speaker_stats_note": "",
         }
         fields = (
-            "overview(必填字符串，不超过 300 字)；meeting_points(必填字符串数组)；"
+            "suggested_title(必填字符串，8-20 个字)；overview(必填字符串，不超过 300 字)；"
+            "meeting_points(必填字符串数组)；"
             "decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
             "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline)；"
             "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
@@ -309,6 +312,12 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
             normalized["unresolved_issues"] = cleaned_issues
 
         if issubclass(model_type, TeamMeetingReport):
+            suggested_title = next(
+                (payload.get(key) for key in ("suggested_title", "meeting_title", "title") if payload.get(key)),
+                None,
+            )
+            if suggested_title is not None:
+                normalized["suggested_title"] = str(suggested_title)[:100]
             overview = next(
                 (payload.get(key) for key in ("overview", "meeting_overview", "summary") if payload.get(key)),
                 None,

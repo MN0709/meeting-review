@@ -18,7 +18,7 @@ from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenEr
 from app.llm import AnalysisError, LLMAnalyzer
 from app.models import (
     ActionItemStatusResult, ActionItemStatusUpdate, MeetingHistory, MeetingListItem,
-    MeetingMoveRequest, MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
+    MeetingMoveRequest, MeetingTitleUpdate, MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
     TaskAccepted, TaskStatus, TeamMeetingReport,
@@ -93,7 +93,7 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
         raise TaskAborted()
     try:
         report = await build_team_report(analysis_transcript, analyzer)
-        if speaker_result and speaker_result.available:
+        if speaker_result:
             report = report.model_copy(update={"speaker_stats_note": speaker_result.message})
         if team_id:
             database.save_report(path.stem, team_id, report)
@@ -397,6 +397,22 @@ async def meeting_list(
 @app.get("/api/meetings/{meeting_id}", response_model=MeetingHistory)
 async def meeting_history(request: Request, meeting_id: str) -> MeetingHistory:
     _assert_team_owns_meeting(meeting_id, request.state.team_id)
+    history = database.get_history(meeting_id, request.state.team_id)
+    if history is None:
+        raise HTTPException(status_code=404, detail="历史报告不存在或尚未生成")
+    return history
+
+
+@app.patch("/api/meetings/{meeting_id}/title", response_model=MeetingHistory)
+async def meeting_title_update(
+    request: Request, meeting_id: str, payload: MeetingTitleUpdate = Body(...),
+) -> MeetingHistory:
+    _assert_team_owns_meeting(meeting_id, request.state.team_id)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="会议标题不能为空")
+    if not database.update_meeting_title(meeting_id, request.state.team_id, title):
+        raise HTTPException(status_code=404, detail="会议不存在")
     history = database.get_history(meeting_id, request.state.team_id)
     if history is None:
         raise HTTPException(status_code=404, detail="历史报告不存在或尚未生成")

@@ -97,6 +97,7 @@ class UnresolvedIssue(StrictModel):
 
 
 class TeamMeetingReport(StrictModel):
+    suggested_title: str = Field(default="", max_length=100)
     overview: str = Field(min_length=1, max_length=300)
     meeting_points: List[str]
     decisions: List[DecisionItem]
@@ -172,6 +173,10 @@ class MeetingListItem(StrictModel):
 
 class MeetingMoveRequest(StrictModel):
     project_id: str
+
+
+class MeetingTitleUpdate(StrictModel):
+    title: str = Field(min_length=1, max_length=100)
 
 
 class MeetingHistory(MeetingListItem):

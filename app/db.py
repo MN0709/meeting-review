@@ -333,6 +333,14 @@ class Database:
             )
         return cursor.rowcount == 1
 
+    def update_meeting_title(self, meeting_id: str, team_id: int, title: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE meetings SET title=? WHERE id=? AND team_id=?",
+                (title, meeting_id, team_id),
+            )
+        return cursor.rowcount == 1
+
     def clear_audio_path(self, meeting_id: str, team_id: int) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(
