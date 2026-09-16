@@ -11,14 +11,15 @@ from uuid import uuid4
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.llm import AnalysisError, LLMAnalyzer
 from app.models import (
     ActionItemStatusResult, ActionItemStatusUpdate, MeetingHistory, MeetingListItem,
-    MeetingMoveRequest, MeetingTitleUpdate, MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
+    MeetingFinalizeRequest, MeetingFinalizeResult, MeetingMoveRequest, MeetingTitleUpdate,
+    MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
     TaskAccepted, TaskStatus, TeamMeetingReport,
@@ -486,11 +487,6 @@ async def speaker_confirm(
     payload: SpeakerConfirmRequest = Body(...),
 ) -> SpeakerConfirmResult:
     _assert_team_owns_meeting(meeting_id, request.state.team_id)
-    if payload.remember_voice and not payload.consent_confirmed:
-        raise HTTPException(
-            status_code=422,
-            detail="记住他人声音前，请确认已取得该参会者同意",
-        )
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="说话人名称不能为空")
@@ -506,11 +502,53 @@ async def speaker_confirm(
     if result is None:
         raise HTTPException(status_code=404, detail="待确认说话人不存在")
     member_id, saved, affected = result
-    if payload.remember_voice and not saved:
-        raise HTTPException(status_code=422, detail="本场没有可用的声音样本，只能保存本场名称")
     return SpeakerConfirmResult(
         member_id=member_id, display_name=name, voiceprint_saved=saved,
         reanalysis_recommended=affected,
+    )
+
+
+@app.post(
+    "/api/meetings/{meeting_id}/finalize", response_model=MeetingFinalizeResult,
+)
+async def meeting_finalize(
+    request: Request, meeting_id: str,
+    payload: MeetingFinalizeRequest = Body(...),
+) -> MeetingFinalizeResult:
+    _assert_team_owns_meeting(meeting_id, request.state.team_id)
+    history = database.get_history(meeting_id, request.state.team_id)
+    pending = [item.display_name for item in history.speakers if item.remember_requested] if history else []
+    has_clips = any(item.clips for item in history.speakers) if history else False
+    consent_already_recorded = history.speaker_consent_confirmed if history else False
+    if (pending or has_clips) and not consent_already_recorded and not payload.consent_confirmed:
+        raise HTTPException(
+            status_code=422,
+            detail="保存代表性声音或声纹前，请统一确认已取得本人同意",
+        )
+    try:
+        members = database.finalize_meeting_voiceprints(
+            meeting_id, request.state.team_id, settings.speaker_model,
+            payload.consent_confirmed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="存在无法保存的声音样本") from exc
+    if members is None:
+        raise HTTPException(status_code=404, detail="会议不存在")
+    return MeetingFinalizeResult(voiceprints_saved=len(members), members=members)
+
+
+@app.get("/api/speaker-clips/{clip_id}")
+async def speaker_clip(request: Request, clip_id: int) -> Response:
+    owner = database.speaker_clip_owner_team_id(clip_id)
+    if owner is not None and owner != request.state.team_id:
+        raise HTTPException(status_code=403, detail="无权访问其他团队的声音片段")
+    result = database.speaker_clip(clip_id, request.state.team_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="声音片段不存在")
+    mime_type, audio = result
+    return Response(
+        content=audio, media_type=mime_type,
+        headers={"Cache-Control": "private, max-age=3600"},
     )
 
 

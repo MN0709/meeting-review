@@ -10,7 +10,7 @@ from typing import Dict, Iterable, Optional
 
 from app.models import (
     ActionStatus, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
-    MemberIdentity, ProjectListItem,
+    MemberIdentity, ProjectListItem, SpeakerClip,
     ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
     TeamMeetingReport, Transcript, TranscriptSegment,
 )
@@ -125,6 +125,18 @@ class Database:
                     updated_at TEXT NOT NULL,
                     UNIQUE(meeting_id, local_label)
                 );
+                CREATE TABLE IF NOT EXISTS speaker_clips(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    team_id INTEGER NOT NULL REFERENCES teams(id),
+                    local_label TEXT NOT NULL,
+                    start REAL NOT NULL,
+                    end REAL NOT NULL,
+                    text TEXT NOT NULL,
+                    mime_type TEXT NOT NULL DEFAULT 'audio/wav',
+                    audio BLOB NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS reports(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     meeting_id TEXT NOT NULL UNIQUE REFERENCES meetings(id) ON DELETE CASCADE,
@@ -148,10 +160,14 @@ class Database:
                 """
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
+            self._ensure_column(connection, "meetings", "speaker_consent_at", "TEXT")
             self._ensure_column(connection, "projects", "parent_id", "TEXT REFERENCES projects(id)")
             self._ensure_column(connection, "members", "role", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(
                 connection, "members", "is_key_decision_maker", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                connection, "meeting_speakers", "remember_requested", "INTEGER NOT NULL DEFAULT 0"
             )
             connection.executescript(
                 """
@@ -169,6 +185,8 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_speaker_profiles_team ON speaker_profiles(team_id);
                 CREATE INDEX IF NOT EXISTS idx_meeting_speakers_team_meeting
                     ON meeting_speakers(team_id, meeting_id);
+                CREATE INDEX IF NOT EXISTS idx_speaker_clips_team_meeting
+                    ON speaker_clips(team_id, meeting_id, local_label);
                 """
             )
             for name, token in team_tokens.items():
@@ -393,6 +411,7 @@ class Database:
             ).fetchone()
             if not owned:
                 raise PermissionError("meeting does not belong to team")
+            connection.execute("DELETE FROM speaker_clips WHERE meeting_id=?", (meeting_id,))
             connection.execute("DELETE FROM meeting_speakers WHERE meeting_id=?", (meeting_id,))
             connection.executemany(
                 """INSERT INTO meeting_speakers(
@@ -409,6 +428,19 @@ class Database:
                     for item in observations
                 ],
             )
+            for item in observations:
+                connection.executemany(
+                    """INSERT INTO speaker_clips(
+                           meeting_id,team_id,local_label,start,end,text,mime_type,audio,created_at
+                       ) VALUES(?,?,?,?,?,?,?, ?,?)""",
+                    [
+                        (
+                            meeting_id, team_id, item.local_label, clip.start, clip.end,
+                            clip.text, "audio/wav", clip.audio, now,
+                        )
+                        for clip in item.clips
+                    ],
+                )
 
     def list_members(self, team_id: int) -> list[MemberIdentity]:
         with self._lock, self._connect() as connection:
@@ -525,7 +557,7 @@ class Database:
         self, meeting_id: str, team_id: int, local_label: str, name: str, role: str,
         is_key_decision_maker: bool, remember_voice: bool, model_version: str,
     ) -> Optional[tuple[int, bool, bool]]:
-        """Map a local label and optionally persist its embedding. Returns member, saved, affected."""
+        """Map a local label; voiceprint persistence is deferred to meeting finalization."""
         now = _utc_now()
         with self._lock, self._connect() as connection:
             speaker = connection.execute(
@@ -554,23 +586,13 @@ class Database:
                     (team_id, name, role, int(is_key_decision_maker), now),
                 )
                 member_id = int(cursor.lastrowid)
-            saved = bool(remember_voice and speaker["embedding_json"])
-            if saved:
-                connection.execute(
-                    """INSERT INTO speaker_profiles(
-                           team_id,member_id,embedding_json,model_version,consented_at,updated_at
-                       ) VALUES(?,?,?,?,?,?)
-                       ON CONFLICT(member_id) DO UPDATE SET
-                           embedding_json=excluded.embedding_json,
-                           model_version=excluded.model_version,
-                           consented_at=excluded.consented_at,updated_at=excluded.updated_at""",
-                    (team_id, member_id, speaker["embedding_json"], model_version, now, now),
-                )
             connection.execute(
-                """UPDATE meeting_speakers SET member_id=?,status=?,updated_at=?
+                """UPDATE meeting_speakers
+                   SET member_id=?,status=?,remember_requested=?,updated_at=?
                    WHERE meeting_id=? AND team_id=? AND local_label=?""",
                 (
-                    member_id, "已确认" if remember_voice else "仅本场", now,
+                    member_id, "已确认" if remember_voice else "仅本场",
+                    int(remember_voice), now,
                     meeting_id, team_id, local_label,
                 ),
             )
@@ -598,7 +620,52 @@ class Database:
                            WHERE meeting_id=? AND owner=?""",
                         (name, now, meeting_id, local_label),
                     )
-        return member_id, saved, affected
+        return member_id, False, affected
+
+    def finalize_meeting_voiceprints(
+        self, meeting_id: str, team_id: int, model_version: str,
+        consent_confirmed: bool = False,
+    ) -> Optional[list[str]]:
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id)
+            ).fetchone()
+            if not owned:
+                return None
+            rows = connection.execute(
+                """SELECT s.member_id,s.embedding_json,m.name
+                   FROM meeting_speakers s JOIN members m ON m.id=s.member_id
+                   WHERE s.meeting_id=? AND s.team_id=? AND s.remember_requested=1""",
+                (meeting_id, team_id),
+            ).fetchall()
+            for row in rows:
+                if not row["embedding_json"]:
+                    raise ValueError("voice sample unavailable")
+                connection.execute(
+                    """INSERT INTO speaker_profiles(
+                           team_id,member_id,embedding_json,model_version,consented_at,updated_at
+                       ) VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(member_id) DO UPDATE SET
+                           embedding_json=excluded.embedding_json,
+                           model_version=excluded.model_version,
+                           consented_at=excluded.consented_at,updated_at=excluded.updated_at""",
+                    (
+                        team_id, row["member_id"], row["embedding_json"],
+                        model_version, now, now,
+                    ),
+                )
+            connection.execute(
+                """UPDATE meeting_speakers SET remember_requested=0,status='已确认',updated_at=?
+                   WHERE meeting_id=? AND team_id=? AND remember_requested=1""",
+                (now, meeting_id, team_id),
+            )
+            if consent_confirmed:
+                connection.execute(
+                    "UPDATE meetings SET speaker_consent_at=? WHERE id=? AND team_id=?",
+                    (now, meeting_id, team_id),
+                )
+        return [row["name"] for row in rows]
 
     def save_report(self, meeting_id: str, team_id: int, report: TeamMeetingReport) -> None:
         payload = report.model_dump_json()
@@ -664,7 +731,8 @@ class Database:
     def get_history(self, meeting_id: str, team_id: int) -> Optional[MeetingHistory]:
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                """SELECT m.id,m.title,m.project_id,m.duration_seconds,m.status,m.created_at,r.json
+                """SELECT m.id,m.title,m.project_id,m.duration_seconds,m.status,m.created_at,
+                          m.speaker_consent_at,r.json
                    FROM meetings m JOIN reports r ON r.meeting_id=m.id
                    WHERE m.id=? AND m.team_id=?""",
                 (meeting_id, team_id),
@@ -677,29 +745,60 @@ class Database:
             ).fetchall() if row else []
             speaker_rows = connection.execute(
                 """SELECT s.local_label,s.member_id,s.confidence,s.status,s.speech_seconds,
-                          s.excerpts_json,s.embedding_json,m.name
+                          s.excerpts_json,s.embedding_json,s.remember_requested,m.name
                    FROM meeting_speakers s LEFT JOIN members m ON m.id=s.member_id
                    WHERE s.meeting_id=? AND s.team_id=? ORDER BY s.id""",
                 (meeting_id, team_id),
             ).fetchall() if row else []
+            clip_rows = connection.execute(
+                """SELECT c.id,c.local_label,c.start,c.end,c.text
+                   FROM speaker_clips c JOIN meetings m ON m.id=c.meeting_id
+                   WHERE c.meeting_id=? AND c.team_id=? AND m.team_id=? ORDER BY c.id""",
+                (meeting_id, team_id, team_id),
+            ).fetchall() if row else []
         if not row:
             return None
         report_payload = self._report_payload(row["json"])
+        clips_by_label: dict[str, list[SpeakerClip]] = {}
+        for clip in clip_rows:
+            clips_by_label.setdefault(clip["local_label"], []).append(SpeakerClip(
+                id=clip["id"], start=clip["start"], end=clip["end"], text=clip["text"],
+            ))
         return MeetingHistory(
             id=row["id"], title=row["title"], project_id=row["project_id"],
             duration_seconds=row["duration_seconds"],
             status=row["status"], created_at=row["created_at"],
             report=TeamMeetingReport.model_validate(report_payload),
             transcript=[TranscriptSegment.model_validate(dict(item)) for item in transcript_rows],
+            speaker_consent_confirmed=row["speaker_consent_at"] is not None,
             speakers=[MeetingSpeaker(
                 local_label=item["local_label"],
                 display_name=item["name"] or item["local_label"],
                 member_id=item["member_id"], confidence=item["confidence"],
                 status=item["status"], speech_seconds=item["speech_seconds"],
                 excerpts=json.loads(item["excerpts_json"]),
+                clips=clips_by_label.get(item["local_label"], []),
                 has_voice_sample=item["embedding_json"] is not None,
+                remember_requested=bool(item["remember_requested"]),
             ) for item in speaker_rows],
         )
+
+    def speaker_clip(self, clip_id: int, team_id: int) -> Optional[tuple[str, bytes]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT c.mime_type,c.audio FROM speaker_clips c
+                   JOIN meetings m ON m.id=c.meeting_id
+                   WHERE c.id=? AND c.team_id=? AND m.team_id=?""",
+                (clip_id, team_id, team_id),
+            ).fetchone()
+        return (row["mime_type"], bytes(row["audio"])) if row else None
+
+    def speaker_clip_owner_team_id(self, clip_id: int) -> Optional[int]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT team_id FROM speaker_clips WHERE id=?", (clip_id,)
+            ).fetchone()
+        return int(row["team_id"]) if row else None
 
     def get_project_memory(
         self, project_id: str, team_id: int, meeting_limit: int = 3

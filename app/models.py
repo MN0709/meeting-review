@@ -183,9 +183,17 @@ class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
     transcript: List[TranscriptSegment]
     speakers: List["MeetingSpeaker"] = Field(default_factory=list)
+    speaker_consent_confirmed: bool = False
 
 
 SpeakerIdentityStatus = Literal["待确认", "已识别", "已确认", "仅本场"]
+
+
+class SpeakerClip(StrictModel):
+    id: int
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    text: str
 
 
 class MeetingSpeaker(StrictModel):
@@ -196,7 +204,9 @@ class MeetingSpeaker(StrictModel):
     status: SpeakerIdentityStatus
     speech_seconds: float = Field(ge=0)
     excerpts: List[str] = Field(default_factory=list)
+    clips: List[SpeakerClip] = Field(default_factory=list)
     has_voice_sample: bool = False
+    remember_requested: bool = False
 
 
 class SpeakerConfirmRequest(StrictModel):
@@ -204,7 +214,15 @@ class SpeakerConfirmRequest(StrictModel):
     role: str = Field(default="", max_length=50)
     is_key_decision_maker: bool = False
     remember_voice: bool = True
+
+
+class MeetingFinalizeRequest(StrictModel):
     consent_confirmed: bool = False
+
+
+class MeetingFinalizeResult(StrictModel):
+    voiceprints_saved: int = Field(ge=0)
+    members: List[str] = Field(default_factory=list)
 
 
 class SpeakerConfirmResult(StrictModel):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import io
 import tempfile
 import threading
 import wave
@@ -34,6 +35,15 @@ class SpeakerObservation:
     matched_member_id: Optional[int] = None
     matched_name: Optional[str] = None
     confidence: Optional[float] = None
+    clips: list["SpeakerClipObservation"] = field(default_factory=list)
+
+
+@dataclass
+class SpeakerClipObservation:
+    start: float
+    end: float
+    text: str
+    audio: bytes
 
 
 @dataclass
@@ -81,6 +91,7 @@ class SpeakerRecognizer:
         self.model_name = settings.speaker_model
         self.threshold = settings.speaker_match_threshold
         self.margin = settings.speaker_match_margin
+        self.intra_merge_threshold = settings.speaker_intra_merge_threshold
         self._model = None
 
     def _load_model(self):
@@ -131,6 +142,48 @@ class SpeakerRecognizer:
         if embedding is None:
             return None
         return [float(value) for value in embedding.detach().cpu().flatten().tolist()]
+
+    @staticmethod
+    def _merge_similar_labels(
+        embeddings: dict[int, Optional[list[float]]], threshold: float,
+    ) -> dict[int, int]:
+        labels = sorted(embeddings)
+        parent = {label: label for label in labels}
+
+        def find(label: int) -> int:
+            while parent[label] != label:
+                parent[label] = parent[parent[label]]
+                label = parent[label]
+            return label
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[max(left_root, right_root)] = min(left_root, right_root)
+
+        for index, left in enumerate(labels):
+            for right in labels[index + 1:]:
+                left_embedding, right_embedding = embeddings[left], embeddings[right]
+                if left_embedding and right_embedding:
+                    if cosine_score(left_embedding, right_embedding) >= threshold:
+                        union(left, right)
+        return {label: find(label) for label in labels}
+
+    @staticmethod
+    def _clip_wav(pcm, sample_rate: int, start: float, end: float) -> bytes:
+        import torch
+
+        start_index = max(0, int(start * sample_rate))
+        end_index = min(pcm.shape[1], int(end * sample_rate))
+        samples = pcm[:, start_index:end_index].mean(dim=0)
+        samples = samples.clamp(-1, 1).mul(32767).to(torch.int16).cpu().numpy().tobytes()
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(sample_rate)
+            output.writeframes(samples)
+        return buffer.getvalue()
 
     @staticmethod
     @contextmanager
@@ -274,7 +327,6 @@ class SpeakerRecognizer:
             )
 
         raw_labels = sorted({label for _, _, label in turns})
-        display_labels = {raw: f"说话人 {index + 1}" for index, raw in enumerate(raw_labels)}
         try:
             import torchaudio
 
@@ -285,6 +337,25 @@ class SpeakerRecognizer:
             logger.warning("speaker_audio_load_failed error_type=%s", type(exc).__name__)
             pcm = None
             sample_rate = 0
+        raw_embeddings: dict[int, Optional[list[float]]] = {}
+        for raw_label in raw_labels:
+            ranges = [(start, end) for start, end, label in turns if label == raw_label]
+            try:
+                raw_embeddings[raw_label] = (
+                    self._cluster_embedding(model, pcm, sample_rate, ranges)
+                    if pcm is not None else None
+                )
+            except Exception as exc:
+                logger.warning("speaker_embedding_failed error_type=%s", type(exc).__name__)
+                raw_embeddings[raw_label] = None
+        merged_labels = self._merge_similar_labels(
+            raw_embeddings, self.intra_merge_threshold,
+        )
+        turns = [(start, end, merged_labels[label]) for start, end, label in turns]
+        final_labels = sorted({label for _, _, label in turns})
+        display_labels = {
+            raw: f"说话人 {index + 1}" for index, raw in enumerate(final_labels)
+        }
         segments: list[TranscriptSegment] = []
         for segment in transcript.segments:
             raw_label = self._assign_label(segment, turns)
@@ -294,11 +365,14 @@ class SpeakerRecognizer:
         labeled = transcript.model_copy(update={"segments": segments})
 
         observations: list[SpeakerObservation] = []
-        for raw_label in raw_labels:
+        for raw_label in final_labels:
             local_label = display_labels[raw_label]
             ranges = [(start, end) for start, end, label in turns if label == raw_label]
             try:
-                embedding = (
+                original_labels = [
+                    label for label, canonical in merged_labels.items() if canonical == raw_label
+                ]
+                embedding = raw_embeddings[original_labels[0]] if len(original_labels) == 1 else (
                     self._cluster_embedding(model, pcm, sample_rate, ranges)
                     if pcm is not None else None
                 )
@@ -308,7 +382,20 @@ class SpeakerRecognizer:
             match, confidence = best_profile_match(
                 embedding or [], profiles, self.threshold, self.margin,
             )
-            excerpts = [segment.text for segment in segments if segment.speaker_label == local_label][:3]
+            speaker_segments = [
+                segment for segment in segments if segment.speaker_label == local_label
+            ]
+            excerpts = [segment.text for segment in speaker_segments[:3]]
+            clips: list[SpeakerClipObservation] = []
+            if pcm is not None:
+                for segment in speaker_segments[:3]:
+                    clip_end = min(segment.end, segment.start + 12.0)
+                    if clip_end - segment.start < 0.4:
+                        continue
+                    clips.append(SpeakerClipObservation(
+                        start=segment.start, end=clip_end, text=segment.text,
+                        audio=self._clip_wav(pcm, sample_rate, segment.start, clip_end),
+                    ))
             observations.append(SpeakerObservation(
                 local_label=local_label,
                 embedding=embedding,
@@ -317,6 +404,7 @@ class SpeakerRecognizer:
                 matched_member_id=match.member_id if match else None,
                 matched_name=match.name if match else None,
                 confidence=confidence,
+                clips=clips,
             ))
 
         names = {item.local_label: item.matched_name for item in observations if item.matched_name}

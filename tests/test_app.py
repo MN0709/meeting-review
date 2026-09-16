@@ -28,8 +28,8 @@ from app.models import ChunkSummary, ReviewReport, SemanticAnalysis, TaskAccepte
 from app.pipeline import build_report
 from app.security import AdmissionController, AdmissionError, SHANGHAI_TZ
 from app.speaker import (
-    KnownVoiceProfile, SpeakerObservation, SpeakerRecognitionResult, SpeakerRecognizer,
-    best_profile_match,
+    KnownVoiceProfile, SpeakerClipObservation, SpeakerObservation,
+    SpeakerRecognitionResult, SpeakerRecognizer, best_profile_match,
 )
 from app.stats import compute_speech_stats
 from app.tasks import InMemoryTaskManager
@@ -233,6 +233,7 @@ def test_team_long_meeting_defaults() -> None:
     assert settings.speaker_model == "chinese"
     assert settings.speaker_match_threshold == 0.72
     assert settings.speaker_match_margin == 0.05
+    assert settings.speaker_intra_merge_threshold == 0.78
 
 
 def test_duration_probe_reads_metadata_without_decoding(monkeypatch, tmp_path) -> None:
@@ -743,6 +744,11 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "长会议仍在后台处理" in html
     assert "音频转写完成后即删除" in html
     assert "确认并记住此声音" in html
+    assert "▶ 听这段" in html
+    assert "voiceConsentDialog" in html
+    assert "已取得同意并完成" in html
+    assert "consent_confirmed:consentConfirmed" in html
+    assert "已取得该参会者同意" not in html
     assert "organizeMeetingDialog" in html
     assert "整理本次会议" in html
     assert "suggestedMeetingTitle" in html
@@ -1824,8 +1830,8 @@ def test_speaker_input_is_normalized_to_mono_16khz_wav(tmp_path) -> None:
 
 
 def test_speaker_wav_fallback_works_without_torchaudio_backend(monkeypatch, tmp_path) -> None:
-    import torch
-    import torchaudio
+    torch = pytest.importorskip("torch")
+    torchaudio = pytest.importorskip("torchaudio")
 
     source = tmp_path / "mono-16k.wav"
     with wave.open(str(source), "wb") as output:
@@ -1849,6 +1855,75 @@ def test_speaker_wav_fallback_works_without_torchaudio_backend(monkeypatch, tmp_
     assert normalized[0, 0].item() == pytest.approx(0.5)
     assert integer_pcm.dtype == torch.int16
     assert integer_pcm[0, 0].item() == 16384
+
+
+def test_same_voice_clusters_are_merged_before_speaker_cards_are_built() -> None:
+    # Labels 1 and 4 represent two non-contiguous turns from the same voice.
+    mapping = SpeakerRecognizer._merge_similar_labels(
+        {
+            1: [1.0, 0.0],
+            2: [-1.0, 0.0],
+            3: [0.0, -1.0],
+            4: [0.8, 0.6],
+        },
+        threshold=0.78,
+    )
+
+    assert mapping[4] == mapping[1]
+    assert mapping[2] != mapping[1]
+    assert mapping[3] != mapping[1]
+
+
+def test_speaker_clips_persist_with_report_and_are_team_isolated() -> None:
+    team_id = main_module.database.authenticate("test-access-token")
+    meeting_id = "speaker-clip-meeting"
+    main_module.database.create_meeting(
+        meeting_id, team_id, "可回听说话人", Path("/tmp/speaker-clip.wav")
+    )
+    main_module.database.save_transcript(meeting_id, team_id, Transcript(
+        duration_seconds=3,
+        segments=[TranscriptSegment(
+            start=0, end=3, text="我来确认这个决策", speaker_label="说话人 1",
+        )],
+    ))
+    main_module.database.save_meeting_speakers(meeting_id, team_id, [SpeakerObservation(
+        local_label="说话人 1", embedding=[1.0, 0.0], speech_seconds=3,
+        excerpts=["我来确认这个决策"],
+        clips=[SpeakerClipObservation(
+            start=0, end=3, text="我来确认这个决策", audio=b"RIFF-test-voice",
+        )],
+    )])
+    main_module.database.save_report(meeting_id, team_id, team_report())
+
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        history = client.get(f"/api/meetings/{meeting_id}")
+        assert history.status_code == 200
+        clips = history.json()["speakers"][0]["clips"]
+        assert clips == [{
+            "id": clips[0]["id"], "start": 0.0, "end": 3.0,
+            "text": "我来确认这个决策",
+        }]
+        clip_id = clips[0]["id"]
+        audio = client.get(f"/api/speaker-clips/{clip_id}")
+        assert audio.status_code == 200
+        assert audio.headers["content-type"].startswith("audio/wav")
+        assert audio.content == b"RIFF-test-voice"
+        missing_consent = client.post(
+            f"/api/meetings/{meeting_id}/finalize", json={"consent_confirmed": False},
+        )
+        assert missing_consent.status_code == 422
+        finalized = client.post(
+            f"/api/meetings/{meeting_id}/finalize", json={"consent_confirmed": True},
+        )
+        assert finalized.status_code == 200
+        assert client.get(f"/api/meetings/{meeting_id}").json()[
+            "speaker_consent_confirmed"
+        ] is True
+        forbidden = client.get(
+            f"/api/speaker-clips/{clip_id}",
+            headers={"X-Access-Token": "other-team-token"},
+        )
+        assert forbidden.status_code == 403
 
 
 def test_speaker_recognition_runs_before_audio_deletion_and_persists_labels(monkeypatch, tmp_path) -> None:
@@ -1897,7 +1972,7 @@ def test_speaker_recognition_runs_before_audio_deletion_and_persists_labels(monk
     assert history.speakers[0].has_voice_sample is True
 
 
-def test_confirm_voice_once_enables_team_profile_and_enforces_consent_and_isolation() -> None:
+def test_confirm_voice_then_final_consent_enables_team_profile_and_enforces_isolation() -> None:
     team_id = main_module.database.authenticate("test-access-token")
     meeting_id = "voice-confirm-meeting"
     main_module.database.create_meeting(
@@ -1922,31 +1997,37 @@ def test_confirm_voice_once_enables_team_profile_and_enforces_consent_and_isolat
     )
 
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
-        no_consent = client.post(
-            f"/api/meetings/{meeting_id}/speakers/%E8%AF%B4%E8%AF%9D%E4%BA%BA%201/confirm",
-            json={"name": "宁总", "remember_voice": True, "consent_confirmed": False},
-        )
-        assert no_consent.status_code == 422
-
         confirmed = client.post(
             f"/api/meetings/{meeting_id}/speakers/%E8%AF%B4%E8%AF%9D%E4%BA%BA%201/confirm",
             json={
                 "name": "宁总", "role": "老板", "is_key_decision_maker": True,
-                "remember_voice": True, "consent_confirmed": True,
+                "remember_voice": True,
             },
         )
         assert confirmed.status_code == 200
-        assert confirmed.json()["voiceprint_saved"] is True
+        assert confirmed.json()["voiceprint_saved"] is False
         assert confirmed.json()["reanalysis_recommended"] is True
 
         history = client.get(f"/api/meetings/{meeting_id}").json()
         assert history["speakers"][0]["display_name"] == "宁总"
         assert history["speakers"][0]["status"] == "已确认"
+        assert history["speakers"][0]["remember_requested"] is True
         assert history["report"]["decisions"][0]["decision_maker"] == "宁总"
         members = client.get("/api/members").json()
         assert members[0]["name"] == "宁总"
         assert members[0]["is_key_decision_maker"] is True
-        assert members[0]["has_voiceprint"] is True
+        assert members[0]["has_voiceprint"] is False
+
+        missing_final_consent = client.post(
+            f"/api/meetings/{meeting_id}/finalize", json={"consent_confirmed": False},
+        )
+        assert missing_final_consent.status_code == 422
+        finalized = client.post(
+            f"/api/meetings/{meeting_id}/finalize", json={"consent_confirmed": True},
+        )
+        assert finalized.status_code == 200
+        assert finalized.json() == {"voiceprints_saved": 1, "members": ["宁总"]}
+        assert client.get("/api/members").json()[0]["has_voiceprint"] is True
         profile = main_module.database.voice_profiles(team_id)[0]
         assert profile["embedding"] == [0.8, 0.2]
         future_match, _ = best_profile_match(

@@ -17,7 +17,8 @@
 - 处理进度：排队中、转写中、AI 分析中、完成或失败；超过 30 分钟的已知音频会提示用户可以关闭页面，任务仍在后台继续，完成后从历史记录查看。
 - 会议历史：“全部会议”页按时间列出团队历史；项目详情页只列出该项目的会议。数据库保留的旧二级数据会自动归并到所属项目，不单独展示。
 - 项目连续回顾：选择项目后聚合最近 3 场已完成会议的决策、行动项和遗留问题；每项标明来源会议，行动项可人工设置状态。
-- 说话人确认：报告中展示本场说话人、发言片段、时长、自动匹配置信度和状态。用户可保存本场名称，或在勾选“已取得参会者同意”后把声纹保存到团队身份库。
+- 说话人确认：报告中展示本场说话人、可点击回听的代表片段、时长、自动匹配置信度和状态。同一声音被过度切成多个标签时会先尝试合并，最终身份仍由用户确认。
+- 声音授权：不再要求每位说话人分别勾选同意；点击“完成整理”时统一显示参会者名单并确认授权。
 - 团队声纹身份库：身份跨项目共享；姓名、角色和“关键决策人”由用户维护，声纹可单独删除。
 - 报告：①会议总览；②会议要点；③决策清单；④行动项；⑤遗留问题；⑥说话人确认；⑦识别状态。点击引文时间戳可展开带说话人标签的转写上下文。
 
@@ -60,6 +61,8 @@ meeting-review/
   |-- GET /api/tasks/{id}（仅处理中/短期任务）
   |-- GET /api/meetings[/{id}]（当前团队历史）
   |-- POST /api/meetings/{id}/speakers/{label}/confirm
+  |-- POST /api/meetings/{id}/finalize（统一授权与声纹落库）
+  |-- GET /api/speaker-clips/{id}（团队隔离的代表音频）
   `-- GET/PATCH /api/members + DELETE /api/members/{id}/voiceprint
                          |
 鉴权 -> IP 限频 -> 每日上限 -> 队列上限 -> 磁盘检查
@@ -72,7 +75,9 @@ meeting-review/
               >30 分钟音频按 30 分钟解码分块，控制峰值内存
                          |
               WeSpeaker 本地说话人分离
+              同场高相似标签合并
               团队声纹匹配（阈值 + 候选差值）
+                         |-- 提取每人最多 3 段代表音频
                          |-- 然后删除原始音频
                          |-- segments 写入 SQLite
                          `-- 代码层二次时长检查
@@ -134,7 +139,9 @@ curl http://127.0.0.1:8000/health
 - `PATCH /api/meetings/{id}/title`：用户接受或编辑 AI 建议标题后更新会议标题；跨团队访问返回 403。
 - `PATCH /api/meetings/{id}/project`：经用户确认后移动到当前团队的另一文件夹，保留转写稿和报告。
 - `PATCH /api/action-items/{id}`：把行动项状态更新为待确认、进行中、已完成或已取消；跨团队访问返回 403。
-- `POST /api/meetings/{id}/speakers/{label}/confirm`：确认本场说话人；`remember_voice=true` 时必须同时传 `consent_confirmed=true`。
+- `POST /api/meetings/{id}/speakers/{label}/confirm`：确认本场说话人；`remember_voice=true` 只标记待保存，不在此接口写入长期声纹。
+- `POST /api/meetings/{id}/finalize`：完成整理并统一确认参会者授权；确认后才把待保存声纹写入团队身份库。
+- `GET /api/speaker-clips/{id}`：读取历史报告中的代表性短音频；按团队隔离，跨团队返回 403。
 - `GET /api/members`：列出当前团队身份库；`PATCH /api/members/{id}` 修改姓名、角色和关键决策人标记。
 - `DELETE /api/members/{id}/voiceprint`：只删除该成员声纹，保留姓名与历史会议。
 - `POST /api/members/{id}/merge`：把重复身份合并进同团队的目标成员，并同步明确匹配的历史责任人名称。
@@ -156,6 +163,7 @@ curl http://127.0.0.1:8000/health
 | `SPEAKER_MODEL` | 否 | `chinese` | WeSpeaker 中文模型名或本地模型目录 |
 | `SPEAKER_MATCH_THRESHOLD` | 否 | `0.72` | 自动身份匹配的最低置信度，需真实录音校准 |
 | `SPEAKER_MATCH_MARGIN` | 否 | `0.05` | 第一与第二候选的最小分差，防止相似声音误认 |
+| `SPEAKER_INTRA_MERGE_THRESHOLD` | 否 | `0.78` | 同场被过度切分的说话人标签合并阈值，需真实录音校准 |
 | `DATABASE_PATH` | 否 | `data/meeting-review.db` | SQLite 路径；Compose 使用 `/data/meeting-review.db` |
 | `MAX_UPLOAD_MB` | 否 | `300` | 上传大小上限（MB） |
 | `MAX_AUDIO_MINUTES` | 否 | `240` | PyAV 与转写后双重时长上限（默认 4 小时） |
@@ -200,7 +208,8 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ## 隐私与已知限制
 
-- 音频在转写和本地声纹特征提取完成后即删除；转写失败、分析失败、超时和优雅停机也会清理临时音频。文件以任务 ID 随机命名，原文件名不落盘。
+- 完整音频在转写和本地声纹特征提取完成后即删除；转写失败、分析失败、超时和优雅停机也会清理临时音频。文件以任务 ID 随机命名，原文件名不落盘。
+- 用户选择保留代表性声音：每位说话人最多 3 段、每段最长 12 秒，与报告一起长期保存在本服务器 SQLite，按团队隔离，删除会议时级联删除。“完成整理”时仅统一授权一次。
 - 经用户确认和授权的声纹 embedding 仅保存在本服务器 SQLite，按团队隔离，可在“团队声纹身份库”单独删除。未确认的本场候选特征会随会议数据保存，用于原音频删除后仍能完成人工确认；删除会议时一并删除。
 - 转写文本与报告仅保存在本服务器 SQLite，按团队隔离，不会用于其他用途；分析时文本会发送给运营方配置的 AI 服务，其数据政策取决于服务商。
 - 日志不记录原文件名、转写文本、模型引文、团队口令或 API Key，仅保留请求 ID、任务 ID、阶段、错误类型和 Token 用量。
