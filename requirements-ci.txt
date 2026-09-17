@@ -1,0 +1,23 @@
+# CI 专用轻量依赖集合。
+#
+# 为什么不直接用 requirements.lock：
+#   faster-whisper / wespeaker / torch 在源码里全部是**延迟导入**
+#   （app/transcription.py:54、app/speaker.py:99、app/speaker.py:130），
+#   测试里也一律被 mock。装 torch 会让每个 CI 任务多下载数百 MB，
+#   而它只影响 1 项被 pytest.importorskip 标为可选的测试。
+#
+# 代价（如实记录）：CI 结果为 90 passed + 1 skipped；完整 91 passed 在本地验证。
+# 详见 docs/阶段文档/会议agent开发文档/第2阶段P0技术开发文档.md 第十二节。
+#
+# 版本锁定到当前已验证的环境（本地 91 passed / 干净 Python 3.12 90 passed + 1 skipped）。
+
+fastapi==0.128.8
+python-multipart==0.0.20
+openai==2.48.0
+pydantic-settings==2.11.0
+tzdata==2026.3
+pytest==8.4.2
+httpx==0.28.1
+av==15.1.0
+numpy==2.0.2
+ruff==0.14.0

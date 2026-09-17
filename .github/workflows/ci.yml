@@ -1,0 +1,66 @@
+name: CI
+
+# R-P0-1：保证「改动不会悄悄弄坏已有功能」。
+# 三个 Python 版本矩阵 + 语法编译 + pytest + ruff。
+#
+# 依赖说明：安装的是 requirements-ci.txt（轻量集合）而不是 requirements.lock。
+# 原因见该文件顶部注释：faster-whisper / wespeaker / torch 全部是延迟导入，
+# 测试里一律被 mock，装 torch 只会让每个任务多下载数百 MB。
+# 代价：CI 结果为 90 passed + 1 skipped（1 项由 pytest.importorskip 标为可选）；
+# 完整 91 passed 在本地（含 torch）验证。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest + lint (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    env:
+      # 测试夹具用的团队口令（与 tests/test_app.py 的 AUTH_HEADERS 一致），不是真实密钥。
+      TEAM_TOKENS: "测试团队:test-access-token,另一团队:other-team-token"
+      DATABASE_PATH: "/tmp/meeting-review-ci.db"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-ci.txt
+            requirements.txt
+            requirements.lock
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+
+      - name: 语法编译（任何语法错误必须让 CI 红灯）
+        run: python -m compileall -q app
+
+      - name: 单元测试
+        run: python -m pytest -q
+
+      - name: Lint
+        run: python -m ruff check app tests
+
+      - name: 底线检查——代码与前端产物中不得出现密钥
+        run: |
+          if grep -rInE "sk-[A-Za-z0-9]{20,}" --include="*.py" --include="*.html" --include="*.json" --include="*.toml" app static; then
+            echo "::error::发现疑似 API Key，密钥不得进入代码或前端产物"
+            exit 1
+          fi
+          echo "未发现密钥，通过"

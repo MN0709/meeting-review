@@ -5,6 +5,25 @@ from pydantic import Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# 口令强度下限（PRD R-P0-3）。16 位是阻止"1234"这类可猜口令的最低门槛。
+MIN_TEAM_TOKEN_LENGTH = 16
+
+
+def _token_strength_problem(name: str, token: str) -> Optional[str]:
+    """返回口令不合规的原因；合规时返回 None。
+
+    只把"纯 ASCII 数字"和"纯 ASCII 字母"判为弱口令：
+    中文长口令（如 16 字以上词组）熵远高于此门槛，不应被误伤。
+    """
+    if len(token) < MIN_TEAM_TOKEN_LENGTH:
+        return f"TEAM_TOKENS 中团队「{name}」的口令至少 {MIN_TEAM_TOKEN_LENGTH} 位（当前 {len(token)} 位）"
+    if token.isascii() and token.isdigit():
+        return f"TEAM_TOKENS 中团队「{name}」的口令不能是纯数字"
+    if token.isascii() and token.isalpha():
+        return f"TEAM_TOKENS 中团队「{name}」的口令不能是纯字母"
+    return None
+
+
 class Settings(BaseSettings):
     app_host: str = Field(default="127.0.0.1", alias="APP_HOST")
     app_port: int = Field(default=8000, ge=1, le=65535, alias="APP_PORT")
@@ -34,6 +53,11 @@ class Settings(BaseSettings):
     database_path: str = Field(default="data/meeting-review.db", alias="DATABASE_PATH")
     llm_max_retries: int = Field(default=2, alias="LLM_MAX_RETRIES")
     transcript_chunk_chars: int = Field(default=6000, alias="TRANSCRIPT_CHUNK_CHARS")
+    # 单价留空时只落 token、不换算金额，避免把价格硬编码进代码或数据库。
+    llm_price_prompt_per_1k: Optional[float] = Field(default=None, ge=0, alias="LLM_PRICE_PROMPT_PER_1K")
+    llm_price_completion_per_1k: Optional[float] = Field(
+        default=None, ge=0, alias="LLM_PRICE_COMPLETION_PER_1K"
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -51,19 +75,35 @@ class Settings(BaseSettings):
             name, token = (part.strip() for part in entry.split(":", 1))
             if not name or not token or name in teams or token in seen_tokens:
                 raise ValueError("TEAM_TOKENS 中团队名和口令必须非空且不能重复")
+            problem = _token_strength_problem(name, token)
+            if problem is not None:
+                raise ValueError(problem)
             teams[name] = token
             seen_tokens.add(token)
         if not teams:
             raise ValueError("TEAM_TOKENS 至少需要配置一个团队")
         return teams
 
+    def redacted_api_key_state(self) -> str:
+        """只返回"已配置/未配置"，供启动日志使用，避免密钥原文进入日志。"""
+        return "已配置" if self.openai_api_key else "未配置"
+
 
 @lru_cache
 def get_settings() -> Settings:
     try:
-        return Settings()
+        settings = Settings()
     except ValidationError as exc:
         missing_team_tokens = any(error.get("loc") == ("TEAM_TOKENS",) for error in exc.errors())
         if missing_team_tokens:
             raise RuntimeError("缺少必填环境变量 TEAM_TOKENS，服务拒绝启动") from exc
         raise
+    try:
+        settings.parsed_team_tokens()
+    except ValueError as exc:
+        raise RuntimeError(
+            "TEAM_TOKENS 不合规，服务拒绝启动：{}\n"
+            "修复指引：把每个团队的口令改成不少于 {} 位、且不是纯数字或纯字母的随机字符串，"
+            "然后重新启动服务（口令只写在 .env，不要提交到仓库）。".format(exc, MIN_TEAM_TOKEN_LENGTH)
+        ) from exc
+    return settings

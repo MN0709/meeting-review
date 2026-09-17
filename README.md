@@ -111,9 +111,17 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# 编辑 .env，至少填写 TEAM_TOKENS 和 OPENAI_API_KEY
+# 编辑 .env：填写 TEAM_TOKENS 和 OPENAI_API_KEY
+# TEAM_TOKENS 的口令有强度要求（启动时校验，不合规会直接拒绝启动）：
+#   · 长度 ≥ 16 位
+#   · 不能是纯数字，也不能是纯英文
+#   生成示例：python3 -c "import secrets;print('mr-'+secrets.token_urlsafe(16))"
 python run.py
 ```
+
+> 依赖区分两份清单：`requirements.txt` 是运行所需的完整集合（含 WeSpeaker 等本地模型依赖）；
+> `requirements-ci.txt` 是 CI 用的轻量集合（不装 torch / faster-whisper / wespeaker，
+> 因为它们都是延迟导入、测试里被 mock）。`requirements.lock` 是当前环境的完整快照。
 
 打开 <http://127.0.0.1:8000>。健康检查无需团队口令：
 
@@ -152,7 +160,7 @@ curl http://127.0.0.1:8000/health
 
 | 变量 | 必需 | 默认值 | 用途 |
 |---|---:|---|---|
-| `TEAM_TOKENS` | **是** | 无 | `团队名:口令,团队名:口令`；启动时解析并 upsert 到 `teams`，本地也必须配置 |
+| `TEAM_TOKENS` | **是** | 无 | `团队名:口令,团队名:口令`；启动时解析并 upsert 到 `teams`，本地也必须配置。**口令强度：≥ 16 位，且不能是纯数字或纯英文；不合规服务直接拒绝启动**（见 R-P0-3） |
 | `OPENAI_API_KEY` | **是** | 无 | OpenAI 兼容 LLM 密钥 |
 | `OPENAI_BASE_URL` | 否 | SDK 默认 | 兼容服务 `/v1` 地址 |
 | `OPENAI_MODEL` | 否 | `gpt-4o-mini` | 分析模型 |
@@ -174,6 +182,8 @@ curl http://127.0.0.1:8000/health
 | `DAILY_TASK_LIMIT` | 否 | `30` | 按 `Asia/Shanghai` 自然日计算的全局任务上限 |
 | `TRANSCRIPT_CHUNK_CHARS` | 否 | `6000` | 长文本分块阈值 |
 | `LLM_MAX_RETRIES` | 否 | `2` | 结构或证据校验失败后的重试次数 |
+| `LLM_PRICE_PROMPT_PER_1K` | 否 | 空 | 输入 token 单价（每 1000）；留空时只记 token、`cost` 返回 `null`，价格不硬编码 |
+| `LLM_PRICE_COMPLETION_PER_1K` | 否 | 空 | 输出 token 单价（每 1000）；同上 |
 | `APP_HOST` / `APP_PORT` | 否 | `127.0.0.1` / `8000` | 监听地址与端口 |
 | `FORWARDED_ALLOW_IPS` | 否 | `127.0.0.1` | Uvicorn 信任的直接代理 IP/网段 |
 
@@ -228,12 +238,17 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 ## 测试与成本占位
 
 ```bash
-pytest -q
-docker build -t meeting-review .
-docker compose config
+# 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
+python -m pytest -q            # 本地完整环境：103 passed
+python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
+python -m compileall -q app    # 语法编译
 ```
 
-测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏。LLM 每次调用会记录 `stage/model/prompt_tokens/completion_tokens/total_tokens`，后续用真实会议填写成本：
+**CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
+CI 使用 `requirements-ci.txt` 轻量集合，因此结果为 **102 passed + 1 skipped**（跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选）；完整 103 项在本地验证。
+
+测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）。
+LLM 每次调用已在日志里记录 `stage/model/prompt_tokens/completion_tokens/total_tokens`。**落库归因（`llm_usage` 表 + `GET /api/usage`）属 P0 的下一个子阶段，尚未实现**，真实会议成本也待真实录音后回填：
 
 声纹真实录音验收按 [docs/VOICEPRINT_TEST_SCRIPT.md](docs/VOICEPRINT_TEST_SCRIPT.md) 录制两场会议：第一场确认身份，第二场验证同人自动识别和新人待确认。
 

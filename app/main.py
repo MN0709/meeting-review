@@ -117,6 +117,12 @@ async def lifespan(_: FastAPI):
     database.initialize(settings.parsed_team_tokens())
     prepare_upload_dir()
     await task_manager.start()
+    logger.info(
+        "startup model=%s api_key=%s database=%s",
+        settings.openai_model,
+        settings.redacted_api_key_state(),
+        settings.database_path,
+    )
     yield
     await task_manager.stop()
 

@@ -239,8 +239,16 @@ class Database:
     def authenticate(self, candidate: str) -> Optional[int]:
         import hmac
 
+        # hmac.compare_digest 不接受含非 ASCII 字符的 str，而 Starlette 把请求头按
+        # latin-1 解码，任意字节序列都可能出现（例如客户端发来畸形口令）。
+        # 统一转成 UTF-8 字节再比较：既保留时序安全比较，也避免把 403 变成 500。
+        # 详见 P0 阶段文档第十二节的风险记录。
+        try:
+            candidate_bytes = candidate.encode("utf-8")
+        except UnicodeEncodeError:  # pragma: no cover - 防御性兜底
+            return None
         for token, team_id in self._tokens.items():
-            if hmac.compare_digest(candidate, token):
+            if hmac.compare_digest(candidate_bytes, token.encode("utf-8")):
                 return team_id
         return None
 
