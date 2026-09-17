@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from app.models import (
     ActionStatus, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
@@ -157,6 +157,19 @@ class Database:
                     updated_at TEXT NOT NULL,
                     UNIQUE(meeting_id, item_index)
                 );
+                CREATE TABLE IF NOT EXISTS llm_usage(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    meeting_id TEXT NULL,
+                    project_id TEXT NULL,
+                    stage TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_tokens INTEGER NULL,
+                    completion_tokens INTEGER NULL,
+                    total_tokens INTEGER NULL,
+                    duration_ms INTEGER NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
@@ -187,6 +200,12 @@ class Database:
                     ON meeting_speakers(team_id, meeting_id);
                 CREATE INDEX IF NOT EXISTS idx_speaker_clips_team_meeting
                     ON speaker_clips(team_id, meeting_id, local_label);
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_team_meeting
+                    ON llm_usage(team_id, meeting_id);
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_team_project
+                    ON llm_usage(team_id, project_id);
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_team_created
+                    ON llm_usage(team_id, created_at);
                 """
             )
             for name, token in team_tokens.items():
@@ -251,6 +270,106 @@ class Database:
             if hmac.compare_digest(candidate_bytes, token.encode("utf-8")):
                 return team_id
         return None
+
+    # ------------------------------------------------------------------
+    # LLM 成本归因（PRD R-P0-2 / §11.1）
+    # ------------------------------------------------------------------
+
+    def meeting_context(self, meeting_id: str, team_id: int) -> Optional[Dict[str, Any]]:
+        """返回本团队某场会议的成本归因上下文；不属于本团队则返回 None。"""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT id, project_id FROM meetings WHERE id = ? AND team_id = ?",
+                (meeting_id, team_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"meeting_id": row["id"], "project_id": row["project_id"]}
+
+    def record_llm_usage(
+        self,
+        team_id: int,
+        stage: str,
+        model: str,
+        meeting_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        created_at: Optional[str] = None,
+    ) -> None:
+        """写入一次 LLM 调用的用量。只记数值与标识，永不记 prompt / 回复原文。"""
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO llm_usage(
+                       team_id,meeting_id,project_id,stage,model,
+                       prompt_tokens,completion_tokens,total_tokens,duration_ms,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    team_id, meeting_id, project_id, stage, model,
+                    prompt_tokens, completion_tokens, total_tokens, duration_ms,
+                    created_at or _utc_now(),
+                ),
+            )
+
+    def usage_summary(
+        self,
+        team_id: int,
+        meeting_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """按 stage / 会议聚合用量，严格限定在 team_id 内。表为空时返回零值与空列表。"""
+        conditions = ["team_id = ?"]
+        params: List[Any] = [team_id]
+        if meeting_id is not None:
+            conditions.append("meeting_id = ?")
+            params.append(meeting_id)
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if date_from is not None:
+            conditions.append("created_at >= ?")
+            params.append(date_from)
+        if date_to is not None:
+            conditions.append("created_at <= ?")
+            params.append(date_to)
+        where = " AND ".join(conditions)
+
+        aggregates = """COUNT(*) AS calls,
+                        COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,
+                        COALESCE(SUM(completion_tokens),0) AS completion_tokens,
+                        COALESCE(SUM(total_tokens),0) AS total_tokens,
+                        COALESCE(SUM(duration_ms),0) AS duration_ms"""
+        with self._lock, self._connect() as connection:
+            totals = connection.execute(
+                "SELECT {} FROM llm_usage WHERE {}".format(aggregates, where), params
+            ).fetchone()
+            by_stage = connection.execute(
+                """SELECT stage, model, {}, MIN(created_at) AS first_at, MAX(created_at) AS last_at
+                   FROM llm_usage WHERE {}
+                   GROUP BY stage, model ORDER BY stage ASC, model ASC""".format(aggregates, where),
+                params,
+            ).fetchall()
+            by_meeting = connection.execute(
+                """SELECT meeting_id, project_id, {}, MIN(created_at) AS first_at, MAX(created_at) AS last_at
+                   FROM llm_usage WHERE {} AND meeting_id IS NOT NULL
+                   GROUP BY meeting_id, project_id ORDER BY MAX(created_at) DESC""".format(
+                    aggregates, where
+                ),
+                params,
+            ).fetchall()
+
+        def _row(row: sqlite3.Row) -> Dict[str, Any]:
+            return {key: row[key] for key in row.keys()}
+
+        return {
+            "totals": _row(totals),
+            "by_stage": [_row(row) for row in by_stage],
+            "by_meeting": [_row(row) for row in by_meeting],
+        }
 
     def create_project(
         self, project_id: str, team_id: int, name: str, parent_id: Optional[str] = None

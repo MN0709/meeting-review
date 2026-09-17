@@ -1,10 +1,13 @@
 import asyncio
+import contextlib
+import contextvars
 import copy
 import json
 import logging
 import re
 import threading
-from typing import Any, Dict, List, Optional, Sequence, Type
+import time
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Type
 
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -14,6 +17,27 @@ from app.models import ChunkSummary, SemanticAnalysis, TeamChunkSummary, TeamMee
 
 
 logger = logging.getLogger(__name__)
+
+# 成本归因上下文（team_id / meeting_id / project_id）。
+# 用 ContextVar 而不是实例属性：asyncio.to_thread 会复制上下文，
+# 因此工作线程里的 _request_sync 能读到同一个值；若未设置则为 None。
+_usage_context_var: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "llm_usage_context", default=None
+)
+
+
+def usage_scope(context: Optional[Dict[str, Any]]) -> contextlib.AbstractContextManager:
+    """在 `with` 块内为所有 LLM 调用附加归因上下文；退出时恢复。"""
+
+    @contextlib.contextmanager
+    def _scope() -> Iterator[None]:
+        token = _usage_context_var.set(context)
+        try:
+            yield
+        finally:
+            _usage_context_var.reset(token)
+
+    return _scope()
 
 SYSTEM_PROMPT = """
 你是严谨的个人会议表现教练。你的分析对象是录音中的用户。
@@ -486,10 +510,20 @@ def validate_team_chunk_evidence(report: TeamChunkSummary, segments: Sequence[Tr
 
 
 class LLMAnalyzer:
-    def __init__(self, settings: Settings, client: Optional[OpenAI] = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: Optional[OpenAI] = None,
+        usage_recorder: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         self.settings = settings
         self._client = client
         self._client_lock = threading.Lock()
+        # 成本落库的旁路回调；不传则只写日志（现有行为）。
+        self._usage_recorder = usage_recorder
+        # 该模型是否支持 response_format=json_schema。首次实测后缓存：
+        # 否则每次调用都要先发一次必然失败的请求再降级，等于双倍请求与双倍计费。
+        self._json_schema_supported: Optional[bool] = None
 
     @property
     def client(self) -> OpenAI:
@@ -506,6 +540,40 @@ class LLMAnalyzer:
                     )
         return self._client
 
+    def _record_usage(
+        self,
+        stage: str,
+        model: str,
+        usage: Any,
+        duration_ms: int,
+        usage_context: Optional[Dict[str, Any]],
+    ) -> None:
+        """把一次调用的用量交给旁路记录器。只交数值与标识，不交 prompt / 回复原文。"""
+        if self._usage_recorder is None:
+            return
+        context = usage_context or {}
+        team_id = context.get("team_id")
+        if team_id is None:
+            return
+        try:
+            self._usage_recorder(
+                {
+                    "team_id": team_id,
+                    "meeting_id": context.get("meeting_id"),
+                    "project_id": context.get("project_id"),
+                    "stage": stage,
+                    "model": model,
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                    "duration_ms": duration_ms,
+                }
+            )
+        except Exception as exc:  # 成本记账是旁路，永远不能影响主链路
+            logger.warning(
+                "llm_usage_record_failed stage=%s error_type=%s", stage, type(exc).__name__
+            )
+
     def _request_sync(
         self,
         model_type: Type[BaseModel],
@@ -513,7 +581,14 @@ class LLMAnalyzer:
         user_prompt: str,
         stage: str,
         response_mode: str,
+        usage_context: Optional[Dict[str, Any]] = None,
     ) -> str:
+        if response_mode == "json_schema" and self._json_schema_supported is False:
+            # 已知该模型不支持 json_schema：直接走 json_object，省掉一次必然失败的请求。
+            response_mode = "json_object"
+        if usage_context is None:
+            # 未显式传入时，取 usage_scope() 设置的归因上下文。
+            usage_context = _usage_context_var.get()
         if response_mode == "json_schema":
             response_format: Dict[str, Any] = {
                 "type": "json_schema",
@@ -527,24 +602,36 @@ class LLMAnalyzer:
             response_format = {"type": "json_object"}
             user_prompt += _json_mode_contract(model_type)
 
-        response = self.client.chat.completions.create(
-            model=self.settings.openai_model,
-            temperature=0.1,
-            response_format=response_format,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
+        started_at = time.monotonic()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.settings.openai_model,
+                temperature=0.1,
+                response_format=response_format,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception:
+            if response_mode == "json_schema":
+                self._json_schema_supported = False
+            raise
+        if response_mode == "json_schema":
+            self._json_schema_supported = True
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+
         usage = getattr(response, "usage", None)
         logger.info(
-            "llm_usage stage=%s model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            "llm_usage stage=%s model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s duration_ms=%s",
             stage,
             self.settings.openai_model,
             getattr(usage, "prompt_tokens", None),
             getattr(usage, "completion_tokens", None),
             getattr(usage, "total_tokens", None),
+            duration_ms,
         )
+        self._record_usage(stage, self.settings.openai_model, usage, duration_ms, usage_context)
         content = response.choices[0].message.content
         if not content:
             raise AnalysisError("LLM 返回了空内容")
@@ -557,6 +644,7 @@ class LLMAnalyzer:
         user_prompt: str,
         stage: str,
         transcript_segments: Optional[Sequence[TranscriptSegment]] = None,
+        usage_context: Optional[Dict[str, Any]] = None,
     ) -> BaseModel:
         last_error: Optional[Exception] = None
         previous_output = ""
@@ -578,6 +666,7 @@ class LLMAnalyzer:
                         user_prompt + repair,
                         "{}:attempt{}".format(stage, attempt + 1),
                         response_mode,
+                        usage_context,
                     )
                 except Exception as exc:
                     if response_mode == "json_schema":
@@ -593,6 +682,7 @@ class LLMAnalyzer:
                             user_prompt + repair,
                             "{}:attempt{}:fallback".format(stage, attempt + 1),
                             response_mode,
+                            usage_context,
                         )
                     else:
                         raise
@@ -666,7 +756,9 @@ class LLMAnalyzer:
         )
         return SemanticAnalysis.model_validate(result.model_dump())
 
-    async def analyze_team(self, transcript: Transcript) -> TeamMeetingReport:
+    async def analyze_team(
+        self, transcript: Transcript, usage_context: Optional[Dict[str, Any]] = None
+    ) -> TeamMeetingReport:
         if not transcript.segments:
             raise AnalysisError("没有可分析的转写内容")
         if len(transcript.text) <= self.settings.transcript_chunk_chars:
@@ -676,6 +768,7 @@ class LLMAnalyzer:
                 "请生成团队会议报告。\n\n带时间戳转写：\n" + format_segments(transcript.segments),
                 "team_final_direct",
                 transcript.segments,
+                usage_context,
             )
             return TeamMeetingReport.model_validate(result.model_dump())
 
@@ -684,7 +777,7 @@ class LLMAnalyzer:
             self._validated_call(
                 TeamChunkSummary, TEAM_CHUNK_SYSTEM_PROMPT,
                 "这是第 {}/{} 块：\n{}".format(index, len(chunks), format_segments(chunk)),
-                "team_chunk_{}".format(index), chunk,
+                "team_chunk_{}".format(index), chunk, usage_context,
             )
             for index, chunk in enumerate(chunks, start=1)
         ])
@@ -696,5 +789,6 @@ class LLMAnalyzer:
             + json.dumps(summaries, ensure_ascii=False),
             "team_final_merge",
             transcript.segments,
+            usage_context,
         )
         return TeamMeetingReport.model_validate(result.model_dump())

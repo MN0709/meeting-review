@@ -295,3 +295,47 @@ class ProjectMemory(StrictModel):
     decisions: List[ProjectMemoryDecision]
     action_items: List[ProjectMemoryAction]
     unresolved_issues: List[ProjectMemoryIssue]
+
+
+# ---------------------------------------------------------------------------
+# LLM 成本归因（PRD R-P0-2）：GET /api/usage 的响应契约
+# ---------------------------------------------------------------------------
+
+
+class LLMUsageTotals(StrictModel):
+    calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    duration_ms: int
+    # 未配置单价时为 None（不把价格硬编码进代码或数据库）
+    cost: Optional[float] = None
+
+
+class LLMUsageStageSummary(LLMUsageTotals):
+    stage: str
+    model: str
+    first_at: Optional[str] = None
+    last_at: Optional[str] = None
+
+
+class LLMUsageMeetingSummary(LLMUsageTotals):
+    meeting_id: str
+    project_id: Optional[str] = None
+    first_at: Optional[str] = None
+    last_at: Optional[str] = None
+
+
+class LLMUsageFilters(StrictModel):
+    meeting_id: Optional[str] = None
+    project_id: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    price_configured: bool
+
+
+class LLMUsageReport(StrictModel):
+    filters: LLMUsageFilters
+    totals: LLMUsageTotals
+    by_stage: List[LLMUsageStageSummary]
+    by_meeting: List[LLMUsageMeetingSummary]

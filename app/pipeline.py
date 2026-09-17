@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Any, Dict, Optional, Protocol
 
 from app.models import ReviewReport, SemanticAnalysis, TeamMeetingReport, Transcript
 from app.stats import compute_speech_stats
@@ -15,5 +15,7 @@ async def build_report(transcript: Transcript, analyzer: Analyzer) -> ReviewRepo
     return ReviewReport(stats=stats, **semantic.model_dump())
 
 
-async def build_team_report(transcript: Transcript, analyzer) -> TeamMeetingReport:
-    return await analyzer.analyze_team(transcript)
+async def build_team_report(
+    transcript: Transcript, analyzer, usage_context: Optional[Dict[str, Any]] = None
+) -> TeamMeetingReport:
+    return await analyzer.analyze_team(transcript, usage_context)

@@ -5,8 +5,9 @@ import shutil
 import sqlite3
 import tempfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Set
+from typing import Any, Dict, Optional, Set
 from uuid import uuid4
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
@@ -15,9 +16,11 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
-from app.llm import AnalysisError, LLMAnalyzer
+from app.llm import AnalysisError, LLMAnalyzer, usage_scope
 from app.models import (
-    ActionItemStatusResult, ActionItemStatusUpdate, MeetingHistory, MeetingListItem,
+    ActionItemStatusResult, ActionItemStatusUpdate, LLMUsageFilters, LLMUsageMeetingSummary,
+    LLMUsageReport, LLMUsageStageSummary, LLMUsageTotals,
+    MeetingHistory, MeetingListItem,
     MeetingFinalizeRequest, MeetingFinalizeResult, MeetingMoveRequest, MeetingTitleUpdate,
     MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
@@ -41,7 +44,18 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 settings = get_settings()
 database = Database(settings.database_path)
 transcriber = WhisperTranscriber(settings)
-analyzer = LLMAnalyzer(settings)
+
+
+def _record_llm_usage(payload: Dict[str, Any]) -> None:
+    """把一次 LLM 调用的用量写入 llm_usage（PRD R-P0-2）。
+
+    成本记账是旁路：只记数值与标识，永不记 prompt / 回复原文；
+    写库失败不会中断分析主链路（异常已在 LLMAnalyzer 内部捕获并只记日志）。
+    """
+    database.record_llm_usage(**payload)
+
+
+analyzer = LLMAnalyzer(settings, usage_recorder=_record_llm_usage)
 speaker_recognizer = SpeakerRecognizer(settings)
 admission = AdmissionController(settings.rate_limit_per_hour, settings.daily_task_limit)
 
@@ -58,6 +72,12 @@ def _on_audio_deleted(record: TaskRecord) -> None:
 
 async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingReport:
     team_id = database.owner_team_id(path.stem)
+    # 成本归因上下文：让每次 LLM 调用都能按会议 / 项目归属（PRD R-P0-2）。
+    usage_context: Optional[Dict[str, Any]] = None
+    if team_id:
+        meeting_context = database.meeting_context(path.stem, team_id)
+        if meeting_context is not None:
+            usage_context = {"team_id": team_id, **meeting_context}
     if not progress("转写中", "正在转写，长会议可能需要较长时间…"):
         raise TaskAborted()
     speaker_result = None
@@ -93,7 +113,8 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
     if not progress("AI 分析中", "转写完成，正在进行 AI 分析…"):
         raise TaskAborted()
     try:
-        report = await build_team_report(analysis_transcript, analyzer)
+        with usage_scope(usage_context):
+            report = await build_team_report(analysis_transcript, analyzer)
         if speaker_result:
             report = report.model_copy(update={"speaker_stats_note": speaker_result.message})
         if team_id:
@@ -128,6 +149,28 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="会脉 · 团队会议记忆", version="0.3.0", lifespan=lifespan)
+
+
+class APIError(Exception):
+    """新增接口（`/api/usage`、后续 `/api/agent/*`）的统一错误结构。
+
+    老 20 个接口继续返回 `{"detail": ...}`（PRD P-6 契约不动）；
+    新接口返回 `{"error": {"code", "message"}}`，与 AGENTS.md 底线 3 一致。
+    """
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
+@app.exception_handler(APIError)
+async def api_error_handler(_: Request, exc: APIError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message}},
+    )
 
 
 @app.middleware("http")
@@ -304,6 +347,85 @@ async def project_memory(request: Request, project_id: str) -> ProjectMemory:
     if memory is None:
         raise HTTPException(status_code=404, detail="项目文件夹不存在")
     return memory
+
+
+def _parse_iso8601(value: Optional[str], field_name: str) -> Optional[str]:
+    """校验并归一化时间参数；非法值返回 422 而不是 500。"""
+    if value is None or value.strip() == "":
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise APIError(422, "invalid_args", "{} 不是合法的 ISO8601 时间，例如 2026-09-18T00:00:00+08:00".format(field_name)) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
+
+
+@app.get("/api/usage", response_model=LLMUsageReport)
+async def llm_usage_report(
+    request: Request,
+    meeting_id: Optional[str] = Query(default=None),
+    project_id: Optional[str] = Query(default=None),
+    date_from: Optional[str] = Query(default=None, alias="from"),
+    date_to: Optional[str] = Query(default=None, alias="to"),
+) -> LLMUsageReport:
+    """按 stage / 会议聚合 LLM 用量与估算成本，严格限定在本团队内（PRD R-P0-2）。"""
+    team_id = request.state.team_id
+    if meeting_id is not None:
+        if database.meeting_context(meeting_id, team_id) is None:
+            owner = database.owner_team_id(meeting_id)
+            if owner is None:
+                raise APIError(404, "not_found", "会议不存在")
+            raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+    if project_id is not None:
+        owner = database.project_owner_team_id(project_id)
+        if owner is None:
+            raise APIError(404, "not_found", "项目文件夹不存在")
+        if owner != team_id:
+            raise APIError(403, "team_forbidden", "无权访问其他团队的项目文件夹")
+
+    parsed_from = _parse_iso8601(date_from, "from")
+    parsed_to = _parse_iso8601(date_to, "to")
+    summary = database.usage_summary(
+        team_id,
+        meeting_id=meeting_id,
+        project_id=project_id,
+        date_from=parsed_from,
+        date_to=parsed_to,
+    )
+
+    # 金额由可配置单价换算；未配置单价时返回 None，不在代码或数据库里硬编码价格。
+    prompt_price = settings.llm_price_prompt_per_1k
+    completion_price = settings.llm_price_completion_per_1k
+    price_configured = prompt_price is not None or completion_price is not None
+
+    def estimate_cost(row: Dict[str, Any]) -> Optional[float]:
+        if not price_configured:
+            return None
+        cost = 0.0
+        if prompt_price is not None:
+            cost += (row.get("prompt_tokens") or 0) / 1000 * prompt_price
+        if completion_price is not None:
+            cost += (row.get("completion_tokens") or 0) / 1000 * completion_price
+        return round(cost, 6)
+
+    return LLMUsageReport(
+        filters=LLMUsageFilters(
+            meeting_id=meeting_id,
+            project_id=project_id,
+            date_from=parsed_from,
+            date_to=parsed_to,
+            price_configured=price_configured,
+        ),
+        totals=LLMUsageTotals(**summary["totals"], cost=estimate_cost(summary["totals"])),
+        by_stage=[
+            LLMUsageStageSummary(**row, cost=estimate_cost(row)) for row in summary["by_stage"]
+        ],
+        by_meeting=[
+            LLMUsageMeetingSummary(**row, cost=estimate_cost(row)) for row in summary["by_meeting"]
+        ],
+    )
 
 
 @app.patch("/api/action-items/{action_id}", response_model=ActionItemStatusResult)
