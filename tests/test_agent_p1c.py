@@ -338,6 +338,33 @@ REPORT_PAYLOAD = {
 }
 
 
+def test_agent_trace_endpoint_shape_and_team_scope(tmp_path, monkeypatch) -> None:
+    import app.main as main_module
+    from fastapi.testclient import TestClient
+
+    path = tmp_path / "trace.db"
+    db = Database(path)
+    # 用与 settings 相同的团队名初始化，避免 TestClient 启动时 lifespan 重建 token→team 映射后不一致。
+    db.initialize(main_module.settings.parsed_team_tokens())
+    team_a = db.authenticate(TOKEN)
+    db.create_meeting("m1", team_a, "周会", tmp_path / "a.m4a")
+    db.record_agent_audit(
+        team_id=team_a, session_id="s1", meeting_id="m1", step=1,
+        tool_name="get_transcript", decision="allow", result_code="ok", duration_ms=3,
+    )
+    monkeypatch.setattr(main_module, "database", db)
+
+    with TestClient(main_module.app) as client:
+        ok = client.get("/api/meetings/m1/agent-trace", headers={"X-Access-Token": TOKEN})
+        assert ok.status_code == 200
+        body = ok.json()
+        assert body["total_calls"] == 1 and body["tool_names"] == ["get_transcript"]
+        assert body["steps"][0]["result_code"] == "ok"
+        # 跨团队读同一会议 → 403
+        other = client.get("/api/meetings/m1/agent-trace", headers={"X-Access-Token": "other-team-token"})
+        assert other.status_code == 403
+
+
 def test_agent_mode_run_validates_evidence_before_return(tmp_path, monkeypatch) -> None:
     import app.main as main_module
     from app.tasks import TaskProcessingError

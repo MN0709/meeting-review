@@ -149,6 +149,7 @@ curl http://127.0.0.1:8000/health
 - `GET /api/tasks/{task_id}`：只查询内存中的处理中或 30 分钟内终态任务；跨团队访问返回 403。
 - `GET /api/meetings`：当前团队会议列表，可用 `project_id` 或 `unclassified=true` 过滤；一级目录查询可传 `include_children=true` 汇总二级目录。
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
+- `GET /api/meetings/{id}/agent-trace`：**只读**返回这场会议里 Agent 的每一步工具调用（会话 / 步 / 工具 / 判定 / 结果 / 耗时），按 `team_id` 隔离，跨团队 403。它是页面第 ⑨ 节「Agent 步骤（只读）」的数据源，也是 M1 的产品验收入口。
 - `PATCH /api/meetings/{id}/title`：用户接受或编辑 AI 建议标题后更新会议标题；跨团队访问返回 403。
 - `PATCH /api/meetings/{id}/project`：经用户确认后移动到当前团队的另一文件夹，保留转写稿和报告。
 - `PATCH /api/action-items/{id}`：把行动项状态更新为待确认、进行中、已完成或已取消；跨团队访问返回 403。

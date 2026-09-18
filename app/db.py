@@ -1233,6 +1233,20 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_agent_audit_for_meeting(
+        self, meeting_id: str, team_id: int, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """按会议读取 Agent 步骤轨迹（只读展示用；已按 team_id 隔离）。"""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT session_id, step, tool_name, decision, result_code,
+                          duration_ms, created_at
+                   FROM agent_audit WHERE meeting_id=? AND team_id=?
+                   ORDER BY id LIMIT ?""",
+                (meeting_id, team_id, max(1, min(int(limit), 1000))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     # ------------------------------------------------------------------
     # 只读工具用的查询（PRD §9.1）；全部按 team_id 先做归属校验。
     # ------------------------------------------------------------------

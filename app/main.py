@@ -24,7 +24,8 @@ from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.llm import AnalysisError, LLMAnalyzer, usage_scope, validate_team_evidence
 from app.models import (
-    ActionItemStatusResult, ActionItemStatusUpdate, LLMUsageFilters, LLMUsageMeetingSummary,
+    ActionItemStatusResult, ActionItemStatusUpdate, AgentTrace, AgentTraceStep,
+    LLMUsageFilters, LLMUsageMeetingSummary,
     LLMUsageReport, LLMUsageStageSummary, LLMUsageTotals,
     MeetingHistory, MeetingListItem,
     MeetingFinalizeRequest, MeetingFinalizeResult, MeetingMoveRequest, MeetingTitleUpdate,
@@ -527,6 +528,24 @@ async def llm_usage_report(
         by_meeting=[
             LLMUsageMeetingSummary(**row, cost=estimate_cost(row)) for row in summary["by_meeting"]
         ],
+    )
+
+
+@app.get("/api/meetings/{meeting_id}/agent-trace", response_model=AgentTrace)
+async def meeting_agent_trace(request: Request, meeting_id: str) -> AgentTrace:
+    """只读展示：这场会议里 Agent 每一步调用了什么工具、判定与耗时（PRD §14.1 M1 验收入口）。
+
+    仅按 team_id 隔离读取 agent_audit；无任何写操作。默认（pipeline）下通常为空。
+    """
+    _assert_team_owns_meeting(meeting_id, request.state.team_id)
+    rows = database.list_agent_audit_for_meeting(meeting_id, request.state.team_id)
+    return AgentTrace(
+        meeting_id=meeting_id,
+        mode=settings.agent_mode,
+        audit_enabled=settings.agent_audit_enabled,
+        total_calls=len(rows),
+        tool_names=sorted({row["tool_name"] for row in rows if row["tool_name"]}),
+        steps=[AgentTraceStep(**row) for row in rows],
     )
 
 

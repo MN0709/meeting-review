@@ -339,3 +339,27 @@ class LLMUsageReport(StrictModel):
     totals: LLMUsageTotals
     by_stage: List[LLMUsageStageSummary]
     by_meeting: List[LLMUsageMeetingSummary]
+
+
+# ---------------------------------------------------------------------------
+# Agent 步骤轨迹（只读展示用；PRD §14.1 M1 验收入口）
+# ---------------------------------------------------------------------------
+
+
+class AgentTraceStep(StrictModel):
+    session_id: str
+    step: Optional[int] = None
+    tool_name: Optional[str] = None
+    decision: str
+    result_code: Optional[str] = None
+    duration_ms: Optional[int] = None
+    created_at: str
+
+
+class AgentTrace(StrictModel):
+    meeting_id: str
+    mode: str
+    audit_enabled: bool
+    total_calls: int
+    tool_names: List[str]
+    steps: List[AgentTraceStep]
