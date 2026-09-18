@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     agent_tools_enabled: str = Field(default="readonly", alias="AGENT_TOOLS_ENABLED")
     agent_write_tools_enabled: bool = Field(default=False, alias="AGENT_WRITE_TOOLS_ENABLED")
     agent_audit_enabled: bool = Field(default=True, alias="AGENT_AUDIT_ENABLED")
+    agent_step_timeout_seconds: float = Field(
+        default=120, gt=0, alias="AGENT_STEP_TIMEOUT_SECONDS"
+    )
+    agent_session_timeout_seconds: float = Field(
+        default=1800, gt=0, alias="AGENT_SESSION_TIMEOUT_SECONDS"
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

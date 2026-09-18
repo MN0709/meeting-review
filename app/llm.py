@@ -637,6 +637,56 @@ class LLMAnalyzer:
             raise AnalysisError("LLM 返回了空内容")
         return content
 
+    def _chat_with_tools_sync(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        stage: str,
+        usage_context: Optional[Dict[str, Any]],
+    ) -> Any:
+        """R-P1-1：带工具目录的一轮对话（**新增方法**，不改任何现有内部实现）。
+
+        复用同一个 OpenAI 客户端与同一条用量落库路径（R-P0-2），
+        使 Agent 的每一次模型调用也能按 stage 归因成本。
+        """
+        if usage_context is None:
+            usage_context = _usage_context_var.get()
+        kwargs: Dict[str, Any] = {
+            "model": self.settings.openai_model,
+            "temperature": 0.1,
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        started_at = time.monotonic()
+        response = self.client.chat.completions.create(**kwargs)
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        usage = getattr(response, "usage", None)
+        logger.info(
+            "llm_usage stage=%s model=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s duration_ms=%s",
+            stage,
+            self.settings.openai_model,
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+            getattr(usage, "total_tokens", None),
+            duration_ms,
+        )
+        self._record_usage(stage, self.settings.openai_model, usage, duration_ms, usage_context)
+        return response
+
+    async def chat_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        *,
+        stage: str = "agent_step",
+        usage_context: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """带工具调用的一轮对话，供 Agent 循环使用。"""
+        return await asyncio.to_thread(
+            self._chat_with_tools_sync, messages, tools, stage, usage_context
+        )
+
     async def _validated_call(
         self,
         model_type: Type[BaseModel],

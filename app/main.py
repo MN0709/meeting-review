@@ -14,11 +14,15 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, Up
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from app.agent.builtin_hooks import build_default_hooks
+from app.agent.permissions.policy import PermissionPolicy
+from app.agent.runner import MeetingAgentRunner
+from app.agent.session import AgentLimits
 from app.agent.tools import default_registry as agent_tool_registry
 from app.agent.tools.catalog import register_all_tools
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
-from app.llm import AnalysisError, LLMAnalyzer, usage_scope
+from app.llm import AnalysisError, LLMAnalyzer, usage_scope, validate_team_evidence
 from app.models import (
     ActionItemStatusResult, ActionItemStatusUpdate, LLMUsageFilters, LLMUsageMeetingSummary,
     LLMUsageReport, LLMUsageStageSummary, LLMUsageTotals,
@@ -61,6 +65,27 @@ analyzer = LLMAnalyzer(settings, usage_recorder=_record_llm_usage)
 # 注册 8 个只读工具 + 3 个能力工具（PRD §9.1/§9.2）。pipeline 模式下不会调用它们，
 # 仅用于 /api/agent/tools 调试端点枚举。
 register_all_tools(agent_tool_registry, database, analyzer)
+
+
+def _build_meeting_agent() -> MeetingAgentRunner:
+    """组装 Agent 运行时（R-P1-1/5/10）：工具表 + 权限策略 + 钩子 + 限额。"""
+    return MeetingAgentRunner(
+        registry=agent_tool_registry,
+        analyzer=analyzer,
+        policy=PermissionPolicy(
+            tools_enabled=settings.agent_tools_enabled,
+            write_tools_enabled=settings.agent_write_tools_enabled,
+        ),
+        hooks=build_default_hooks(database, audit_enabled=settings.agent_audit_enabled),
+        limits=AgentLimits(
+            max_steps=settings.agent_max_steps,
+            step_timeout_seconds=settings.agent_step_timeout_seconds,
+            session_timeout_seconds=settings.agent_session_timeout_seconds,
+        ),
+    )
+
+
+meeting_agent = _build_meeting_agent()
 speaker_recognizer = SpeakerRecognizer(settings)
 admission = AdmissionController(settings.rate_limit_per_hour, settings.daily_task_limit)
 
@@ -119,7 +144,12 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
         raise TaskAborted()
     try:
         with usage_scope(usage_context):
-            report = await build_team_report(analysis_transcript, analyzer)
+            if settings.agent_mode == "agent" and team_id:
+                report = await _run_agent_report(path.stem, team_id)
+            else:
+                report = await build_team_report(analysis_transcript, analyzer)
+                if settings.agent_mode == "shadow" and team_id:
+                    await _shadow_agent_compare(path.stem, team_id, report)
         if speaker_result:
             report = report.model_copy(update={"speaker_stats_note": speaker_result.message})
         if team_id:
@@ -127,6 +157,53 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
         return report
     except AnalysisError as exc:
         raise TaskProcessingError(502, str(exc)) from exc
+
+
+async def _run_agent_report(meeting_id: str, team_id: int) -> TeamMeetingReport:
+    """AGENT_MODE=agent：模型自主编排产出报告，再由确定性代码校验（写库仍由本函数外完成）。"""
+    outcome = await meeting_agent.run(meeting_id=meeting_id, team_id=team_id)
+    if outcome.report is None:
+        raise TaskProcessingError(
+            502, "Agent 未能在限定范围内产出报告（status={}）".format(outcome.status)
+        )
+    report = TeamMeetingReport.model_validate(outcome.report)
+    transcript = database.load_transcript(meeting_id, team_id)
+    if transcript is not None:
+        try:
+            validate_team_evidence(report, transcript.segments)
+        except ValueError as exc:
+            raise TaskProcessingError(
+                502, "Agent 报告的引文校验未通过：{}".format(str(exc)[:150])
+            ) from exc
+    return report
+
+
+async def _shadow_agent_compare(
+    meeting_id: str, team_id: int, pipeline_report: TeamMeetingReport
+) -> None:
+    """AGENT_MODE=shadow：Agent 也跑一遍，但**不落库**，只记录与 pipeline 的关键差异。"""
+    try:
+        outcome = await meeting_agent.run(
+            meeting_id=meeting_id, team_id=team_id, session_id="shadow-{}".format(meeting_id)
+        )
+    except Exception as exc:
+        logger.warning("shadow_failed meeting_id=%s error_type=%s", meeting_id, type(exc).__name__)
+        return
+    agent_report: Optional[TeamMeetingReport] = None
+    if outcome.report is not None:
+        try:
+            agent_report = TeamMeetingReport.model_validate(outcome.report)
+        except Exception:
+            agent_report = None
+    logger.info(
+        "shadow_compare meeting_id=%s status=%s steps=%s tools=%s "
+        "pipeline_decisions=%s agent_decisions=%s pipeline_actions=%s agent_actions=%s",
+        meeting_id, outcome.status, outcome.steps, len(outcome.records),
+        len(pipeline_report.decisions),
+        len(agent_report.decisions) if agent_report else -1,
+        len(pipeline_report.action_items),
+        len(agent_report.action_items) if agent_report else -1,
+    )
 
 
 task_manager = InMemoryTaskManager(

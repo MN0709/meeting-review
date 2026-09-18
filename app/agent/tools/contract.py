@@ -24,6 +24,7 @@ ToolResultCode = Literal[
     "invalid_args",
     "too_large",
     "denied_host_owned",
+    "denied_policy",
     "tool_error",
 ]
 
@@ -34,6 +35,7 @@ VALID_CODES: tuple[str, ...] = (
     "invalid_args",
     "too_large",
     "denied_host_owned",
+    "denied_policy",
     "tool_error",
 )
 
@@ -49,6 +51,7 @@ DEFAULT_HINTS: dict[str, str] = {
     "invalid_args": "参数不合法，请检查参数名与类型后重试。",
     "too_large": "返回内容过大，请缩小查询范围或分页获取。",
     "denied_host_owned": "该操作只能由人在界面上执行，你无权调用。",
+    "denied_policy": "该工具当前未开启或不在允许范围内，请不要重试。",
     "tool_error": "工具执行失败，可换一种方式，或在报告中把该项标记为待确认。",
 }
 
