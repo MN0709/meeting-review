@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import re
@@ -15,8 +16,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.agent.builtin_hooks import build_default_hooks
+from app.agent.goal import GoalJudge, build_goal_evaluator
+from app.agent.harness import AgentHarness
 from app.agent.permissions.policy import PermissionPolicy
-from app.agent.runner import MeetingAgentRunner
+from app.agent.planning import Planner
 from app.agent.session import AgentLimits
 from app.agent.tools import default_registry as agent_tool_registry
 from app.agent.tools.catalog import register_all_tools
@@ -68,9 +71,9 @@ analyzer = LLMAnalyzer(settings, usage_recorder=_record_llm_usage)
 register_all_tools(agent_tool_registry, database, analyzer)
 
 
-def _build_meeting_agent() -> MeetingAgentRunner:
-    """组装 Agent 运行时（R-P1-1/5/10）：工具表 + 权限策略 + 钩子 + 限额。"""
-    return MeetingAgentRunner(
+def _build_meeting_agent() -> AgentHarness:
+    """s15 唯一装配点：工具表 + 权限 + 钩子 + 规划 + 完成判定 + 限额 + 动态提示词。"""
+    return AgentHarness(
         registry=agent_tool_registry,
         analyzer=analyzer,
         policy=PermissionPolicy(
@@ -78,11 +81,14 @@ def _build_meeting_agent() -> MeetingAgentRunner:
             write_tools_enabled=settings.agent_write_tools_enabled,
         ),
         hooks=build_default_hooks(database, audit_enabled=settings.agent_audit_enabled),
+        planner=Planner(),
+        goal_judge=GoalJudge(build_goal_evaluator(settings.agent_goal_judge, analyzer)),
         limits=AgentLimits(
             max_steps=settings.agent_max_steps,
             step_timeout_seconds=settings.agent_step_timeout_seconds,
             session_timeout_seconds=settings.agent_session_timeout_seconds,
         ),
+        context_budget_tokens=settings.agent_context_budget_tokens,
     )
 
 
@@ -162,7 +168,7 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
 
 async def _run_agent_report(meeting_id: str, team_id: int) -> TeamMeetingReport:
     """AGENT_MODE=agent：模型自主编排产出报告，再由确定性代码校验（写库仍由本函数外完成）。"""
-    outcome = await meeting_agent.run(meeting_id=meeting_id, team_id=team_id)
+    outcome = await meeting_agent.run_meeting(meeting_id=meeting_id, team_id=team_id)
     if outcome.report is None:
         raise TaskProcessingError(
             502, "Agent 未能在限定范围内产出报告（status={}）".format(outcome.status)
@@ -184,7 +190,7 @@ async def _shadow_agent_compare(
 ) -> None:
     """AGENT_MODE=shadow：Agent 也跑一遍，但**不落库**，只记录与 pipeline 的关键差异。"""
     try:
-        outcome = await meeting_agent.run(
+        outcome = await meeting_agent.run_meeting(
             meeting_id=meeting_id, team_id=team_id, session_id="shadow-{}".format(meeting_id)
         )
     except Exception as exc:
@@ -324,6 +330,8 @@ if settings.agent_mode != "pipeline":
     async def agent_tools() -> dict:
         return {
             "mode": settings.agent_mode,
+            "goal_judge": settings.agent_goal_judge,
+            "system_prompt": meeting_agent.build_prompt(),
             "tools": [
                 {
                     "name": spec.name,
@@ -539,6 +547,13 @@ async def meeting_agent_trace(request: Request, meeting_id: str) -> AgentTrace:
     """
     _assert_team_owns_meeting(meeting_id, request.state.team_id)
     rows = database.list_agent_audit_for_meeting(meeting_id, request.state.team_id)
+    plan: list = []
+    task = database.get_agent_task(meeting_id, request.state.team_id)
+    if task and task.get("progress_json"):
+        try:
+            plan = json.loads(task["progress_json"]).get("todo", []) or []
+        except (ValueError, TypeError):
+            plan = []
     return AgentTrace(
         meeting_id=meeting_id,
         mode=settings.agent_mode,
@@ -546,6 +561,7 @@ async def meeting_agent_trace(request: Request, meeting_id: str) -> AgentTrace:
         total_calls=len(rows),
         tool_names=sorted({row["tool_name"] for row in rows if row["tool_name"]}),
         steps=[AgentTraceStep(**row) for row in rows],
+        plan=[{"task": str(item.get("task", "")), "status": str(item.get("status", "pending"))} for item in plan],
     )
 
 

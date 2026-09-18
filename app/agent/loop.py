@@ -1,8 +1,9 @@
-"""R-P1-1：标准 Agent 循环（全仓唯一主循环，s15 将来在此装配）。
+"""R-P1-1：标准 Agent 循环（全仓唯一主循环，s15 在其上装配各机制）。
 
-循环骨架：调用模型 → 若没有 tool_use 则终止 → 逐个执行工具并回灌结果 → 继续。
+循环骨架：重建系统提示词 → 调用模型 → 若没有 tool_use 则交给完成判定 →
+逐个执行工具并回灌结果 → 继续。
 
-终止条件是「模型不再产生 tool_use」，不是固定轮次；
+终止条件是「模型不再产生 tool_use」且独立评估器认可，不是固定轮次；
 三重保障：max_steps + 单步超时 + 会话超时。
 """
 
@@ -17,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from app.agent.hooks import HookManager
 from app.agent.permissions.policy import PermissionPolicy
-from app.agent.session import AgentLimits, AgentSession, ToolCallRecord
+from app.agent.session import AgentLimits, AgentSession, GoalJudgment, ToolCallRecord, bind_session
 from app.agent.tools.contract import ToolResult, failure
 from app.agent.tools.registry import ToolRegistry, ToolSpec
 
@@ -39,12 +40,18 @@ class AgentLoop:
         policy: PermissionPolicy,
         hooks: Optional[HookManager] = None,
         limits: Optional[AgentLimits] = None,
+        planner: Optional[Any] = None,
+        goal_judge: Optional[Any] = None,
+        prompt_builder: Optional[Any] = None,
     ) -> None:
         self.registry = registry
         self.model = model
         self.policy = policy
         self.hooks = hooks or HookManager()
         self.limits = limits or AgentLimits()
+        self.planner = planner
+        self.goal_judge = goal_judge
+        self.prompt_builder = prompt_builder
 
     def available_tools(self) -> List[ToolSpec]:
         """只把策略允许的工具暴露给模型（拒绝判定仍会再走一次，双保险）。"""
@@ -65,6 +72,7 @@ class AgentLoop:
                 if time.monotonic() - started > self.limits.session_timeout_seconds:
                     session.status = "session_timeout"
                     break
+                session.refresh_system_prompt(self.prompt_builder)
                 try:
                     response = await asyncio.wait_for(
                         self.model.step(
@@ -90,8 +98,9 @@ class AgentLoop:
                 message = response.choices[0].message
                 tool_calls = list(getattr(message, "tool_calls", None) or [])
                 if not tool_calls:
-                    session.status = "completed"
-                    break
+                    if await self._finalize(session):
+                        break
+                    continue
 
                 session.append_assistant(getattr(message, "content", None), tool_calls)
                 for call in tool_calls:
@@ -100,6 +109,37 @@ class AgentLoop:
         finally:
             self.hooks.trigger("Stop", self._hook_payload(session, include_status=True))
         return session
+
+    async def _finalize(self, session: AgentSession) -> bool:
+        """模型停手：交由独立评估器判定。返回 True 表示可以结束循环。"""
+        if self.goal_judge is None:
+            session.status = "completed"
+            return True
+        try:
+            judgment = await self.goal_judge.judge(session)
+        except Exception as exc:  # 判定器自身异常也必须交还人
+            logger.warning("goal_judge_failed error_type=%s", type(exc).__name__)
+            judgment = GoalJudgment(
+                False, "完成判定失败（{}）".format(type(exc).__name__), [], "unknown", error=True
+            )
+        session.judgments.append(judgment)
+        if judgment.error:
+            session.status = "needs_human"
+            session.notes.append("goal_judge_error")
+            return True
+        if judgment.done:
+            session.status = "completed"
+            return True
+        if session.judge_retries >= self.limits.max_judge_retries:
+            session.status = "needs_human"
+            session.notes.append("goal_not_reached")
+            return True
+        session.judge_retries += 1
+        missing = "；".join(judgment.missing[:5]) or "请补全报告"
+        session.append_observation(
+            "独立评估认为尚未完成：{}\n缺失项：{}\n请继续修正后再停手。".format(judgment.reason, missing)
+        )
+        return False
 
     async def _execute_tool_call(self, session: AgentSession, call: Any) -> None:
         name = getattr(call.function, "name", "") or ""
@@ -124,10 +164,12 @@ class AgentLoop:
                 decision = "deny_policy"
                 result = failure("denied_policy", pre.reason or "该工具调用被钩子拦截。")
             else:
-                result = await self._invoke(spec, session, args)
+                with bind_session(session):
+                    result = await self._invoke(spec, session, args)
 
         duration_ms = int((time.monotonic() - started) * 1000)
         self._collect_artifact(session, name, result)
+        reminder = self.planner.reminder(session, step) if self.planner else None
         self.hooks.trigger(
             "PostToolUse",
             {
@@ -146,7 +188,7 @@ class AgentLoop:
                 result_code=result.code, duration_ms=duration_ms,
             )
         )
-        session.append_tool_result(call.id, result)
+        session.append_tool_result(call.id, result, extra=reminder or "")
 
     async def _invoke(self, spec: Optional[ToolSpec], session: AgentSession, args: Dict[str, Any]) -> ToolResult:
         if spec is None:

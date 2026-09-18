@@ -376,7 +376,7 @@ def test_agent_mode_run_validates_evidence_before_return(tmp_path, monkeypatch) 
         def __init__(self, payload):
             self.payload = payload
 
-        async def run(self, *, meeting_id, team_id, session_id=None):
+        async def run_meeting(self, *, meeting_id, team_id, session_id=None):
             return SimpleNamespace(report=self.payload, status="completed")
 
     monkeypatch.setattr(main_module, "meeting_agent", _FakeRunner(REPORT_PAYLOAD))

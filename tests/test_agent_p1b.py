@@ -16,6 +16,7 @@ import pytest
 
 from app.agent.tools.catalog import (
     CAPABILITY_TOOL_NAMES,
+    PLANNING_TOOL_NAMES,
     READONLY_TOOL_NAMES,
     register_all_tools,
 )
@@ -36,7 +37,7 @@ TEAM_A = "甲团队"
 TEAM_B = "乙团队"
 TOKEN_A = "test-access-token"
 TOKEN_B = "other-team-token"
-ALL_TOOL_NAMES = sorted(READONLY_TOOL_NAMES + CAPABILITY_TOOL_NAMES)
+ALL_TOOL_NAMES = sorted(READONLY_TOOL_NAMES + PLANNING_TOOL_NAMES + CAPABILITY_TOOL_NAMES)
 
 REPORT = TeamMeetingReport(
     suggested_title="上线准备会",
@@ -119,10 +120,10 @@ def _call_async(registry: ToolRegistry, name: str, team_id: int, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def test_all_eleven_tools_registered_and_readonly(tmp_path) -> None:
+def test_all_tools_registered_and_readonly(tmp_path) -> None:
     _, registry, _, _, _ = _seed(tmp_path)
     assert registry.names() == ALL_TOOL_NAMES
-    assert len(registry) == 11
+    assert len(registry) == 12
     assert {spec.permission_level for spec in registry.list_tools()} == {"readonly"}
     for spec in registry.list_tools():
         assert spec.input_schema.get("type") == "object"

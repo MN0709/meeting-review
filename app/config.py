@@ -77,6 +77,8 @@ class Settings(BaseSettings):
     agent_session_timeout_seconds: float = Field(
         default=1800, gt=0, alias="AGENT_SESSION_TIMEOUT_SECONDS"
     )
+    # s17 完成判定：rule（默认，零成本）/ model（单独按 stage=goal_judge 计费）
+    agent_goal_judge: Literal["rule", "model"] = Field(default="rule", alias="AGENT_GOAL_JUDGE")
 
     model_config = SettingsConfigDict(
         env_file=".env",

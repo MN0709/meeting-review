@@ -356,6 +356,11 @@ class AgentTraceStep(StrictModel):
     created_at: str
 
 
+class AgentPlanItem(StrictModel):
+    task: str
+    status: str
+
+
 class AgentTrace(StrictModel):
     meeting_id: str
     mode: str
@@ -363,3 +368,4 @@ class AgentTrace(StrictModel):
     total_calls: int
     tool_names: List[str]
     steps: List[AgentTraceStep]
+    plan: List[AgentPlanItem] = Field(default_factory=list)
