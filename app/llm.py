@@ -763,6 +763,16 @@ class LLMAnalyzer:
 
         raise AnalysisError("LLM 输出在重试后仍无法通过结构或引文校验") from last_error
 
+    async def _gather_bounded(self, coroutines: Sequence[Any]) -> List[Any]:
+        """R-P1-7 ②：并发受显式上限约束，不无条件把所有分块一次性发出去。"""
+        semaphore = asyncio.Semaphore(max(1, self.settings.llm_max_concurrency))
+
+        async def run(coro: Any) -> Any:
+            async with semaphore:
+                return await coro
+
+        return list(await asyncio.gather(*(run(coro) for coro in coroutines)))
+
     async def analyze(self, transcript: Transcript) -> SemanticAnalysis:
         if not transcript.segments:
             raise AnalysisError("没有可分析的转写内容")
@@ -789,7 +799,7 @@ class LLMAnalyzer:
             )
             for index, chunk in enumerate(chunks, start=1)
         ]
-        chunk_results = await asyncio.gather(*chunk_calls)
+        chunk_results = await self._gather_bounded(chunk_calls)
         summaries: List[Dict[str, Any]] = [result.model_dump() for result in chunk_results]
 
         merge_prompt = (
@@ -823,7 +833,7 @@ class LLMAnalyzer:
             return TeamMeetingReport.model_validate(result.model_dump())
 
         chunks = split_segments(transcript.segments, max(1000, self.settings.transcript_chunk_chars - 1000))
-        chunk_results = await asyncio.gather(*[
+        chunk_results = await self._gather_bounded([
             self._validated_call(
                 TeamChunkSummary, TEAM_CHUNK_SYSTEM_PROMPT,
                 "这是第 {}/{} 块：\n{}".format(index, len(chunks), format_segments(chunk)),

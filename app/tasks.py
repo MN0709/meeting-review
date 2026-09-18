@@ -4,8 +4,9 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Deque, Dict, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, Optional, Set
 from uuid import uuid4
 
 from app.models import TaskAccepted, TaskStage, TaskStatus
@@ -45,8 +46,14 @@ class TaskRecord:
     history: list[TaskStage] = field(default_factory=lambda: ["上传完成"])
 
 
-class InMemoryTaskManager:
-    """FIFO single-worker queue. One process must run exactly one Uvicorn worker."""
+class TaskManager:
+    """FIFO single-worker queue，状态同时写入 SQLite（R-P1-8）。
+
+    - 传入 `database` 时：每次状态流转落库、`GET /api/tasks/{id}` 在内存过期后读库、
+      启动时用 `hydrate()` 恢复未完成任务（音频还在就继续跑，不在就明确失败）。
+    - 不传 `database` 时：行为与纯内存队列完全一致（便于单测）。
+    - One process must run exactly one Uvicorn worker.
+    """
 
     def __init__(
         self,
@@ -57,6 +64,7 @@ class InMemoryTaskManager:
         cleanup_interval_seconds: float = 60,
         status_callback: Optional[RecordCallback] = None,
         audio_deleted_callback: Optional[RecordCallback] = None,
+        database: Optional[Any] = None,
     ) -> None:
         self.processor = processor
         self.timeout_seconds = timeout_seconds
@@ -64,8 +72,10 @@ class InMemoryTaskManager:
         self.cleanup_interval_seconds = cleanup_interval_seconds
         self.status_callback = status_callback
         self.audio_deleted_callback = audio_deleted_callback
+        self.database = database
         self.records: Dict[str, TaskRecord] = {}
         self._queue: Deque[str] = deque()
+        self._resume_queue: Deque[str] = deque()
         self._queue_event: Optional[asyncio.Event] = None
         self._worker_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -73,9 +83,84 @@ class InMemoryTaskManager:
         self._current_task_id: Optional[str] = None
         self._queue_reservations = 0
 
+    # ------------------------------------------------------------------
+    # R-P1-8：持久化与重启恢复
+    # ------------------------------------------------------------------
+
+    def hydrate(self) -> None:
+        """启动时从库里读回未完成任务；音频还在就排队续跑，不在就明确失败。"""
+        if self.database is None:
+            return
+        try:
+            rows = self.database.list_active_agent_tasks()
+        except Exception as exc:
+            logger.warning("task_hydrate_failed error_type=%s", type(exc).__name__)
+            return
+        for row in rows:
+            task_id = row["task_id"]
+            audio = Path(row["audio_path"]) if row.get("audio_path") else None
+            record = TaskRecord(
+                task_id=task_id,
+                request_id=row.get("request_id") or "",
+                audio_path=audio or Path("/nonexistent"),
+                team_id=int(row["team_id"]) if row.get("team_id") is not None else 0,
+                long_meeting=bool(row.get("long_meeting")),
+            )
+            record.status = row.get("status") or "排队中"
+            record.message = row.get("message") or record.status
+            self.records[task_id] = record
+            if audio is not None and audio.exists():
+                self._resume_queue.append(task_id)
+                logger.info("task_resume_queued task_id=%s status=%s", task_id, record.status)
+            else:
+                record.error = "服务重启，且临时音频已清理，请重新提交"
+                record.error_code = 503
+                self._transition(record, "失败", record.error)
+
+    def resume_paths(self) -> Set[Path]:
+        """需要保留的临时音频（供启动清理时跳过）。"""
+        return {
+            record.audio_path
+            for record in self.records.values()
+            if record.status not in TERMINAL_STAGES and record.audio_path.exists()
+        }
+
+    def _persist(self, record: TaskRecord) -> None:
+        if self.database is None or not record.team_id:
+            return
+        finished_iso = (
+            datetime.now(timezone.utc).isoformat() if record.status in TERMINAL_STAGES else None
+        )
+        try:
+            self.database.upsert_agent_task(
+                record.task_id,
+                record.team_id,
+                record.status,
+                meeting_id=record.task_id,
+                message=record.message,
+                error=record.error,
+                error_code=record.error_code,
+                finished_at=finished_iso,
+                request_id=record.request_id or None,
+                long_meeting=record.long_meeting,
+                audio_path=str(record.audio_path) if record.audio_path else None,
+            )
+        except Exception as exc:  # 落库失败不能影响处理主链路
+            logger.warning(
+                "task_persist_failed task_id=%s error_type=%s", record.task_id, type(exc).__name__
+            )
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+
     async def start(self) -> None:
         if self._worker_task and not self._worker_task.done():
             return
+        while self._resume_queue:
+            task_id = self._resume_queue.popleft()
+            if task_id not in self._queue:
+                self._queue.append(task_id)
         self._queue_event = asyncio.Event()
         if self._queue:
             self._queue_event.set()
@@ -108,6 +193,10 @@ class InMemoryTaskManager:
                 record.error = "服务正在关闭，请重新提交"
                 record.error_code = 503
                 self._transition(record, "失败", record.error)
+
+    # ------------------------------------------------------------------
+    # 对外接口
+    # ------------------------------------------------------------------
 
     async def submit(
         self,
@@ -149,10 +238,20 @@ class InMemoryTaskManager:
 
     def get(self, task_id: str, team_id: Optional[int] = None) -> Optional[TaskStatus]:
         record = self.records.get(task_id)
-        if record is None or (team_id is not None and record.team_id != team_id):
-            return None
-        queue_position = self._queue_position(task_id)
-        message = self._queue_message(task_id) if record.status == "排队中" else record.message
+        if record is not None:
+            if team_id is not None and record.team_id != team_id:
+                return None
+            return self._status_from_record(record)
+        # 内存已过期（例如重启后）：回落到数据库
+        if self.database is not None and team_id is not None:
+            row = self.database.get_agent_task(task_id, team_id)
+            if row is not None:
+                return self._status_from_row(row)
+        return None
+
+    def _status_from_record(self, record: TaskRecord) -> TaskStatus:
+        queue_position = self._queue_position(record.task_id)
+        message = self._queue_message(record.task_id) if record.status == "排队中" else record.message
         return TaskStatus(
             task_id=record.task_id,
             request_id=record.request_id,
@@ -163,6 +262,25 @@ class InMemoryTaskManager:
             error=record.error,
             error_code=record.error_code,
             long_meeting=record.long_meeting,
+        )
+
+    def _status_from_row(self, row: Dict[str, Any]) -> TaskStatus:
+        report = None
+        if row.get("status") in TERMINAL_STAGES and self.database is not None:
+            try:
+                report = self.database.get_report(row["task_id"], int(row["team_id"]))
+            except Exception:
+                report = None
+        return TaskStatus(
+            task_id=row["task_id"],
+            request_id=row.get("request_id") or "",
+            status=row["status"],
+            queue_position=0,
+            message=row.get("message") or row["status"],
+            report=report,
+            error=row.get("error"),
+            error_code=row.get("error_code"),
+            long_meeting=bool(row.get("long_meeting")),
         )
 
     def cleanup_expired(self, now: Optional[float] = None) -> int:
@@ -177,6 +295,10 @@ class InMemoryTaskManager:
         for task_id in expired:
             self.records.pop(task_id, None)
         return len(expired)
+
+    # ------------------------------------------------------------------
+    # 内部
+    # ------------------------------------------------------------------
 
     def _queue_position(self, task_id: str) -> int:
         record = self.records.get(task_id)
@@ -207,6 +329,7 @@ class InMemoryTaskManager:
             record.task_id,
             status,
         )
+        self._persist(record)
         if self.status_callback:
             self.status_callback(record)
         return True
@@ -285,3 +408,7 @@ class InMemoryTaskManager:
             removed = self.cleanup_expired()
             if removed:
                 logger.info("expired_tasks_cleaned count=%s", removed)
+
+
+# 兼容旧名字（既有测试与调用方使用）
+InMemoryTaskManager = TaskManager

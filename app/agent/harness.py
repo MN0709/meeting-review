@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
+from app.agent.context import ContextManager
 from app.agent.hooks import HookManager
 from app.agent.loop import AgentLoop
 from app.agent.model import AgentModel
@@ -44,6 +45,9 @@ class AgentHarness:
         self.goal_judge = goal_judge
         self.limits = limits or AgentLimits()
         self.context_budget_tokens = context_budget_tokens
+        self.context_manager = (
+            ContextManager(context_budget_tokens) if context_budget_tokens else None
+        )
         self.loop = AgentLoop(
             registry=registry,
             model=AgentModel(analyzer) if analyzer is not None else None,
@@ -53,6 +57,7 @@ class AgentHarness:
             planner=planner,
             goal_judge=goal_judge,
             prompt_builder=self.build_prompt,
+            context_manager=self.context_manager,
         )
 
     def available_tools(self) -> List[ToolSpec]:

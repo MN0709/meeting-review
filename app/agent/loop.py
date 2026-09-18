@@ -43,6 +43,7 @@ class AgentLoop:
         planner: Optional[Any] = None,
         goal_judge: Optional[Any] = None,
         prompt_builder: Optional[Any] = None,
+        context_manager: Optional[Any] = None,
     ) -> None:
         self.registry = registry
         self.model = model
@@ -52,6 +53,8 @@ class AgentLoop:
         self.planner = planner
         self.goal_judge = goal_judge
         self.prompt_builder = prompt_builder
+        self.context_manager = context_manager
+        self.compactions = 0
 
     def available_tools(self) -> List[ToolSpec]:
         """只把策略允许的工具暴露给模型（拒绝判定仍会再走一次，双保险）。"""
@@ -73,6 +76,7 @@ class AgentLoop:
                     session.status = "session_timeout"
                     break
                 session.refresh_system_prompt(self.prompt_builder)
+                self._maybe_compact(session)
                 try:
                     response = await asyncio.wait_for(
                         self.model.step(
@@ -109,6 +113,16 @@ class AgentLoop:
         finally:
             self.hooks.trigger("Stop", self._hook_payload(session, include_status=True))
         return session
+
+    def _maybe_compact(self, session: AgentSession) -> None:
+        """R-P1-7（s08）：上下文超预算时压缩历史，并记录说明。"""
+        if self.context_manager is None:
+            return
+        note = self.context_manager.maybe_compact(session)
+        if note:
+            self.compactions += 1
+            session.notes.append(note)
+            logger.info("agent_compact session_id=%s %s", session.session_id, note)
 
     async def _finalize(self, session: AgentSession) -> bool:
         """模型停手：交由独立评估器判定。返回 True 表示可以结束循环。"""

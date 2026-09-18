@@ -219,13 +219,16 @@ task_manager = InMemoryTaskManager(
     retention_seconds=settings.task_retention_minutes * 60,
     status_callback=_on_task_status,
     audio_deleted_callback=_on_audio_deleted,
+    database=database,
 )
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     database.initialize(settings.parsed_team_tokens())
-    prepare_upload_dir()
+    # R-P1-8：先从库里恢复未完成任务，再清理临时目录（保留待续跑任务的音频）。
+    task_manager.hydrate()
+    prepare_upload_dir(keep=task_manager.resume_paths())
     await task_manager.start()
     logger.info(
         "startup model=%s api_key=%s database=%s",
@@ -348,10 +351,11 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def prepare_upload_dir(upload_dir: Path = UPLOAD_DIR) -> None:
+def prepare_upload_dir(upload_dir: Path = UPLOAD_DIR, keep: Optional[Set[Path]] = None) -> None:
     upload_dir.mkdir(parents=True, exist_ok=True)
+    protected = {path.resolve() for path in (keep or set())}
     for entry in upload_dir.iterdir():
-        if entry.is_file() or entry.is_symlink():
+        if (entry.is_file() or entry.is_symlink()) and entry.resolve() not in protected:
             entry.unlink(missing_ok=True)
 
 

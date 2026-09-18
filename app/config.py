@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     queue_max: int = Field(default=5, gt=0, alias="QUEUE_MAX")
     database_path: str = Field(default="data/meeting-review.db", alias="DATABASE_PATH")
     llm_max_retries: int = Field(default=2, alias="LLM_MAX_RETRIES")
+    # R-P1-7 ②：分块分析的并发上限，避免 4 小时会议无条件并发数十次调用
+    llm_max_concurrency: int = Field(default=4, ge=1, le=16, alias="LLM_MAX_CONCURRENCY")
     transcript_chunk_chars: int = Field(default=6000, alias="TRANSCRIPT_CHUNK_CHARS")
     # 单价留空时只落 token、不换算金额，避免把价格硬编码进代码或数据库。
     llm_price_prompt_per_1k: Optional[float] = Field(default=None, ge=0, alias="LLM_PRICE_PROMPT_PER_1K")

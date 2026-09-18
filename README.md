@@ -146,7 +146,7 @@ curl http://127.0.0.1:8000/health
 - `POST /api/projects`：创建项目文件夹，可传 `parent_id` 创建第二级；第三层会被拒绝。`PATCH /api/projects/{id}` 修改名称。
 - `DELETE /api/projects/{id}`：默认把会议移入未分类；显式传入 `delete_meetings=true` 才连同终态会议、转写稿和报告删除。
 - `POST /api/review`：multipart 字段 `file`、可选 `title` 和可选 `project_id`，成功返回 HTTP 202 与任务 ID；新版页面要求先选文件夹，API 保留未分类兼容能力。
-- `GET /api/tasks/{task_id}`：只查询内存中的处理中或 30 分钟内终态任务；跨团队访问返回 403。
+- `GET /api/tasks/{task_id}`：先查内存中的处理中或 30 分钟内终态任务；内存未命中时回落 SQLite（重启后仍可读）；跨团队访问返回 403。
 - `GET /api/meetings`：当前团队会议列表，可用 `project_id` 或 `unclassified=true` 过滤；一级目录查询可传 `include_children=true` 汇总二级目录。
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
 - `GET /api/meetings/{id}/agent-trace`：**只读**返回这场会议里 Agent 的每一步工具调用（会话 / 步 / 工具 / 判定 / 结果 / 耗时），按 `team_id` 隔离，跨团队 403。它是页面第 ⑨ 节「Agent 步骤（只读）」的数据源，也是 M1 的产品验收入口。
@@ -188,6 +188,7 @@ curl http://127.0.0.1:8000/health
 | `DAILY_TASK_LIMIT` | 否 | `30` | 按 `Asia/Shanghai` 自然日计算的全局任务上限 |
 | `TRANSCRIPT_CHUNK_CHARS` | 否 | `6000` | 长文本分块阈值 |
 | `LLM_MAX_RETRIES` | 否 | `2` | 结构或证据校验失败后的重试次数 |
+| `LLM_MAX_CONCURRENCY` | 否 | `4` | 分块分析的并发上限，避免长会议无条件并发数十次调用 |
 | `LLM_PRICE_PROMPT_PER_1K` | 否 | 空 | 输入 token 单价（每 1000）；留空时只记 token、`cost` 返回 `null`，价格不硬编码 |
 | `LLM_PRICE_COMPLETION_PER_1K` | 否 | 空 | 输出 token 单价（每 1000）；同上 |
 | `APP_HOST` / `APP_PORT` | 否 | `127.0.0.1` / `8000` | 监听地址与端口 |
@@ -210,6 +211,8 @@ curl http://127.0.0.1:8000/health
 - `AGENT_MODE=shadow`：pipeline 正常出结果并落库；Agent 也跑一遍但**不落库**，只记录关键差异，用于灰度对拍。
 - 权限：Agent 只能调用只读工具；删除会议/项目/声纹、合并成员、写长期声纹属于 host-owned，**Agent 永远不可调用**。
 - 审计：每次工具调用写入 `agent_audit`，只存参数摘要（非原文），可按 `session_id` 回放。
+- 上下文：超预算时自动压缩较早的工具结果（`AGENT_CONTEXT_BUDGET_TOKENS`），保留最近结果与消息结构。
+- 任务：处理状态同时写入 SQLite，服务重启后 `GET /api/tasks/{id}` 仍可读；临时音频还在时会排队续跑。
 
 ## 服务器部署（Ubuntu + Docker）
 
@@ -263,13 +266,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：195 passed
+python -m pytest -q            # 本地完整环境：204 passed
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 195 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 204 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：

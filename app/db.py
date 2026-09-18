@@ -231,6 +231,10 @@ class Database:
                     status TEXT NOT NULL,
                     stage TEXT NULL,
                     progress_json TEXT NULL,
+                    message TEXT NULL,
+                    request_id TEXT NULL,
+                    long_meeting INTEGER NOT NULL DEFAULT 0,
+                    audio_path TEXT NULL,
                     error TEXT NULL,
                     error_code INTEGER NULL,
                     created_at TEXT NOT NULL,
@@ -267,6 +271,10 @@ class Database:
             self._ensure_column(
                 connection, "meeting_speakers", "remember_requested", "INTEGER NOT NULL DEFAULT 0"
             )
+            self._ensure_column(connection, "agent_tasks", "message", "TEXT")
+            self._ensure_column(connection, "agent_tasks", "request_id", "TEXT")
+            self._ensure_column(connection, "agent_tasks", "long_meeting", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "agent_tasks", "audio_path", "TEXT")
             connection.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_projects_team_created
@@ -1148,25 +1156,37 @@ class Database:
     def upsert_agent_task(
         self, task_id: str, team_id: int, status: str, *,
         meeting_id: Optional[str] = None, stage: Optional[str] = None,
-        progress_json: Optional[str] = None, error: Optional[str] = None,
-        error_code: Optional[int] = None, finished_at: Optional[str] = None,
+        progress_json: Optional[str] = None, message: Optional[str] = None,
+        error: Optional[str] = None, error_code: Optional[int] = None,
+        finished_at: Optional[str] = None, request_id: Optional[str] = None,
+        long_meeting: Optional[bool] = None, audio_path: Optional[str] = None,
     ) -> None:
-        """写入或更新一条 Agent 任务行（R-P1-8）。"""
+        """写入或更新一条 Agent 任务行（R-P1-8）。
+
+        progress_json / message / request_id / long_meeting / audio_path 用 COALESCE 合并，
+        避免「计划写入」与「任务状态写入」互相覆盖。
+        """
         now = _utc_now()
         with self._lock, self._connect() as connection:
             connection.execute(
                 """INSERT INTO agent_tasks(
-                       task_id,team_id,meeting_id,status,stage,progress_json,
-                       error,error_code,created_at,updated_at,finished_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                       task_id,team_id,meeting_id,status,stage,progress_json,message,
+                       request_id,long_meeting,audio_path,error,error_code,
+                       created_at,updated_at,finished_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(task_id) DO UPDATE SET
                        status=excluded.status, stage=excluded.stage,
-                       progress_json=excluded.progress_json, error=excluded.error,
-                       error_code=excluded.error_code, updated_at=excluded.updated_at,
-                       finished_at=excluded.finished_at""",
+                       progress_json=COALESCE(excluded.progress_json, agent_tasks.progress_json),
+                       message=COALESCE(excluded.message, agent_tasks.message),
+                       request_id=COALESCE(excluded.request_id, agent_tasks.request_id),
+                       long_meeting=COALESCE(excluded.long_meeting, agent_tasks.long_meeting),
+                       audio_path=COALESCE(excluded.audio_path, agent_tasks.audio_path),
+                       error=excluded.error, error_code=excluded.error_code,
+                       updated_at=excluded.updated_at, finished_at=excluded.finished_at""",
                 (
-                    task_id, team_id, meeting_id, status, stage, progress_json,
-                    error, error_code, now, now, finished_at,
+                    task_id, team_id, meeting_id, status, stage, progress_json, message,
+                    request_id, int(bool(long_meeting)), audio_path, error, error_code,
+                    now, now, finished_at,
                 ),
             )
 
