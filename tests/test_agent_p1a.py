@@ -283,7 +283,8 @@ def test_agent_tools_endpoint_exists_in_agent_mode(tmp_path) -> None:
         "    assert r.status_code == 200, r.text\n"
         "    body = r.json()\n"
         "    assert body['mode'] == 'agent'\n"
-        "    assert body['tools'] == []\n"
+        "    assert len(body['tools']) == 11\n"
+        "    assert 'get_transcript' in {t['name'] for t in body['tools']}\n"
     )
     result = subprocess.run(
         [sys.executable, "-c", code], cwd=str(PROJECT_DIR), env=environment,

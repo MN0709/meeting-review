@@ -15,6 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.agent.tools import default_registry as agent_tool_registry
+from app.agent.tools.catalog import register_all_tools
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.llm import AnalysisError, LLMAnalyzer, usage_scope
@@ -57,6 +58,9 @@ def _record_llm_usage(payload: Dict[str, Any]) -> None:
 
 
 analyzer = LLMAnalyzer(settings, usage_recorder=_record_llm_usage)
+# 注册 8 个只读工具 + 3 个能力工具（PRD §9.1/§9.2）。pipeline 模式下不会调用它们，
+# 仅用于 /api/agent/tools 调试端点枚举。
+register_all_tools(agent_tool_registry, database, analyzer)
 speaker_recognizer = SpeakerRecognizer(settings)
 admission = AdmissionController(settings.rate_limit_per_hour, settings.daily_task_limit)
 

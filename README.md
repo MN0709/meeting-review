@@ -136,6 +136,7 @@ curl http://127.0.0.1:8000/health
 
 - `GET /health`：免鉴权健康检查。
 - `GET /api/auth/check`：校验团队口令并返回团队 ID，错误为 403。
+- `GET /api/agent/tools`：Agent 工具调试端点，枚举注册的 11 个只读/能力工具。**默认关闭**：`AGENT_MODE=pipeline` 时该路由不存在（404）；仅 `shadow`/`agent` 模式且 team 内可访问。
 - `GET /api/usage`：按 `stage` / 会议聚合 LLM 用量与估算成本，严格限定在本团队内。
   参数：`meeting_id?`、`project_id?`、`from?`、`to?`（ISO8601）；跨团队 403，非法日期 422，表为空返回空数组。
   金额需配置 `LLM_PRICE_PROMPT_PER_1K` / `LLM_PRICE_COMPLETION_PER_1K`；未配置时 `cost` 为 `null`。
@@ -249,13 +250,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：143 passed（P0 基线 121 + P1-A 新增 22）
+python -m pytest -q            # 本地完整环境：161 passed（P0 基线 121 + P1-A 22 + P1-B 18）
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 143 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 161 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：

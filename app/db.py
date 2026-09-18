@@ -1232,3 +1232,245 @@ class Database:
                 tuple(params),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # 只读工具用的查询（PRD §9.1）；全部按 team_id 先做归属校验。
+    # ------------------------------------------------------------------
+
+    def get_report(self, meeting_id: str, team_id: int) -> Optional[TeamMeetingReport]:
+        """只取报告（不连带转写），供 get_report 工具用。"""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT r.json FROM reports r JOIN meetings m ON m.id=r.meeting_id
+                   WHERE m.id=? AND m.team_id=?""",
+                (meeting_id, team_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return TeamMeetingReport.model_validate(self._report_payload(row["json"]))
+
+    def load_transcript(self, meeting_id: str, team_id: int) -> Optional[Transcript]:
+        """加载一场会议的完整转写（供能力工具分析用；已按 team_id 隔离）。"""
+        with self._lock, self._connect() as connection:
+            meeting = connection.execute(
+                "SELECT duration_seconds FROM meetings WHERE id=? AND team_id=?",
+                (meeting_id, team_id),
+            ).fetchone()
+            if meeting is None:
+                return None
+            rows = connection.execute(
+                "SELECT start,end,speaker_label,text FROM transcripts WHERE meeting_id=? ORDER BY id",
+                (meeting_id,),
+            ).fetchall()
+        return Transcript(
+            language="zh",
+            duration_seconds=meeting["duration_seconds"],
+            segments=[
+                TranscriptSegment(
+                    start=row["start"], end=row["end"],
+                    speaker_label=row["speaker_label"], text=row["text"],
+                )
+                for row in rows
+            ],
+        )
+
+    def transcript_summary(self, meeting_id: str, team_id: int) -> Optional[Dict[str, Any]]:
+        """转写概览：段数、时间范围、说话人时长分布、要点密度（不返回全文）。"""
+        with self._lock, self._connect() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id)
+            ).fetchone()
+            if not owned:
+                return None
+            aggregate = connection.execute(
+                """SELECT COUNT(*) AS n, COALESCE(MIN(start),0) AS s, COALESCE(MAX(end),0) AS e
+                   FROM transcripts WHERE meeting_id=?""",
+                (meeting_id,),
+            ).fetchone()
+            speakers = connection.execute(
+                """SELECT COALESCE(speaker_label,'') AS label, COALESCE(SUM(end-start),0) AS seconds
+                   FROM transcripts WHERE meeting_id=? GROUP BY label ORDER BY seconds DESC""",
+                (meeting_id,),
+            ).fetchall()
+        span = float(aggregate["e"]) - float(aggregate["s"])
+        per_minute = (float(aggregate["n"]) / span * 60) if span > 0 else 0.0
+        return {
+            "total_segments": int(aggregate["n"]),
+            "time_range": {"start": round(float(aggregate["s"]), 3), "end": round(float(aggregate["e"]), 3)},
+            "speakers": [
+                {"label": row["label"], "seconds": round(float(row["seconds"]), 1)} for row in speakers
+            ],
+            "segments_per_minute": round(per_minute, 2),
+        }
+
+    def transcript_page(
+        self, meeting_id: str, team_id: int, offset: int, limit: int
+    ) -> Optional[List[Dict[str, Any]]]:
+        with self._lock, self._connect() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id)
+            ).fetchone()
+            if not owned:
+                return None
+            rows = connection.execute(
+                """SELECT start,end,speaker_label,text FROM transcripts
+                   WHERE meeting_id=? ORDER BY id LIMIT ? OFFSET ?""",
+                (meeting_id, max(1, int(limit)), max(0, int(offset))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def read_segment_window(
+        self, meeting_id: str, team_id: int, *,
+        timestamp: Optional[float] = None, segment_index: Optional[int] = None,
+        before: int = 5, after: int = 5,
+    ) -> Optional[Dict[str, Any]]:
+        """回读某时间点/某段前后的转写片段（PRD §9.1 read_segment_window）。"""
+        before = max(0, min(int(before), 50))
+        after = max(0, min(int(after), 50))
+        with self._lock, self._connect() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id)
+            ).fetchone()
+            if not owned:
+                return None
+            if segment_index is not None:
+                offset = max(0, int(segment_index))
+            elif timestamp is not None:
+                anchor = connection.execute(
+                    """SELECT id FROM transcripts WHERE meeting_id=? AND start<=?
+                       ORDER BY start DESC, id DESC LIMIT 1""",
+                    (meeting_id, float(timestamp)),
+                ).fetchone()
+                if anchor is None:
+                    first = connection.execute(
+                        "SELECT id FROM transcripts WHERE meeting_id=? ORDER BY id LIMIT 1",
+                        (meeting_id,),
+                    ).fetchone()
+                    anchor_id = first["id"] if first else None
+                else:
+                    anchor_id = anchor["id"]
+                if anchor_id is None:
+                    return {"segments": [], "window": {"start": 0.0, "end": 0.0},
+                            "total_segments": 0, "anchor_index": 0}
+                offset = connection.execute(
+                    "SELECT COUNT(*) AS c FROM transcripts WHERE meeting_id=? AND id<?",
+                    (meeting_id, anchor_id),
+                ).fetchone()["c"]
+            else:
+                offset = 0
+            total = connection.execute(
+                "SELECT COUNT(*) AS c FROM transcripts WHERE meeting_id=?", (meeting_id,)
+            ).fetchone()["c"]
+            start_offset = max(0, offset - before)
+            rows = connection.execute(
+                """SELECT start,end,speaker_label,text FROM transcripts
+                   WHERE meeting_id=? ORDER BY id LIMIT ? OFFSET ?""",
+                (meeting_id, before + after + 1, start_offset),
+            ).fetchall()
+        segments = [dict(row) for row in rows]
+        return {
+            "segments": segments,
+            "window": {
+                "start": segments[0]["start"] if segments else 0.0,
+                "end": segments[-1]["end"] if segments else 0.0,
+            },
+            "total_segments": int(total),
+            "anchor_index": int(offset),
+        }
+
+    def search_transcripts(
+        self, team_id: int, query: str, *,
+        meeting_id: Optional[str] = None, project_id: Optional[str] = None, limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """跨会议/单会议检索转写，严格限定在 team_id 内。
+
+        中文子串检索用 FTS5(trigram)，查询词 ≥ 3 字；更短的或含特殊字符时回退 LIKE。
+        """
+        text = (query or "").strip()
+        if not text:
+            return []
+        limit = max(1, min(int(limit), 50))
+        conditions = ["m.team_id = ?"]
+        params: List[Any] = [team_id]
+        if meeting_id is not None:
+            conditions.append("t.meeting_id = ?")
+            params.append(meeting_id)
+        if project_id is not None:
+            conditions.append("m.project_id = ?")
+            params.append(project_id)
+        where = " AND ".join(conditions)
+        escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        use_fts = (
+            self._fts5_available and len(text) >= 3 and not any(ch in text for ch in '"()*:^-')
+        )
+        with self._lock, self._connect() as connection:
+            if use_fts:
+                rows = connection.execute(
+                    """SELECT t.meeting_id, m.title AS meeting_title, t.start, t.end,
+                              t.speaker_label, t.text
+                       FROM transcript_fts f
+                       JOIN transcripts t ON t.id = f.rowid
+                       JOIN meetings m ON m.id = t.meeting_id
+                       WHERE transcript_fts MATCH ? AND {}
+                       ORDER BY f.rank LIMIT ?""".format(where),
+                    (text, *params, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT t.meeting_id, m.title AS meeting_title, t.start, t.end,
+                              t.speaker_label, t.text
+                       FROM transcripts t JOIN meetings m ON m.id = t.meeting_id
+                       WHERE t.text LIKE ? ESCAPE '\\' AND {}
+                       ORDER BY t.meeting_id, t.id LIMIT ?""".format(where),
+                    ("%{}%".format(escaped), *params, limit),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_action_items(
+        self, team_id: int, *, project_id: Optional[str] = None,
+        status: Optional[str] = None, limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        conditions = ["a.team_id = ?"]
+        params: List[Any] = [team_id]
+        if project_id is not None:
+            conditions.append("m.project_id = ?")
+            params.append(project_id)
+        if status is not None:
+            conditions.append("a.status = ?")
+            params.append(status)
+        limit = max(1, min(int(limit), 200))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT a.id,a.task,a.owner,a.deadline,a.status,
+                          a.meeting_id,m.title AS meeting_title
+                   FROM meeting_action_items a JOIN meetings m ON m.id=a.meeting_id
+                   WHERE {} ORDER BY a.updated_at DESC, a.id DESC LIMIT ?""".format(
+                    " AND ".join(conditions)
+                ),
+                (*params, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_meetings_filtered(
+        self, team_id: int, *, project_id: Optional[str] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None, limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        conditions = ["team_id = ?"]
+        params: List[Any] = [team_id]
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        if date_from is not None:
+            conditions.append("created_at >= ?")
+            params.append(date_from)
+        if date_to is not None:
+            conditions.append("created_at <= ?")
+            params.append(date_to)
+        limit = max(1, min(int(limit), 100))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id,title,project_id,duration_seconds,status,created_at FROM meetings
+                   WHERE {} ORDER BY created_at DESC LIMIT ?""".format(" AND ".join(conditions)),
+                (*params, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
