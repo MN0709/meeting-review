@@ -14,6 +14,7 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, Up
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from app.agent.tools import default_registry as agent_tool_registry
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.llm import AnalysisError, LLMAnalyzer, usage_scope
@@ -231,6 +232,26 @@ async def index() -> FileResponse:
 @app.get("/api/auth/check")
 async def auth_check(request: Request) -> dict:
     return {"status": "ok", "team_id": request.state.team_id}
+
+
+# R-P1-2 调试端点：枚举当前注册的工具。仅 team 内可用，且默认（pipeline）模式下
+# 路由不存在（返回 404），确保不改变现有 20 个接口的行为。在阶段 4（P1-B）
+# 注册 11 个工具后，这里会列出它们。
+if settings.agent_mode != "pipeline":
+    @app.get("/api/agent/tools")
+    async def agent_tools() -> dict:
+        return {
+            "mode": settings.agent_mode,
+            "tools": [
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "input_schema": spec.input_schema,
+                    "permission_level": spec.permission_level,
+                }
+                for spec in agent_tool_registry.list_tools()
+            ],
+        }
 
 
 def _client_ip(request: Request) -> str:

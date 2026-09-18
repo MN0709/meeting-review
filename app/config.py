@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 from pydantic import Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +58,19 @@ class Settings(BaseSettings):
     llm_price_completion_per_1k: Optional[float] = Field(
         default=None, ge=0, alias="LLM_PRICE_COMPLETION_PER_1K"
     )
+
+    # --- Agent 层开关（PRD v1.1 §13.1）-------------------------------------
+    # 默认 pipeline：不设置任何 AGENT_* 时，行为与 P0 完全一致（零行为变化）。
+    agent_mode: Literal["pipeline", "shadow", "agent"] = Field(
+        default="pipeline", alias="AGENT_MODE"
+    )
+    agent_max_steps: int = Field(default=20, ge=1, alias="AGENT_MAX_STEPS")
+    agent_context_budget_tokens: int = Field(
+        default=60000, ge=1000, alias="AGENT_CONTEXT_BUDGET_TOKENS"
+    )
+    agent_tools_enabled: str = Field(default="readonly", alias="AGENT_TOOLS_ENABLED")
+    agent_write_tools_enabled: bool = Field(default=False, alias="AGENT_WRITE_TOOLS_ENABLED")
+    agent_audit_enabled: bool = Field(default=True, alias="AGENT_AUDIT_ENABLED")
 
     model_config = SettingsConfigDict(
         env_file=".env",

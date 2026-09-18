@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -14,6 +15,9 @@ from app.models import (
     ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
     TeamMeetingReport, Transcript, TranscriptSegment,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
@@ -39,6 +43,8 @@ class Database:
         self.path = Path(path)
         self._lock = threading.RLock()
         self._tokens: Dict[str, int] = {}
+        # FTS5 是否可用（运行环境差异）；不可用时工具层回退 LIKE。
+        self._fts5_available = False
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -54,6 +60,54 @@ class Database:
         columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _setup_fts5(connection: sqlite3.Connection) -> bool:
+        """建立转写全文索引（R-P1-3 search_transcript 的底座）。
+
+        用 external content FTS5：索引只存词项，转写原文仍只存 transcripts 表，
+        不产生第二份敏感文本；用触发器保持同步。
+        tokenizer 选 trigram：unicode61 会把整段中文当单个 token，导致“搜索中间的词”
+        搜不到；trigram 支持中文子串匹配（查询词需 ≥ 3 字，更短的由工具层回退 LIKE）。
+        环境不支持 FTS5 时降级返回 False（工具层回退 LIKE），不影响服务启动。
+        """
+        try:
+            connection.executescript(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
+                    text, content='transcripts', content_rowid='id', tokenize='trigram'
+                );
+                CREATE TRIGGER IF NOT EXISTS transcripts_fts_ai AFTER INSERT ON transcripts BEGIN
+                    INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS transcripts_fts_ad AFTER DELETE ON transcripts BEGIN
+                    INSERT INTO transcript_fts(transcript_fts, rowid, text)
+                        VALUES ('delete', old.id, old.text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS transcripts_fts_au AFTER UPDATE ON transcripts BEGIN
+                    INSERT INTO transcript_fts(transcript_fts, rowid, text)
+                        VALUES ('delete', old.id, old.text);
+                    INSERT INTO transcript_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+                """
+            )
+        except sqlite3.OperationalError as exc:
+            logger.warning("fts5_unavailable error_type=%s", type(exc).__name__)
+            return False
+        # 旧库补索引：transcripts 已有内容但索引为空时重建一次（幂等）。
+        try:
+            existing = connection.execute("SELECT COUNT(*) FROM transcripts").fetchone()[0]
+            if existing:
+                indexed = connection.execute(
+                    "SELECT COUNT(*) FROM transcript_fts_docsize"
+                ).fetchone()[0]
+                if indexed != existing:
+                    connection.execute(
+                        "INSERT INTO transcript_fts(transcript_fts) VALUES('rebuild')"
+                    )
+        except sqlite3.OperationalError as exc:
+            logger.warning("fts5_rebuild_skipped error_type=%s", type(exc).__name__)
+        return True
 
     def initialize(self, team_tokens: Dict[str, str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,6 +224,37 @@ class Database:
                     duration_ms INTEGER NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS agent_tasks(
+                    task_id TEXT PRIMARY KEY,
+                    team_id INTEGER NOT NULL,
+                    meeting_id TEXT NULL,
+                    status TEXT NOT NULL,
+                    stage TEXT NULL,
+                    progress_json TEXT NULL,
+                    error TEXT NULL,
+                    error_code INTEGER NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_task_deps(
+                    task_id TEXT NOT NULL,
+                    depends_on_task_id TEXT NOT NULL,
+                    UNIQUE(task_id, depends_on_task_id)
+                );
+                CREATE TABLE IF NOT EXISTS agent_audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    meeting_id TEXT NULL,
+                    session_id TEXT NOT NULL,
+                    step INTEGER NULL,
+                    tool_name TEXT NULL,
+                    args_digest TEXT NULL,
+                    decision TEXT NOT NULL,
+                    result_code TEXT NULL,
+                    duration_ms INTEGER NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
@@ -206,8 +291,14 @@ class Database:
                     ON llm_usage(team_id, project_id);
                 CREATE INDEX IF NOT EXISTS idx_llm_usage_team_created
                     ON llm_usage(team_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_tasks_team_status
+                    ON agent_tasks(team_id, status);
+                CREATE INDEX IF NOT EXISTS idx_agent_audit_team_session
+                    ON agent_audit(team_id, session_id, id);
                 """
             )
+            # 转写全文索引（R-P1-3 的底座）；环境不支持 FTS5 时降级，不影响启动。
+            self._fts5_available = self._setup_fts5(connection)
             for name, token in team_tokens.items():
                 connection.execute(
                     """INSERT INTO teams(name, token_hash, created_at) VALUES(?,?,?)
@@ -434,10 +525,25 @@ class Database:
             ):
                 raise ProjectHasActiveMeetingsError()
             if delete_meetings:
+                meeting_ids = [row["id"] for row in rows]
+                if meeting_ids:
+                    placeholders = ",".join("?" for _ in meeting_ids)
+                    for table in ("llm_usage", "agent_audit", "agent_tasks"):
+                        connection.execute(
+                            "DELETE FROM {} WHERE team_id=? AND meeting_id IN ({})".format(
+                                table, placeholders
+                            ),
+                            (team_id, *meeting_ids),
+                        )
                 connection.execute(
                     "DELETE FROM meetings WHERE team_id=? AND project_id=?", (team_id, project_id)
                 )
             else:
+                # 会议移入未分类；成本行保留但解除对已删项目的指向（PRD §10.3）。
+                connection.execute(
+                    "UPDATE llm_usage SET project_id=NULL WHERE team_id=? AND project_id=?",
+                    (team_id, project_id),
+                )
                 connection.execute(
                     "UPDATE meetings SET project_id=NULL WHERE team_id=? AND project_id=?",
                     (team_id, project_id),
@@ -462,6 +568,16 @@ class Database:
 
     def delete_meeting(self, meeting_id: str, team_id: int) -> None:
         with self._lock, self._connect() as connection:
+            # PRD §10.3：删除会议时，Agent 新增的关联数据一并级联清理。
+            connection.execute(
+                "DELETE FROM llm_usage WHERE meeting_id=? AND team_id=?", (meeting_id, team_id)
+            )
+            connection.execute(
+                "DELETE FROM agent_audit WHERE meeting_id=? AND team_id=?", (meeting_id, team_id)
+            )
+            connection.execute(
+                "DELETE FROM agent_tasks WHERE meeting_id=? AND team_id=?", (meeting_id, team_id)
+            )
             connection.execute("DELETE FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id))
 
     def update_status(self, meeting_id: str, team_id: int, status: str) -> None:
@@ -1019,3 +1135,100 @@ class Database:
                 "SELECT start,end,speaker_label,text FROM transcripts WHERE meeting_id=? ORDER BY id",
                 (meeting_id,),
             ))
+
+    # ------------------------------------------------------------------
+    # Agent 任务与审计（PRD R-P1-8 / R-P1-5 的存储底座）
+    # 本阶段只建表与读写；任务队列的替换与重启恢复在阶段 7（P1-E）接线。
+    # ------------------------------------------------------------------
+
+    def fts5_available(self) -> bool:
+        """转写全文索引是否可用（工具层据此决定用 MATCH 还是 LIKE）。"""
+        return self._fts5_available
+
+    def upsert_agent_task(
+        self, task_id: str, team_id: int, status: str, *,
+        meeting_id: Optional[str] = None, stage: Optional[str] = None,
+        progress_json: Optional[str] = None, error: Optional[str] = None,
+        error_code: Optional[int] = None, finished_at: Optional[str] = None,
+    ) -> None:
+        """写入或更新一条 Agent 任务行（R-P1-8）。"""
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO agent_tasks(
+                       task_id,team_id,meeting_id,status,stage,progress_json,
+                       error,error_code,created_at,updated_at,finished_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(task_id) DO UPDATE SET
+                       status=excluded.status, stage=excluded.stage,
+                       progress_json=excluded.progress_json, error=excluded.error,
+                       error_code=excluded.error_code, updated_at=excluded.updated_at,
+                       finished_at=excluded.finished_at""",
+                (
+                    task_id, team_id, meeting_id, status, stage, progress_json,
+                    error, error_code, now, now, finished_at,
+                ),
+            )
+
+    def get_agent_task(self, task_id: str, team_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_tasks WHERE task_id=? AND team_id=?", (task_id, team_id)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_active_agent_tasks(self) -> List[Dict[str, Any]]:
+        """列出未终态任务，供进程重启后恢复（R-P1-8）。
+
+        不按 team 过滤，因为恢复必须覆盖全部团队；但只返回标识与进度字段，
+        其中 progress_json 由调用方保证不含转写文本（R-P1-9 计划只存步骤）。
+        """
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM agent_tasks WHERE status NOT IN ('完成','失败') "
+                "ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_agent_audit(
+        self, *, team_id: int, session_id: str, decision: str,
+        meeting_id: Optional[str] = None, step: Optional[int] = None,
+        tool_name: Optional[str] = None, args_digest: Optional[str] = None,
+        result_code: Optional[str] = None, duration_ms: Optional[int] = None,
+        created_at: Optional[str] = None,
+    ) -> None:
+        """写入一次工具调用的审计行（R-P1-5）。
+
+        只记参数摘要（调用方传 digest），**永不记转写文本、引文原文、口令、密钥**。
+        meeting_id 用于执行 PRD §10.3 的删除级联。
+        """
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO agent_audit(
+                       team_id,meeting_id,session_id,step,tool_name,args_digest,
+                       decision,result_code,duration_ms,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    team_id, meeting_id, session_id, step, tool_name, args_digest,
+                    decision, result_code, duration_ms, created_at or _utc_now(),
+                ),
+            )
+
+    def list_agent_audit(
+        self, team_id: int, session_id: Optional[str] = None, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        """按团队（可选按会话）读取审计行，用于回放一次会话的每一步调用。"""
+        conditions = ["team_id=?"]
+        params: List[Any] = [team_id]
+        if session_id is not None:
+            conditions.append("session_id=?")
+            params.append(session_id)
+        params.append(max(1, min(int(limit), 1000)))
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM agent_audit WHERE {} ORDER BY id LIMIT ?".format(
+                    " AND ".join(conditions)
+                ),
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]

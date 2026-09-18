@@ -190,6 +190,12 @@ curl http://127.0.0.1:8000/health
 | `LLM_PRICE_COMPLETION_PER_1K` | 否 | 空 | 输出 token 单价（每 1000）；同上 |
 | `APP_HOST` / `APP_PORT` | 否 | `127.0.0.1` / `8000` | 监听地址与端口 |
 | `FORWARDED_ALLOW_IPS` | 否 | `127.0.0.1` | Uvicorn 信任的直接代理 IP/网段 |
+| `AGENT_MODE` | 否 | `pipeline` | 会议处理走哪条路径：`pipeline`（默认，零行为变化）\| `shadow`（并行对拍不落库）\| `agent`（模型自主编排）。P1-A 起生效 |
+| `AGENT_MAX_STEPS` | 否 | `20` | 单会话最大步数，超限安全终止（阶段 5 使用） |
+| `AGENT_CONTEXT_BUDGET_TOKENS` | 否 | `60000` | 上下文预算，超限触发压缩（阶段 7 使用） |
+| `AGENT_TOOLS_ENABLED` | 否 | `readonly` | 允许模型调用的工具级别（阶段 5 使用） |
+| `AGENT_WRITE_TOOLS_ENABLED` | 否 | `false` | 写工具总开关；P1 固定 false |
+| `AGENT_AUDIT_ENABLED` | 否 | `true` | 是否写入 `agent_audit` 审计表（阶段 5 使用） |
 
 ## 服务器部署（Ubuntu + Docker）
 
@@ -236,20 +242,20 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 以下均为 MVP 后迭代项：
 
-1. **数字人二次讨论**：报告生成后选择严厉面试官、行业前辈等 AI 角色继续追问；作为付费增值层，复用现有转写稿与报告上下文增量实现。
+1. **AI 角色追问（persona follow-up）**：报告生成后选择严厉面试官、行业前辈等 AI 角色继续追问；作为付费增值层，复用现有转写稿与报告上下文增量实现。（原名「数字人二次讨论」，2026-09-18 因名实不符更名。）
 2. **待办到期提醒**：利用任务/负责人/截止时间结构化数据接入邮件或企业微信机器人；依赖账号体系和通知通道，因此排在 MVP 验证之后。
 
 ## 测试与成本占位
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：103 passed
+python -m pytest -q            # 本地完整环境：143 passed（P0 基线 121 + P1-A 新增 22）
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，因此结果为 **102 passed + 1 skipped**（跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选）；完整 103 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 143 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：
