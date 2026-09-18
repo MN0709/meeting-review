@@ -28,6 +28,7 @@ from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenEr
 from app.llm import AnalysisError, LLMAnalyzer, usage_scope, validate_team_evidence
 from app.models import (
     ActionItemStatusResult, ActionItemStatusUpdate, AgentTrace, AgentTraceStep,
+    DEFAULT_MEETING_TITLE,
     LLMUsageFilters, LLMUsageMeetingSummary,
     LLMUsageReport, LLMUsageStageSummary, LLMUsageTotals,
     MeetingHistory, MeetingListItem,
@@ -160,6 +161,11 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
         if speaker_result:
             report = report.model_copy(update={"speaker_stats_note": speaker_result.message})
         if team_id:
+            # D-027：标题仍是默认值时，自动采用 AI 建议标题（用户改过的不覆盖）。
+            # legacy ReviewReport 没有 suggested_title，用 getattr 保持兼容。
+            database.apply_suggested_title(
+                path.stem, team_id, getattr(report, "suggested_title", "")
+            )
             database.save_report(path.stem, team_id, report)
         return report
     except AnalysisError as exc:
@@ -385,7 +391,7 @@ async def review(
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="仅支持 mp3、m4a 和 wav 文件")
-    clean_title = title.strip()[:100] or "未命名会议"
+    clean_title = title.strip()[:100] or DEFAULT_MEETING_TITLE
     clean_project_id = project_id.strip() or None
     if clean_project_id is not None:
         _assert_team_owns_project(clean_project_id, request.state.team_id)

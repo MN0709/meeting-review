@@ -7,6 +7,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# 会议未填标题时的占位值；D-027 用它判断「标题是否可被 AI 建议替换」。
+DEFAULT_MEETING_TITLE = "未命名会议"
+
+
 class TranscriptSegment(StrictModel):
     start: float = Field(ge=0)
     end: float = Field(ge=0)

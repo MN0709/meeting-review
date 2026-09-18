@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from app.models import (
-    ActionStatus, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
+    ActionStatus, DEFAULT_MEETING_TITLE, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
     MemberIdentity, ProjectListItem, SpeakerClip,
     ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
     TeamMeetingReport, Transcript, TranscriptSegment,
@@ -607,6 +607,20 @@ class Database:
             cursor = connection.execute(
                 "UPDATE meetings SET title=? WHERE id=? AND team_id=?",
                 (title, meeting_id, team_id),
+            )
+        return cursor.rowcount == 1
+
+    def apply_suggested_title(self, meeting_id: str, team_id: int, suggested_title: str) -> bool:
+        """D-027：标题仍是默认值（或空）时采用 AI 建议标题；用户改过的绝不覆盖。"""
+        title = (suggested_title or "").strip()[:100]
+        if not title or title == DEFAULT_MEETING_TITLE:
+            return False
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE meetings SET title=?
+                   WHERE id=? AND team_id=?
+                     AND (title IS NULL OR title='' OR title=?)""",
+                (title, meeting_id, team_id, DEFAULT_MEETING_TITLE),
             )
         return cursor.rowcount == 1
 
