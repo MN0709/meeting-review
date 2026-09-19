@@ -25,7 +25,7 @@ from app.agent.tools import default_registry as agent_tool_registry
 from app.agent.tools.catalog import register_all_tools
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
-from app.llm import AnalysisError, LLMAnalyzer, usage_scope, validate_team_evidence
+from app.llm import AnalysisError, LLMAnalyzer, usage_scope, validate_team_action_evidence, validate_team_evidence
 from app.models import (
     ActionItemStatusResult, ActionItemStatusUpdate, AgentTrace, AgentTraceStep,
     DEFAULT_MEETING_TITLE,
@@ -184,6 +184,8 @@ async def _run_agent_report(meeting_id: str, team_id: int) -> TeamMeetingReport:
     if transcript is not None:
         try:
             validate_team_evidence(report, transcript.segments)
+            # 行动项也必须能回到原话（否则负责人无法核对）
+            validate_team_action_evidence(report, transcript.segments)
         except ValueError as exc:
             raise TaskProcessingError(
                 502, "Agent 报告的引文校验未通过：{}".format(str(exc)[:150])

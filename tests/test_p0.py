@@ -176,7 +176,10 @@ REPORT_PAYLOAD = {
             "evidence": {"quote": "决定本周上线", "timestamp": "00:00:00"},
         }
     ],
-    "action_items": [{"task": "准备清单", "owner": "小宁", "deadline": "周五"}],
+    "action_items": [{
+        "task": "准备清单", "owner": "小宁", "deadline": "周五",
+        "evidence": {"quote": "好，我去准备清单", "timestamp": "00:00:03"},
+    }],
     "unresolved_issues": [],
 }
 

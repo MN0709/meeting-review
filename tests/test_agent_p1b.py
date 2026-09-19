@@ -50,7 +50,10 @@ REPORT = TeamMeetingReport(
             evidence=EvidenceQuote(quote="决定本周上线", timestamp="00:00:01"),
         )
     ],
-    action_items=[ActionItem(task="准备发布清单", owner="小李", deadline="周五")],
+    action_items=[ActionItem(
+        task="准备发布清单", owner="小李", deadline="周五",
+        evidence=EvidenceQuote(quote="我来准备发布清单", timestamp="00:00:03"),
+    )],
     unresolved_issues=[],
 )
 

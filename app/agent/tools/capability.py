@@ -145,8 +145,19 @@ def _validate_evidence(
     invalid: List[Dict[str, Any]] = []
     evidence_items = [("decision", item.evidence) for item in report.decisions] + [
         ("unresolved_issue", item.evidence) for item in report.unresolved_issues
-    ]
+    ] + [("action_item", item.evidence) for item in report.action_items]
     for kind, evidence in evidence_items:
+        if evidence is None:
+            invalid.append(
+                {
+                    "kind": kind,
+                    "quote": "",
+                    "timestamp": "",
+                    "reason": "缺少原话证据，无法核对负责人/决策人",
+                    "nearest_segment_preview": "",
+                }
+            )
+            continue
         if not _quote_matches(evidence.quote, evidence.timestamp, segments):
             invalid.append(
                 {

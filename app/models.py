@@ -28,21 +28,24 @@ class Transcript(StrictModel):
         return "".join(segment.text for segment in self.segments).strip()
 
 
+class EvidenceQuote(StrictModel):
+    quote: str = Field(min_length=1)
+    timestamp: str = Field(pattern=r"^\d{2}:\d{2}:\d{2}$")
+
+
 class ActionItem(StrictModel):
     task: str
     owner: str
     deadline: str
+    # 新增（可选）：行动项的原话证据。新报告由模型强制提供并严格校验；
+    # 旧报告缺失时为 None，保证历史数据仍可读取（D-024 契约向前兼容）。
+    evidence: Optional[EvidenceQuote] = None
 
 
 class MeetingMinutes(StrictModel):
     key_points: List[str]
     conclusions: List[str]
     action_items: List[ActionItem]
-
-
-class EvidenceQuote(StrictModel):
-    quote: str = Field(min_length=1)
-    timestamp: str = Field(pattern=r"^\d{2}:\d{2}:\d{2}$")
 
 
 class PerformanceFinding(StrictModel):

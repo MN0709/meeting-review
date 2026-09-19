@@ -60,15 +60,17 @@ TEAM_SYSTEM_PROMPT = """
 你是严谨的团队正式会议分析助手。只能根据转写内容提炼信息，不得补写。
 先根据会议的核心主题生成一个 8-20 个字的中文建议标题，不加书名号，不使用“会议纪要”等空泛名称。
 再用不超过 300 字概括会议目标、进展和结果，并输出会议要点、决策清单、行动项与遗留问题。
-每条决策和遗留问题必须包含输入中完全一致的原话和时间戳，不得改写引文；无法确认决策人时填“未明确”。
+每条决策、行动项和遗留问题都必须包含输入中完全一致的原话和时间戳，不得改写引文；无法确认决策人或负责人时填“未明确”，但仍必须给出对应原话（evidence）。
+行动项的 evidence 用于核对“谁承诺了什么”，不得省略。
 遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
-行动项的负责人或截止时间不明确时填“未明确”。speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
+行动项的截止时间不明确时填“未明确”。speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
 只输出符合指定 JSON Schema 的 JSON，不输出 Markdown 或解释。
 """.strip()
 
 TEAM_CHUNK_SYSTEM_PROMPT = """
 你负责从团队正式会议的一个转写分块中提取会议要点、明确决策、行动项和遗留问题。
-每条决策和遗留问题必须保留完全一致的逐字原话及时间戳，不得改写引文；无法确认决策人、负责人或截止时间时填“未明确”。
+每条决策、行动项和遗留问题必须保留完全一致的逐字原话及时间戳，不得改写引文；无法确认决策人、负责人或截止时间时填“未明确”，但仍必须给出对应原话（evidence）。
+行动项的 evidence 用于核对“谁承诺了什么”，不得省略。
 遗留问题只记录明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
 不要分析个人表现，不要补写分块中不存在的信息。只输出符合指定 JSON Schema 的 JSON。
 """.strip()
@@ -107,7 +109,8 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
                 "content": "决策内容", "decision_maker": "未明确",
                 "evidence": {"quote": "原话", "timestamp": "00:00:00"},
             }],
-            "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确"}],
+            "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确",
+                              "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "unresolved_issues": [{
                 "content": "尚未解决的问题",
                 "evidence": {"quote": "原话", "timestamp": "00:00:00"},
@@ -118,7 +121,8 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
             "suggested_title(必填字符串，8-20 个字)；overview(必填字符串，不超过 300 字)；"
             "meeting_points(必填字符串数组)；"
             "decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
-            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline)；"
+            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
+            "evidence 只有 quote/timestamp)；"
             "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
             "speaker_stats_note(必填空字符串，由后端覆盖)"
         )
@@ -126,12 +130,13 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
         example = {
             "meeting_points": ["会议要点"],
             "decisions": [{"content": "决策内容", "decision_maker": "未明确", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
-            "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确"}],
+            "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "unresolved_issues": [{"content": "尚未解决的问题", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
         }
         fields = (
             "meeting_points(必填字符串数组)；decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
-            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline)；"
+            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
+            "evidence 只有 quote/timestamp)；"
             "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)"
         )
     elif issubclass(model_type, SemanticAnalysis):
@@ -289,7 +294,19 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
                     cleaned.append({"task": item, "owner": "未明确", "deadline": "未明确"})
                 elif isinstance(item, dict):
                     task = next((item.get(key) for key in ("task", "item", "content", "description") if item.get(key) is not None), "")
-                    cleaned.append({"task": str(task), "owner": str(item.get("owner") or "未明确"), "deadline": str(item.get("deadline") or "未明确")})
+                    entry = {
+                        "task": str(task),
+                        "owner": str(item.get("owner") or "未明确"),
+                        "deadline": str(item.get("deadline") or "未明确"),
+                    }
+                    # 行动项原话证据：结构正确才保留，不在这里改写引文内容
+                    evidence = item.get("evidence")
+                    if isinstance(evidence, dict) and "quote" in evidence and "timestamp" in evidence:
+                        entry["evidence"] = {
+                            "quote": evidence.get("quote", ""),
+                            "timestamp": evidence.get("timestamp", ""),
+                        }
+                    cleaned.append(entry)
             normalized["action_items"] = cleaned
 
         decisions = normalized.get("decisions")
@@ -499,6 +516,20 @@ def validate_team_evidence(report: TeamMeetingReport, segments: Sequence[Transcr
         + [issue.evidence for issue in report.unresolved_issues],
         segments,
     )
+
+
+def validate_team_action_evidence(report: Any, segments: Sequence[TranscriptSegment]) -> None:
+    """行动项原话证据（新增）：要求每一项都有 evidence，且引文/时间戳可核对。
+
+    只在新报告的分析路径上调用；旧报告缺失 evidence 时不会被重新校验（向前兼容）。
+    """
+    items = list(getattr(report, "action_items", []) or [])
+    missing = [item.task for item in items if item.evidence is None]
+    if missing:
+        raise ValueError(
+            "以下行动项缺少原话证据（evidence），无法核对负责人，请为每一项补上输入中转写原文的完全一致子串与时间戳: {}".format(missing[:3])
+        )
+    _validate_quotes([item.evidence for item in items], segments)
 
 
 def validate_team_chunk_evidence(report: TeamChunkSummary, segments: Sequence[TranscriptSegment]) -> None:
@@ -745,8 +776,10 @@ class LLMAnalyzer:
                         validate_evidence(parsed, transcript_segments)
                     elif isinstance(parsed, TeamMeetingReport):
                         validate_team_evidence(parsed, transcript_segments)
+                        validate_team_action_evidence(parsed, transcript_segments)
                     elif isinstance(parsed, TeamChunkSummary):
                         validate_team_chunk_evidence(parsed, transcript_segments)
+                        validate_team_action_evidence(parsed, transcript_segments)
                     elif isinstance(parsed, ChunkSummary):
                         validate_chunk_evidence(parsed, transcript_segments)
                 return parsed

@@ -2,7 +2,7 @@
   "meeting_minutes": {
     "key_points": ["建议优先进入校园市场。", "校园用户较集中，预期获客成本较低。", "可先选择三个社团进行试点。"],
     "conclusions": ["优先验证校园市场，并以三个社团作为首批试点。"],
-    "action_items": [{"task": "确定三个试点社团并制定试点计划。", "owner": "未明确", "deadline": "未明确"}]
+    "action_items": [{"task": "确定三个试点社团并制定试点计划。", "owner": "未明确", "deadline": "未明确", "evidence": null}]
   },
   "overall_score": 7,
   "overall_comment": "结论和理由较清晰，但行动计划缺少时间闭环。",
