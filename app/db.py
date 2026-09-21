@@ -260,6 +260,17 @@ class Database:
                     duration_ms INTEGER NULL,
                     created_at TEXT NOT NULL
                 );
+                -- R-P1.5-6（阶段 10-A）：上传同意留证。
+                CREATE TABLE IF NOT EXISTS consent_records(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT NOT NULL,
+                    team_id INTEGER NOT NULL,
+                    consent_version TEXT NOT NULL,
+                    consented_at TEXT NOT NULL,
+                    ip TEXT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_consent_meeting
+                    ON consent_records(meeting_id, team_id);
                 -- R-P1.5-7（阶段 9-C）：四类交付物各自独立成/败。
                 CREATE TABLE IF NOT EXISTS deliverable_status(
                     meeting_id TEXT NOT NULL,
@@ -604,6 +615,10 @@ class Database:
                 "DELETE FROM deliverable_status WHERE meeting_id=? AND team_id=?",
                 (meeting_id, team_id),
             )
+            connection.execute(
+                "DELETE FROM consent_records WHERE meeting_id=? AND team_id=?",
+                (meeting_id, team_id),
+            )
             connection.execute("DELETE FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id))
 
     def update_status(self, meeting_id: str, team_id: int, status: str) -> None:
@@ -775,6 +790,29 @@ class Database:
     # ------------------------------------------------------------------
     # R-P1.5-7（阶段 9-C）：交付物状态。四类交付物各自独立成/败。
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # R-P1.5-6（阶段 10-A）：上传同意留证。
+    # ------------------------------------------------------------------
+
+    def save_consent(
+        self, meeting_id: str, team_id: int, consent_version: str, ip: Optional[str] = None,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO consent_records(meeting_id,team_id,consent_version,consented_at,ip)
+                   VALUES(?,?,?,?,?)""",
+                (meeting_id, team_id, consent_version, _utc_now(), ip),
+            )
+
+    def consent_records(self, meeting_id: str, team_id: int) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT consent_version,consented_at,ip FROM consent_records
+                   WHERE meeting_id=? AND team_id=? ORDER BY id""",
+                (meeting_id, team_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def set_deliverable_status(
         self, meeting_id: str, team_id: int, kind: str, status: str,

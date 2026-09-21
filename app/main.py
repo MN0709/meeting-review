@@ -404,7 +404,7 @@ async def _save_upload(upload: UploadFile, path: Path) -> None:
 @app.post("/api/review", response_model=TaskAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def review(
     request: Request, file: UploadFile = File(...), title: str = Form(default=""),
-    project_id: str = Form(default=""),
+    project_id: str = Form(default=""), consent_confirmed: bool = Form(default=False),
 ) -> TaskAccepted:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -425,10 +425,21 @@ async def review(
             actual_minutes = math.ceil(metadata_duration / 6) / 10
             raise HTTPException(status_code=422, detail=f"当前版本支持 {settings.max_audio_minutes:g} 分钟以内的录音，你的录音约 {actual_minutes:.1f} 分钟")
         long_meeting = metadata_duration is not None and metadata_duration > 30 * 60
+        # R-P1.5-6：未勾选同意不得上传（红线 10）。放在格式/时长校验之后、
+        # 建库与入队之前：拒绝时不留下会议记录，临时文件会在 finally 里清掉。
+        if not consent_confirmed:
+            raise HTTPException(
+                status_code=422,
+                detail="请先勾选「我已知晓：音频将上传至本服务用于本次转写，其中包含他人声音」再上传",
+            )
         database.create_meeting(
             task_id, request.state.team_id, clean_title, temp_path, clean_project_id
         )
         created = True
+        database.save_consent(
+            task_id, request.state.team_id, settings.consent_version,
+            _client_ip(request),
+        )
         accepted = await task_manager.submit(
             temp_path, request.state.request_id, task_id=task_id,
             team_id=request.state.team_id, long_meeting=long_meeting,

@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     pdf_renderer: Literal["auto", "playwright", "chrome", "none"] = Field(
         default="auto", alias="PDF_RENDERER"
     )
+    # 上传同意协议版本（R-P1.5-6）。文案变更时递增，旧记录不被覆盖。
+    consent_version: str = Field(default="v1", alias="CONSENT_VERSION")
 
     # --- Agent 层开关（PRD v1.1 §13.1）-------------------------------------
     # 默认 pipeline：不设置任何 AGENT_* 时，行为与 P0 完全一致（零行为变化）。

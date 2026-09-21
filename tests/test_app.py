@@ -468,7 +468,11 @@ def test_preflight_allows_duration_and_randomizes_server_filename(
     monkeypatch.setattr(main_module.task_manager, "submit", fake_submit)
 
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
-        response = client.post("/api/review", files={"file": ("normal.wav", b"fake", "audio/wav")})
+        response = client.post(
+            "/api/review",
+            data={"consent_confirmed": "true"},
+            files={"file": ("normal.wav", b"fake", "audio/wav")},
+        )
 
     assert response.status_code == 202
     assert len(response.json()["task_id"]) == 32
@@ -986,7 +990,7 @@ def test_review_can_be_assigned_to_project_folder(monkeypatch) -> None:
         project = client.post("/api/projects", json={"name": "产品发布"}).json()
         response = client.post(
             "/api/review",
-            data={"project_id": project["id"], "title": "发布准备会"},
+            data={"project_id": project["id"], "title": "发布准备会", "consent_confirmed": "true"},
             files={"file": ("meeting.wav", b"fake", "audio/wav")},
         )
         assert response.status_code == 202
@@ -1223,7 +1227,11 @@ def test_review_endpoint_returns_task_and_reuses_module_level_analyzer(monkeypat
     monkeypatch.setattr(main_module, "build_team_report", fake_build_report)
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
         for _ in range(2):
-            response = client.post("/api/review", files={"file": ("sample.wav", b"fake", "audio/wav")})
+            response = client.post(
+                "/api/review",
+                data={"consent_confirmed": "true"},
+                files={"file": ("sample.wav", b"fake", "audio/wav")},
+            )
             assert response.status_code == 202
             body = response.json()
             assert body["task_id"]

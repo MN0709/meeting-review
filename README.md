@@ -8,7 +8,7 @@
 
 ## 页面与团队报告
 
-- 上传：可填写会议标题，支持 MP3/M4A/WAV，默认最大 300 MB、4 小时；2-4 小时录音建议使用 M4A/MP3。
+- 上传：可填写会议标题，支持 MP3/M4A/WAV，默认最大 300 MB、4 小时；2-4 小时录音建议使用 M4A/MP3。**必须先勾选同意**（「我已知晓：音频将上传至本服务用于本次转写，其中包含他人声音」）才能开始；未勾选时前端按钮禁用，绕过前端直接调接口返回 422 且不建会议、不入队、不留临时文件（R-P1.5-6）。同意后写入 `consent_records` 留证：协议版本号（`CONSENT_VERSION`，默认 `v1`）+ 同意时间 + 来源 IP；改文案升版本时旧记录不被覆盖。
 - 会后整理：报告生成后自动打开“整理本次会议”，用户可确认/编辑 AI 建议标题，并根据原话片段确认说话人；允许稍后处理。**若标题仍是“未命名会议”（用户从未填写或修改），报告生成后会自动采用 AI 建议标题（D-027）；用户自己填过或改过的标题不会被覆盖。**
 - 导航：登录后左侧有“首页 / 全部会议 / 项目 / 搜索”；主页专注上传，不再同屏堆叠历史和项目记忆。
 - 跨会议搜索（R-P1.5-4）：“搜索”页输入一句话，在**当前团队全部历史会议**的转写原文里查找；结果带会议名、项目、时间戳、说话人与命中片段，点击直接跳到那场会议并定位。底层复用 FTS5 转写索引（中文 ≥ 3 字走 FTS5，更短或含特殊字符自动回退 `LIKE`），不占上传限频与每日名额。
@@ -192,7 +192,10 @@ curl http://127.0.0.1:8000/health
 | `SPEAKER_MODEL` | 否 | `chinese` | WeSpeaker 中文模型名或本地模型目录 |
 | `SPEAKER_MATCH_THRESHOLD` | 否 | `0.72` | 自动身份匹配的最低置信度，需真实录音校准 |
 | `SPEAKER_MATCH_MARGIN` | 否 | `0.05` | 第一与第二候选的最小分差，防止相似声音误认 |
-| `SPEAKER_INTRA_MERGE_THRESHOLD` | 否 | `0.78` | 同场被过度切分的说话人标签合并阈值，需真实录音校准 |
+| `SPEAKER_INTRA_MERGE_THRESHOLD` | 否 | `0.85` | 同场被过度切分的说话人标签合并阈值（2026-09-21 用真实录音由 0.78 上调）；**两簇各自命中不同成员时一律不合并** |
+| `CONSENT_VERSION` | 否 | `v1` | 上传同意协议版本号；改动同意文案时递增，旧留证记录不被覆盖（R-P1.5-6） |
+| `PDF_RENDERER` | 否 | `auto` | 图片纪要导出 PDF 的渲染器：`auto`（Playwright 优先，回退本机 Chrome）/ `playwright` / `chrome` / `none` |
+| `IMAGE_MINUTES_TEMPLATE` | 否 | `card_v1` | 图片纪要版式模板名（模板在 `app/deliverables/templates/`） |
 | `DATABASE_PATH` | 否 | `data/meeting-review.db` | SQLite 路径；Compose 使用 `/data/meeting-review.db` |
 | `MAX_UPLOAD_MB` | 否 | `300` | 上传大小上限（MB） |
 | `MAX_AUDIO_MINUTES` | 否 | `240` | PyAV 与转写后双重时长上限（默认 4 小时） |
@@ -281,13 +284,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：314 passed
+python -m pytest -q            # 本地完整环境：323 passed
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 314 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 323 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：
