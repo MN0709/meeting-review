@@ -186,11 +186,50 @@ class MeetingTitleUpdate(StrictModel):
     title: str = Field(min_length=1, max_length=100)
 
 
+# ---------------------------------------------------------------------------
+# 「我」的指认与我的任务（R-P1.5-5，阶段 9／M2）
+# 口径：只做「完全一致」匹配，未指认时一律为空，绝不推断。
+# ---------------------------------------------------------------------------
+
+
+class SelfSpeakerUpdate(StrictModel):
+    local_label: Optional[str] = None
+    member_id: Optional[int] = None
+
+
+class SelfSpeakerResult(StrictModel):
+    self_speaker_set: bool
+    local_label: Optional[str] = None
+    member_id: Optional[int] = None
+    member_name: Optional[str] = None
+    self_name: Optional[str] = None
+
+
+class MyTaskItem(StrictModel):
+    id: int
+    task: str
+    owner: str
+    deadline: str
+    status: str
+
+
+class MyTasksResult(StrictModel):
+    meeting_id: str
+    self_speaker_set: bool
+    local_label: Optional[str] = None
+    member_id: Optional[int] = None
+    self_name: Optional[str] = None
+    count: int = Field(ge=0)
+    owner_unknown: int = Field(ge=0)
+    items: List[MyTaskItem]
+
+
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
     transcript: List[TranscriptSegment]
     speakers: List["MeetingSpeaker"] = Field(default_factory=list)
     speaker_consent_confirmed: bool = False
+    self_speaker: Optional[SelfSpeakerResult] = None
 
 
 SpeakerIdentityStatus = Literal["待确认", "已识别", "已确认", "仅本场"]

@@ -39,7 +39,7 @@ from app.models import (
     MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
-    SearchHit, SearchResponse,
+    MyTaskItem, MyTasksResult, SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
@@ -647,6 +647,97 @@ async def search_history(
         for row in rows
     ]
     return SearchResponse(query=text, count=len(hits), hits=hits)
+
+
+@app.get("/api/meetings/{meeting_id}/my-tasks", response_model=MyTasksResult)
+async def my_tasks(request: Request, meeting_id: str) -> MyTasksResult:
+    """R-P1.5-5：「我答应的任务」切面。
+
+    - 只收 `owner` 与「我」（成员姓名或本场说话人标签）**完全一致**的行动项；
+    - 未指认时返回空 + `self_speaker_set=false`，**绝不推断**（红线 8）。
+    """
+    team_id = request.state.team_id
+    owner_team = database.owner_team_id(meeting_id)
+    if owner_team is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner_team != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+
+    items = database.list_meeting_action_items(meeting_id, team_id)
+    owner_unknown = sum(
+        1 for item in items if not (item.get("owner") or "").strip()
+        or (item.get("owner") or "").strip() == "未明确"
+    )
+    current = database.self_speaker(meeting_id, team_id)
+    if current is None:
+        return MyTasksResult(
+            meeting_id=meeting_id, self_speaker_set=False,
+            count=0, owner_unknown=owner_unknown, items=[],
+        )
+    self_name = current["self_name"]
+    mine = [
+        MyTaskItem(**item) for item in items
+        if self_name and (item.get("owner") or "").strip() == self_name
+    ]
+    return MyTasksResult(
+        meeting_id=meeting_id, self_speaker_set=True,
+        local_label=current["local_label"], member_id=current["member_id"],
+        self_name=self_name, count=len(mine), owner_unknown=owner_unknown, items=mine,
+    )
+
+
+@app.post("/api/meetings/{meeting_id}/self-speaker", response_model=SelfSpeakerResult)
+async def set_self_speaker(
+    request: Request, meeting_id: str, payload: SelfSpeakerUpdate = Body(...),
+) -> SelfSpeakerResult:
+    """R-P1.5-5：指定本场哪个说话人是「我」；两者都为空时清除指认。"""
+    team_id = request.state.team_id
+    owner_team = database.owner_team_id(meeting_id)
+    if owner_team is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner_team != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+
+    history = database.get_history(meeting_id, team_id)
+    if history is None:
+        raise APIError(404, "not_found", "这场会议还没有生成报告")
+
+    if payload.member_id is None and not (payload.local_label or "").strip():
+        database.set_self_speaker(meeting_id, team_id)
+        return SelfSpeakerResult(self_speaker_set=False)
+
+    if payload.member_id is not None:
+        member = next(
+            (item for item in database.list_members(team_id) if item.id == payload.member_id), None,
+        )
+        if member is None:
+            raise APIError(422, "invalid_args", "团队成员不存在或不属于本团队")
+        speaker = next(
+            (item for item in history.speakers if item.member_id == member.id), None,
+        )
+        if speaker is None:
+            raise APIError(
+                422, "invalid_args",
+                "这位成员不在本场会议里；请在本场说话人里指定。",
+            )
+        database.set_self_speaker(meeting_id, team_id, member_id=member.id, label=speaker.local_label)
+        return SelfSpeakerResult(
+            self_speaker_set=True, local_label=speaker.local_label,
+            member_id=member.id, member_name=member.name, self_name=member.name,
+        )
+
+    label = payload.local_label.strip()
+    speaker = next((item for item in history.speakers if item.local_label == label), None)
+    if speaker is None:
+        raise APIError(422, "invalid_args", "本场没有这个说话人：{}".format(label))
+    database.set_self_speaker(meeting_id, team_id, member_id=speaker.member_id, label=label)
+    member_name = next(
+        (item.name for item in database.list_members(team_id) if item.id == speaker.member_id), None,
+    )
+    return SelfSpeakerResult(
+        self_speaker_set=True, local_label=label, member_id=speaker.member_id,
+        member_name=member_name, self_name=member_name or label,
+    )
 
 
 @app.get("/api/meetings/{meeting_id}/agent-trace", response_model=AgentTrace)

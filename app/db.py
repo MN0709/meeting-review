@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from app.models import (
     ActionStatus, DEFAULT_MEETING_TITLE, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
     MemberIdentity, ProjectListItem, SpeakerClip,
+    SelfSpeakerResult,
     ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
     TeamMeetingReport, Transcript, TranscriptSegment,
 )
@@ -263,6 +264,9 @@ class Database:
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
             self._ensure_column(connection, "meetings", "speaker_consent_at", "TEXT")
+            # R-P1.5-5（阶段 9／M2）：本场「我」的指认。两者均可为空 → 代表未指定。
+            self._ensure_column(connection, "meetings", "self_member_id", "INTEGER")
+            self._ensure_column(connection, "meetings", "self_label", "TEXT")
             self._ensure_column(connection, "projects", "parent_id", "TEXT REFERENCES projects(id)")
             self._ensure_column(connection, "members", "role", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(
@@ -707,6 +711,65 @@ class Database:
                     ],
                 )
 
+    def set_self_speaker(
+        self, meeting_id: str, team_id: int, *,
+        member_id: Optional[int] = None, label: Optional[str] = None,
+    ) -> bool:
+        """R-P1.5-5：写入/清除本场「我」的指认（两者都为空 = 清除）。"""
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE meetings SET self_member_id=?, self_label=? WHERE id=? AND team_id=?",
+                (member_id, label, meeting_id, team_id),
+            )
+            return cursor.rowcount > 0
+
+    def self_speaker(self, meeting_id: str, team_id: int) -> Optional[Dict[str, Any]]:
+        """本场「我」的指认；未指定返回 None。绝不推断。
+
+        - 选了已命名说话人：member_id 有值，self_name 取成员姓名；
+        - 选了未命名说话人：只有 label，self_name 取说话人标签（如「说话人 1」）；
+        - 两者都空：返回 None（上层一律显示「未指定你自己」）。
+        """
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT m.self_member_id, m.self_label, mem.name AS member_name
+                   FROM meetings m LEFT JOIN members mem ON mem.id = m.self_member_id
+                   WHERE m.id=? AND m.team_id=?""",
+                (meeting_id, team_id),
+            ).fetchone()
+            if row is None:
+                return None
+            member_id = row["self_member_id"]
+            label = row["self_label"]
+            member_name = row["member_name"]
+            if member_id is None and not label:
+                return None
+            if not label:
+                speaker = connection.execute(
+                    """SELECT local_label FROM meeting_speakers
+                       WHERE meeting_id=? AND team_id=? AND member_id=? ORDER BY id LIMIT 1""",
+                    (meeting_id, team_id, member_id),
+                ).fetchone()
+                label = speaker["local_label"] if speaker else None
+        return {
+            "member_id": member_id,
+            "local_label": label,
+            "member_name": member_name,
+            "self_name": member_name or label,
+        }
+
+    def list_meeting_action_items(self, meeting_id: str, team_id: int) -> List[Dict[str, Any]]:
+        """本场全部行动项（只读），供「我答应的任务」切面使用。"""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT a.id,a.task,a.owner,a.deadline,a.status
+                   FROM meeting_action_items a JOIN meetings m ON m.id=a.meeting_id
+                   WHERE a.meeting_id=? AND a.team_id=? AND m.team_id=?
+                   ORDER BY a.item_index, a.id""",
+                (meeting_id, team_id, team_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_members(self, team_id: int) -> list[MemberIdentity]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
@@ -1024,6 +1087,7 @@ class Database:
         if not row:
             return None
         report_payload = self._report_payload(row["json"])
+        self_speaker = self.self_speaker(meeting_id, team_id)
         clips_by_label: dict[str, list[SpeakerClip]] = {}
         for clip in clip_rows:
             clips_by_label.setdefault(clip["local_label"], []).append(SpeakerClip(
@@ -1036,6 +1100,7 @@ class Database:
             report=TeamMeetingReport.model_validate(report_payload),
             transcript=[TranscriptSegment.model_validate(dict(item)) for item in transcript_rows],
             speaker_consent_confirmed=row["speaker_consent_at"] is not None,
+            self_speaker=SelfSpeakerResult(**self_speaker, self_speaker_set=True) if self_speaker else None,
             speakers=[MeetingSpeaker(
                 local_label=item["local_label"],
                 display_name=item["name"] or item["local_label"],
