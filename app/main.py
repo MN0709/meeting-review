@@ -45,6 +45,7 @@ from app.models import (
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
     MyTaskItem, MyTasksResult, SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
     ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
+    DeliverableState, DeliverablesReport, RetryResult,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
@@ -155,6 +156,7 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
     analysis_transcript = speaker_result.analysis_transcript if speaker_result else transcript
     if team_id:
         database.save_transcript(path.stem, team_id, persisted_transcript)
+        _mark_deliverable(path.stem, team_id, "transcript", "ok")
         if speaker_result:
             database.save_meeting_speakers(path.stem, team_id, speaker_result.observations)
     if not progress("AI 分析中", "转写完成，正在进行 AI 分析…"):
@@ -176,8 +178,13 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
                 path.stem, team_id, getattr(report, "suggested_title", "")
             )
             database.save_report(path.stem, team_id, report)
+            _mark_deliverable(path.stem, team_id, "report", "ok")
+            _mark_deliverable(path.stem, team_id, "tasks", "ok")
         return report
     except AnalysisError as exc:
+        if team_id:
+            _mark_deliverable(path.stem, team_id, "report", "failed", "analysis_failed")
+            _mark_deliverable(path.stem, team_id, "tasks", "failed", "analysis_failed")
         raise TaskProcessingError(502, str(exc)) from exc
 
 
@@ -745,6 +752,111 @@ async def set_self_speaker(
     )
 
 
+DELIVERABLE_KINDS = ("transcript", "report", "tasks", "image_minutes")
+DELIVERABLE_LABELS = {
+    "transcript": "逐字稿",
+    "report": "文字报告（精简纪要）",
+    "tasks": "任务单（行动项）",
+    "image_minutes": "图片纪要 + PDF",
+}
+RENDERER_MISSING_CODE = "renderer_unavailable"
+
+
+def _mark_deliverable(
+    meeting_id: str, team_id: Optional[int], kind: str, status: str,
+    error_code: Optional[str] = None,
+) -> None:
+    """写交付物状态。失败不能影响主链路（状态是辅助信息）。"""
+    if not team_id:
+        return
+    try:
+        database.set_deliverable_status(meeting_id, team_id, kind, status, error_code)
+    except Exception as exc:  # pragma: no cover - 防御性兑底
+        logger.warning(
+            "deliverable_status_write_failed kind=%s error_type=%s", kind, type(exc).__name__,
+        )
+
+
+def _deliverable_message(kind: str, status: str, error_code: Optional[str]) -> Optional[str]:
+    if status == "ok":
+        return None
+    if status == "pending":
+        return "还没生成或还在处理中。"
+    if kind == "transcript":
+        return "转写失败；原始录音已按隐私策略删除，请重新上传录音。"
+    if error_code == RENDERER_MISSING_CODE:
+        return "图片纪要已生成，但 PDF 渲染器不可用（可重试）。"
+    if kind == "report":
+        return "报告生成失败，可重试（重试会重新调用 AI）。"
+    return "这一项失败了，可单独重试，不影响其它交付物。"
+
+
+def _deliverable_state(kind: str, row: Optional[Dict[str, Any]]) -> DeliverableState:
+    status = (row or {}).get("status") or "pending"
+    error_code = (row or {}).get("error_code")
+    retryable = status in ("failed", "needs_review") and kind != "transcript"
+    return DeliverableState(
+        kind=kind, label=DELIVERABLE_LABELS[kind], status=status,
+        error_code=error_code, message=_deliverable_message(kind, status, error_code),
+        retryable=retryable, updated_at=(row or {}).get("updated_at"),
+    )
+
+
+def _deliverables_report(meeting_id: str, team_id: int) -> DeliverablesReport:
+    rows = {row["kind"]: row for row in database.deliverable_statuses(meeting_id, team_id)}
+    # 旧会议（本次升级前创建的）没有状态行；按实际数据推断一个诚实初值，
+    # 避免把已经存在的报告/逐字稿显示成「待生成」。
+    fallback = _inferred_statuses(meeting_id, team_id)
+    items = [
+        _deliverable_state(kind, rows.get(kind) or fallback.get(kind))
+        for kind in DELIVERABLE_KINDS
+    ]
+    return DeliverablesReport(
+        meeting_id=meeting_id, items=items,
+        needs_review=sum(1 for item in items if item.status in ("failed", "needs_review")),
+    )
+
+
+def _inferred_statuses(meeting_id: str, team_id: int) -> Dict[str, Dict[str, Any]]:
+    transcript = database.load_transcript(meeting_id, team_id)
+    has_transcript = transcript is not None and bool(transcript.segments)
+    has_report = database.get_history(meeting_id, team_id) is not None
+    inferred: Dict[str, Dict[str, Any]] = {}
+    if has_transcript:
+        inferred["transcript"] = {"status": "ok", "error_code": None, "updated_at": None}
+    if has_report:
+        for kind in ("report", "tasks", "image_minutes"):
+            inferred[kind] = {"status": "ok", "error_code": None, "updated_at": None}
+    return inferred
+
+
+def _mark_image_minutes_generated(meeting_id: str, team_id: int) -> None:
+    """四板块刚生成。
+
+    注意：**不把已有的「待核对」/「失败」改成正常**——看一次报告不应该假装 PDF 问题已修好；
+    只有 PDF 真正渲染成功（或用户点重试且真的渲染成功）才算正常。
+    """
+    current = {
+        row["kind"]: row["status"] for row in database.deliverable_statuses(meeting_id, team_id)
+    }
+    if current.get("image_minutes") in ("failed", "needs_review"):
+        return
+    _mark_deliverable(meeting_id, team_id, "image_minutes", "ok")
+
+
+def _image_minutes_html(history, action_rows, self_name: Optional[str]) -> str:
+    return render_html(
+        report=history.report, action_rows=action_rows, self_name=self_name,
+        title="{}｜图片纪要".format(history.title),
+        meta=_image_minutes_meta(history, self_name),
+        footer=(
+            "由「会脉 · 团队会议记忆」生成 ｜ 完整录音已按隐私策略删除，此处不含音频。\n"
+            "图片纪要仅用于速览；结论与引文以会脉报告中的原话证据为准。"
+        ),
+        template=settings.image_minutes_template or DEFAULT_TEMPLATE,
+    )
+
+
 def _image_minutes_inputs(meeting_id: str, team_id: int):
     """图片纪要所需的只读数据：历史（报告/标题/元信息）、行动项状态、本场「我」。"""
     history = database.get_history(meeting_id, team_id)
@@ -793,6 +905,7 @@ async def image_minutes(request: Request, meeting_id: str) -> ImageMinutesResult
         )
         for part in build_parts(report=history.report, action_rows=action_rows, self_name=self_name)
     ]
+    _mark_image_minutes_generated(meeting_id, team_id)
     return ImageMinutesResult(
         meeting_id=meeting_id, title=history.title,
         meta=_image_minutes_meta(history, self_name), parts=parts,
@@ -804,20 +917,15 @@ async def image_minutes_pdf(request: Request, meeting_id: str) -> Response:
     """R-P1.5-1：导出图片纪要 PDF。渲染器不可用时返回 503（不返回 500，不影响其它交付物）。"""
     team_id = request.state.team_id
     history, action_rows, self_name = _image_minutes_inputs(meeting_id, team_id)
-    html_text = render_html(
-        report=history.report, action_rows=action_rows, self_name=self_name,
-        title="{}｜图片纪要".format(history.title),
-        meta=_image_minutes_meta(history, self_name),
-        footer=(
-            "由「会脉 · 团队会议记忆」生成 ｜ 完整录音已按隐私策略删除，此处不含音频。\n"
-            "图片纪要仅用于速览；结论与引文以会脉报告中的原话证据为准。"
-        ),
-        template=settings.image_minutes_template or DEFAULT_TEMPLATE,
-    )
+    html_text = _image_minutes_html(history, action_rows, self_name)
     try:
         pdf_bytes = await render_pdf(html_text, renderer=settings.pdf_renderer)
     except RendererUnavailable as exc:
-        raise APIError(503, "renderer_unavailable", str(exc)) from exc
+        # R-P1.5-7：图片纪要本身已生成，只是 PDF 不可用 → 标「待核对」并给重试入口；
+        # 其它交付物（文字报告、逐字稿）完全不受影响。
+        _mark_deliverable(meeting_id, team_id, "image_minutes", "needs_review", RENDERER_MISSING_CODE)
+        raise APIError(503, RENDERER_MISSING_CODE, str(exc)) from exc
+    _mark_deliverable(meeting_id, team_id, "image_minutes", "ok")
     filename = "{}-图片纪要.pdf".format(history.title or "会议")
     return Response(
         content=pdf_bytes,
@@ -828,6 +936,95 @@ async def image_minutes_pdf(request: Request, meeting_id: str) -> Response:
             ),
             "Cache-Control": "no-store",
         },
+    )
+
+
+@app.get("/api/meetings/{meeting_id}/deliverables", response_model=DeliverablesReport)
+async def meeting_deliverables(request: Request, meeting_id: str) -> DeliverablesReport:
+    """R-P1.5-7：四类交付物各自的状态（含「待核对」与可重试标记）。"""
+    team_id = request.state.team_id
+    owner = database.owner_team_id(meeting_id)
+    if owner is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+    return _deliverables_report(meeting_id, team_id)
+
+
+@app.post("/api/meetings/{meeting_id}/retry", response_model=RetryResult)
+async def retry_deliverable(
+    request: Request, meeting_id: str, kind: str = Query(...),
+) -> RetryResult:
+    """R-P1.5-7：按交付物重试。**不重跑已成功的部分**。"""
+    team_id = request.state.team_id
+    owner = database.owner_team_id(meeting_id)
+    if owner is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+    if kind not in DELIVERABLE_KINDS:
+        raise APIError(422, "invalid_args", "未知交付物：{}".format(kind))
+
+    if kind == "transcript":
+        raise APIError(
+            409, "not_retryable",
+            "转写需要原始录音，而录音已按隐私策略删除；请重新上传录音。",
+        )
+
+    if kind == "tasks":
+        history = database.get_history(meeting_id, team_id)
+        if history is None:
+            raise APIError(404, "not_found", "还没有可用的报告，请先重试报告。")
+        database.save_report(meeting_id, team_id, history.report)
+        _mark_deliverable(meeting_id, team_id, "tasks", "ok")
+        return RetryResult(
+            meeting_id=meeting_id, kind=kind, status="ok",
+            message="已按现有报告重新生成任务单（未重新调用 AI）。",
+        )
+
+    if kind == "image_minutes":
+        history, action_rows, self_name = _image_minutes_inputs(meeting_id, team_id)
+        html_text = _image_minutes_html(history, action_rows, self_name)
+        try:
+            # 真重试：实际渲染一次 PDF；失败则保持「待核对」，不假装修好。
+            await render_pdf(html_text, renderer=settings.pdf_renderer)
+        except RendererUnavailable as exc:
+            _mark_deliverable(
+                meeting_id, team_id, "image_minutes", "needs_review", RENDERER_MISSING_CODE,
+            )
+            raise APIError(503, RENDERER_MISSING_CODE, str(exc)) from exc
+        _mark_deliverable(meeting_id, team_id, "image_minutes", "ok")
+        return RetryResult(
+            meeting_id=meeting_id, kind=kind, status="ok",
+            message="已重新生成图片纪要，并可导出 PDF（未重新调用 AI）。",
+        )
+
+    # kind == "report"：唯一会重新调用 AI 的重试
+    transcript = database.load_transcript(meeting_id, team_id)
+    if transcript is None or not transcript.segments:
+        raise APIError(404, "not_found", "没有可用的逐字稿，请先重新上传录音。")
+    meeting_context = database.meeting_context(meeting_id, team_id) or {}
+    try:
+        with usage_scope({"team_id": team_id, **meeting_context}):
+            report = await build_team_report(transcript, analyzer)
+    except AnalysisError as exc:
+        _mark_deliverable(meeting_id, team_id, "report", "failed", "analysis_failed")
+        raise APIError(502, "analysis_failed", "重新生成报告失败：{}".format(str(exc)[:150])) from exc
+    except Exception as exc:
+        _mark_deliverable(meeting_id, team_id, "report", "failed", "analysis_failed")
+        raise APIError(502, "analysis_failed", "重新生成报告失败（{}）".format(type(exc).__name__)) from exc
+    try:
+        validate_team_evidence(report, transcript.segments)
+        validate_team_action_evidence(report, transcript.segments)
+    except ValueError as exc:
+        _mark_deliverable(meeting_id, team_id, "report", "failed", "evidence_failed")
+        raise APIError(502, "evidence_failed", "重新生成的报告引文校验未通过") from exc
+    database.save_report(meeting_id, team_id, report)
+    _mark_deliverable(meeting_id, team_id, "report", "ok")
+    _mark_deliverable(meeting_id, team_id, "tasks", "ok")
+    return RetryResult(
+        meeting_id=meeting_id, kind=kind, status="ok",
+        message="已重新生成报告（本次重新调用了 AI）。",
     )
 
 
@@ -936,7 +1133,13 @@ async def task_status(request: Request, task_id: str) -> TaskStatus:
     task = task_manager.get(task_id, request.state.team_id)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
-    return task
+    # R-P1.5-7：按交付物聚合状态（新增字段；老字段与语义不变）。
+    try:
+        state = _deliverables_report(task_id, request.state.team_id)
+        return task.model_copy(update={"deliverables": state.items})
+    except Exception as exc:  # pragma: no cover - 状态是辅助信息，不能影响任务查询
+        logger.warning("task_deliverables_failed error_type=%s", type(exc).__name__)
+        return task
 
 
 @app.get("/api/meetings", response_model=list[MeetingListItem])

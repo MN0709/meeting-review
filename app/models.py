@@ -139,6 +139,8 @@ class TaskStatus(TaskAccepted):
     report: Optional[Union[TeamMeetingReport, ReviewReport]] = None
     error: Optional[str] = None
     error_code: Optional[int] = None
+    # R-P1.5-7：按交付物聚合的状态（新增字段，老字段语义不变）。
+    deliverables: List["DeliverableState"] = Field(default_factory=list)
 
 
 class ChunkSummary(StrictModel):
@@ -252,6 +254,34 @@ class ImageMinutesResult(StrictModel):
     title: str
     meta: str
     parts: List[ImageMinutesPart]
+
+
+# ---------------------------------------------------------------------------
+# 交付物状态（R-P1.5-7，阶段 9-C）
+# ---------------------------------------------------------------------------
+
+
+class DeliverableState(StrictModel):
+    kind: Literal["transcript", "report", "tasks", "image_minutes"]
+    label: str
+    status: Literal["pending", "ok", "failed", "needs_review"]
+    error_code: Optional[str] = None
+    message: Optional[str] = None
+    retryable: bool = False
+    updated_at: Optional[str] = None
+
+
+class DeliverablesReport(StrictModel):
+    meeting_id: str
+    items: List[DeliverableState]
+    needs_review: int = Field(ge=0)
+
+
+class RetryResult(StrictModel):
+    meeting_id: str
+    kind: str
+    status: str
+    message: str
 
 
 class MeetingHistory(MeetingListItem):
@@ -469,3 +499,7 @@ class SearchResponse(StrictModel):
     query: str
     count: int = Field(ge=0)
     hits: List[SearchHit]
+
+
+# TaskStatus.deliverables 引用后定义的 DeliverableState（前向引用）。
+TaskStatus.model_rebuild()

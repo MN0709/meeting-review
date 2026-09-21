@@ -260,6 +260,16 @@ class Database:
                     duration_ms INTEGER NULL,
                     created_at TEXT NOT NULL
                 );
+                -- R-P1.5-7（阶段 9-C）：四类交付物各自独立成/败。
+                CREATE TABLE IF NOT EXISTS deliverable_status(
+                    meeting_id TEXT NOT NULL,
+                    team_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','ok','failed','needs_review')),
+                    error_code TEXT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (meeting_id, kind)
+                );
                 """
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
@@ -590,6 +600,10 @@ class Database:
             connection.execute(
                 "DELETE FROM agent_tasks WHERE meeting_id=? AND team_id=?", (meeting_id, team_id)
             )
+            connection.execute(
+                "DELETE FROM deliverable_status WHERE meeting_id=? AND team_id=?",
+                (meeting_id, team_id),
+            )
             connection.execute("DELETE FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id))
 
     def update_status(self, meeting_id: str, team_id: int, status: str) -> None:
@@ -757,6 +771,35 @@ class Database:
             "member_name": member_name,
             "self_name": member_name or label,
         }
+
+    # ------------------------------------------------------------------
+    # R-P1.5-7（阶段 9-C）：交付物状态。四类交付物各自独立成/败。
+    # ------------------------------------------------------------------
+
+    def set_deliverable_status(
+        self, meeting_id: str, team_id: int, kind: str, status: str,
+        error_code: Optional[str] = None,
+    ) -> None:
+        if status not in ("pending", "ok", "failed", "needs_review"):
+            raise ValueError("未知交付物状态：{}".format(status))
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO deliverable_status(meeting_id,team_id,kind,status,error_code,updated_at)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(meeting_id,kind) DO UPDATE SET
+                       status=excluded.status, error_code=excluded.error_code,
+                       updated_at=excluded.updated_at, team_id=excluded.team_id""",
+                (meeting_id, team_id, kind, status, error_code, _utc_now()),
+            )
+
+    def deliverable_statuses(self, meeting_id: str, team_id: int) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT kind,status,error_code,updated_at FROM deliverable_status
+                   WHERE meeting_id=? AND team_id=? ORDER BY kind""",
+                (meeting_id, team_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_meeting_action_items(self, meeting_id: str, team_id: int) -> List[Dict[str, Any]]:
         """本场全部行动项（只读），供「我答应的任务」切面使用。"""
