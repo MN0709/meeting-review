@@ -376,3 +376,27 @@ class AgentTrace(StrictModel):
     tool_names: List[str]
     steps: List[AgentTraceStep]
     plan: List[AgentPlanItem] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 跨会议搜索（R-P1.5-4，阶段 8／M1）
+# 复用 FTS5 转写索引，只新增只读产品端点，不新增表、不改老契约。
+# ---------------------------------------------------------------------------
+
+
+class SearchHit(StrictModel):
+    meeting_id: str
+    meeting_title: str
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    timestamp: str = Field(pattern=r"^\d{2}:\d{2}:\d{2}$")
+    speaker_label: Optional[str] = None
+    text_snippet: str = Field(min_length=1, max_length=200)
+
+
+class SearchResponse(StrictModel):
+    query: str
+    count: int = Field(ge=0)
+    hits: List[SearchHit]

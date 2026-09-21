@@ -1522,3 +1522,83 @@ class Database:
                 (*params, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # R-P1.5-4（阶段 8／M1）：跨会议搜索的产品查询。
+    # 与 Agent 工具用的 `search_transcripts` 分开，避免改动已被工具依赖的方法；
+    # 两者共用同一套 FTS5(trigram) + LIKE 回退策略与 team_id 隔离条件。
+    # ------------------------------------------------------------------
+
+    def search_meetings(
+        self, team_id: int, query: str, *, project_id: Optional[str] = None,
+        date_from: Optional[str] = None, date_to: Optional[str] = None,
+        limit: int = 20, per_meeting_limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """跨会议检索转写片段（严格限定 team_id）。
+
+        - 查询词 ≥ 3 字且不含 FTS 特殊字符时走 FTS5(trigram)，否则回退 LIKE；
+        - 同一场会议最多返回 `per_meeting_limit` 条，避免单场会议淹没结果；
+        - 返回按命中顺序（FTS 用 rank，LIKE 用会议时间倒序 + 片段顺序）。
+        """
+        text = (query or "").strip()
+        if not text:
+            return []
+        limit = max(1, min(int(limit), 50))
+        per_meeting_limit = max(1, min(int(per_meeting_limit), limit))
+        # 先多取一些候选，再按会议数量裁剪；上限防止长会议产生超大扫描结果。
+        fetch_limit = min(max(limit * per_meeting_limit * 4, limit), 500)
+
+        conditions = ["m.team_id = ?"]
+        params: List[Any] = [team_id]
+        if project_id is not None:
+            conditions.append("m.project_id = ?")
+            params.append(project_id)
+        if date_from is not None:
+            conditions.append("m.created_at >= ?")
+            params.append(date_from)
+        if date_to is not None:
+            conditions.append("m.created_at <= ?")
+            params.append(date_to)
+        where = " AND ".join(conditions)
+        escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        use_fts = (
+            self._fts5_available and len(text) >= 3 and not any(ch in text for ch in '"()*:^-')
+        )
+        with self._lock, self._connect() as connection:
+            if use_fts:
+                rows = connection.execute(
+                    """SELECT t.meeting_id, m.title AS meeting_title, m.project_id AS project_id,
+                              p.name AS project_name, t.start, t.end, t.speaker_label, t.text
+                       FROM transcript_fts f
+                       JOIN transcripts t ON t.id = f.rowid
+                       JOIN meetings m ON m.id = t.meeting_id
+                       LEFT JOIN projects p ON p.id = m.project_id
+                       WHERE transcript_fts MATCH ? AND {}
+                       ORDER BY f.rank LIMIT ?""".format(where),
+                    (text, *params, fetch_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT t.meeting_id, m.title AS meeting_title, m.project_id AS project_id,
+                              p.name AS project_name, t.start, t.end, t.speaker_label, t.text
+                       FROM transcripts t
+                       JOIN meetings m ON m.id = t.meeting_id
+                       LEFT JOIN projects p ON p.id = m.project_id
+                       WHERE t.text LIKE ? ESCAPE '\\' AND {}
+                       ORDER BY m.created_at DESC, t.start ASC LIMIT ?""".format(where),
+                    ("%{}%".format(escaped), *params, fetch_limit),
+                ).fetchall()
+
+        hits: List[Dict[str, Any]] = []
+        seen_per_meeting: Dict[str, int] = {}
+        for row in rows:
+            item = dict(row)
+            meeting_id = str(item.pop("meeting_id"))
+            used = seen_per_meeting.get(meeting_id, 0)
+            if used >= per_meeting_limit:
+                continue
+            seen_per_meeting[meeting_id] = used + 1
+            hits.append({**item, "meeting_id": meeting_id})
+            if len(hits) >= limit:
+                break
+        return hits

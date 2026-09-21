@@ -6,7 +6,7 @@ import shutil
 import sqlite3
 import tempfile
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 from uuid import uuid4
@@ -25,7 +25,10 @@ from app.agent.tools import default_registry as agent_tool_registry
 from app.agent.tools.catalog import register_all_tools
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
-from app.llm import AnalysisError, LLMAnalyzer, usage_scope, validate_team_action_evidence, validate_team_evidence
+from app.llm import (
+    AnalysisError, LLMAnalyzer, format_timestamp, usage_scope,
+    validate_team_action_evidence, validate_team_evidence,
+)
 from app.models import (
     ActionItemStatusResult, ActionItemStatusUpdate, AgentTrace, AgentTraceStep,
     DEFAULT_MEETING_TITLE,
@@ -36,10 +39,11 @@ from app.models import (
     MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
+    SearchHit, SearchResponse,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
-from app.security import AdmissionController, AdmissionError, AdmissionReservation
+from app.security import AdmissionController, AdmissionError, AdmissionReservation, SHANGHAI_TZ
 from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
 from app.transcription import WhisperTranscriber, probe_audio_duration
 from app.speaker import KnownVoiceProfile, SpeakerRecognizer
@@ -485,6 +489,49 @@ def _parse_iso8601(value: Optional[str], field_name: str) -> Optional[str]:
     return parsed.isoformat()
 
 
+_SEARCH_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+SEARCH_QUERY_MAX_CHARS = 50
+SEARCH_SNIPPET_WIDTH = 30
+
+
+def _parse_search_date(value: Optional[str], field_name: str, *, end_of_day: bool = False) -> Optional[str]:
+    """搜索用的日期参数。
+
+    只给到日（`2026-09-18`）时按 Asia/Shanghai 自然日解释：`from` 取当天 00:00:00，
+    `to` 取当天 23:59:59.999999，再统一转 UTC 与 `meetings.created_at` 字符串比较；
+    给了完整 ISO8601 时与 `/api/usage` 一致，直接用原值。
+    """
+    if value is None or value.strip() == "":
+        return None
+    raw = value.strip()
+    if not _SEARCH_DATE_ONLY.fullmatch(raw):
+        return _parse_iso8601(raw, field_name)
+    try:
+        day = datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise APIError(422, "invalid_args", "{} 不是合法日期，例如 2026-09-18".format(field_name)) from exc
+    boundary = datetime.combine(day, time.max if end_of_day else time.min, tzinfo=SHANGHAI_TZ)
+    return boundary.astimezone(timezone.utc).isoformat()
+
+
+def _search_snippet(text: str, query: str, width: int = SEARCH_SNIPPET_WIDTH) -> str:
+    """从命中片段文本中截出关键词附近的一段（模型/前端都不写 HTML）。"""
+    body = (text or "").strip()
+    if not body:
+        return ""
+    index = body.lower().find(query.lower())
+    if index < 0:
+        index = 0
+    start = max(0, index - width)
+    end = min(len(body), index + len(query) + width)
+    snippet = body[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(body):
+        snippet = snippet + "…"
+    return snippet[:200]
+
+
 @app.get("/api/usage", response_model=LLMUsageReport)
 async def llm_usage_report(
     request: Request,
@@ -549,6 +596,57 @@ async def llm_usage_report(
             LLMUsageMeetingSummary(**row, cost=estimate_cost(row)) for row in summary["by_meeting"]
         ],
     )
+
+
+@app.get("/api/search", response_model=SearchResponse)
+async def search_history(
+    request: Request,
+    q: str = Query(default=""),
+    project_id: Optional[str] = Query(default=None),
+    date_from: Optional[str] = Query(default=None, alias="from"),
+    date_to: Optional[str] = Query(default=None, alias="to"),
+    limit: Optional[int] = Query(default=None),
+) -> SearchResponse:
+    """R-P1.5-4：跳会议搜索转写片段（只读，严格 team_id 隔离）。
+
+    与历史查询一致：不占上传限频与每日额度；FTS5 不可用时自动回退 LIKE。
+    """
+    team_id = request.state.team_id
+    text = (q or "").strip()
+    if not text or len(text) > SEARCH_QUERY_MAX_CHARS:
+        raise APIError(
+            422, "invalid_args",
+            "搜索词长度需在 1–{} 字之间".format(SEARCH_QUERY_MAX_CHARS),
+        )
+    if project_id is not None:
+        owner = database.project_owner_team_id(project_id)
+        if owner is None:
+            raise APIError(404, "not_found", "项目文件夹不存在")
+        if owner != team_id:
+            raise APIError(403, "team_forbidden", "无权访问其他团队的项目文件夹")
+
+    parsed_from = _parse_search_date(date_from, "from")
+    parsed_to = _parse_search_date(date_to, "to", end_of_day=True)
+    row_limit = 20 if limit is None else max(1, min(int(limit), 50))
+    rows = database.search_meetings(
+        team_id, text,
+        project_id=project_id, date_from=parsed_from, date_to=parsed_to, limit=row_limit,
+    )
+    hits = [
+        SearchHit(
+            meeting_id=row["meeting_id"],
+            meeting_title=row["meeting_title"],
+            project_id=row.get("project_id"),
+            project_name=row.get("project_name"),
+            start=float(row["start"]),
+            end=float(row["end"]),
+            timestamp=format_timestamp(float(row["start"])),
+            speaker_label=row.get("speaker_label"),
+            text_snippet=_search_snippet(str(row["text"]), text) or str(row["text"])[:200],
+        )
+        for row in rows
+    ]
+    return SearchResponse(query=text, count=len(hits), hits=hits)
 
 
 @app.get("/api/meetings/{meeting_id}/agent-trace", response_model=AgentTrace)
