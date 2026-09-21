@@ -146,9 +146,18 @@ class SpeakerRecognizer:
     @staticmethod
     def _merge_similar_labels(
         embeddings: dict[int, Optional[list[float]]], threshold: float,
+        identities: Optional[dict[int, Optional[int]]] = None,
     ) -> dict[int, int]:
+        """把「同一个人的多个片段」合并成一个人。
+
+        保护规则（2026-09-21 真实录音回归后新增）：**两个簇各自命中了不同的已知成员时，
+        一律不合并**。真实录音「个人项目修改方向（胡泊老师指导）」里两人簇相似度为 0.789，
+        仅靠阈值会把马宁（0.865）与胡泊（0.900）合成一个人，两人的身份一起丢失；
+        而同一个人的过度切分片段会命中同一个人（或都未命中），不影响原有的过度切分修正。
+        """
         labels = sorted(embeddings)
         parent = {label: label for label in labels}
+        known = identities or {}
 
         def find(label: int) -> int:
             while parent[label] != label:
@@ -164,9 +173,19 @@ class SpeakerRecognizer:
         for index, left in enumerate(labels):
             for right in labels[index + 1:]:
                 left_embedding, right_embedding = embeddings[left], embeddings[right]
-                if left_embedding and right_embedding:
-                    if cosine_score(left_embedding, right_embedding) >= threshold:
-                        union(left, right)
+                if not (left_embedding and right_embedding):
+                    continue
+                if cosine_score(left_embedding, right_embedding) < threshold:
+                    continue
+                left_id, right_id = known.get(left), known.get(right)
+                if left_id is not None and right_id is not None and left_id != right_id:
+                    # 两个人：不合，宁可多留一个说话人，也不能把身份混为一谈。
+                    logger.info(
+                        "speaker_merge_blocked_by_identity left=%s right=%s left_member=%s right_member=%s",
+                        left, right, left_id, right_id,
+                    )
+                    continue
+                union(left, right)
         return {label: find(label) for label in labels}
 
     @staticmethod
@@ -259,6 +278,17 @@ class SpeakerRecognizer:
             finally:
                 torchaudio.load = original_load
 
+    def _raw_identities(
+        self, raw_embeddings: dict[int, Optional[list[float]]],
+        profiles: Sequence[KnownVoiceProfile],
+    ) -> dict[int, Optional[int]]:
+        """合并前先看每个原始簇各自命中谁（用同一套阈值与分差规则）。"""
+        identities: dict[int, Optional[int]] = {}
+        for label, embedding in raw_embeddings.items():
+            match, _ = best_profile_match(embedding or [], profiles, self.threshold, self.margin)
+            identities[label] = match.member_id if match else None
+        return identities
+
     def process(
         self, audio_path: Path, transcript: Transcript,
         profiles: Sequence[KnownVoiceProfile] = (),
@@ -350,6 +380,7 @@ class SpeakerRecognizer:
                 raw_embeddings[raw_label] = None
         merged_labels = self._merge_similar_labels(
             raw_embeddings, self.intra_merge_threshold,
+            identities=self._raw_identities(raw_embeddings, profiles),
         )
         turns = [(start, end, merged_labels[label]) for start, end, label in turns]
         final_labels = sorted({label for _, _, label in turns})

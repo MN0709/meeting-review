@@ -40,8 +40,10 @@ class Settings(BaseSettings):
     speaker_model: str = Field(default="chinese", alias="SPEAKER_MODEL")
     speaker_match_threshold: float = Field(default=0.72, ge=0, le=1, alias="SPEAKER_MATCH_THRESHOLD")
     speaker_match_margin: float = Field(default=0.05, ge=0, le=1, alias="SPEAKER_MATCH_MARGIN")
+    # 同场过度切分的合并阈值。2026-09-21 真实录音回归后由 0.78 上调到 0.85：
+    # 实测「不同的人」的簇相似度可达 0.789（马宁/胡泊），0.78 会把两个人合成一个。
     speaker_intra_merge_threshold: float = Field(
-        default=0.78, ge=0, le=1, alias="SPEAKER_INTRA_MERGE_THRESHOLD"
+        default=0.85, ge=0, le=1, alias="SPEAKER_INTRA_MERGE_THRESHOLD"
     )
     max_upload_mb: int = Field(default=300, gt=0, alias="MAX_UPLOAD_MB")
     max_audio_minutes: float = Field(default=240, gt=0, alias="MAX_AUDIO_MINUTES")

@@ -233,7 +233,9 @@ def test_team_long_meeting_defaults() -> None:
     assert settings.speaker_model == "chinese"
     assert settings.speaker_match_threshold == 0.72
     assert settings.speaker_match_margin == 0.05
-    assert settings.speaker_intra_merge_threshold == 0.78
+    # 2026-09-21 真实录音校准：不同人的簇相似度实测可达 0.789（马宁/胡泊），
+    # 原 0.78 会把两个人合并成一人，故默认上调到 0.85（见 tests/test_speaker_merge.py）。
+    assert settings.speaker_intra_merge_threshold == 0.85
 
 
 def test_duration_probe_reads_metadata_without_decoding(monkeypatch, tmp_path) -> None:
