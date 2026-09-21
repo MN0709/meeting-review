@@ -103,6 +103,21 @@ class UnresolvedIssue(StrictModel):
     evidence: EvidenceQuote
 
 
+class SuggestedProject(StrictModel):
+    """R-P1.5-8：AI 项目归属建议（只建议，不自动移动）。"""
+
+    existing_project_id: Optional[str] = None
+    new_project_name: Optional[str] = None
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    reason: str = ""
+
+
+class SuggestedProjectAction(StrictModel):
+    action: Literal["accept", "rename", "dismiss"]
+    project_id: Optional[str] = None
+    name: Optional[str] = None
+
+
 class TeamMeetingReport(StrictModel):
     suggested_title: str = Field(default="", max_length=100)
     overview: str = Field(min_length=1, max_length=300)
@@ -112,6 +127,8 @@ class TeamMeetingReport(StrictModel):
     unresolved_issues: List[UnresolvedIssue]
     # R-P1.5-1（阶段 9-B）：图片纪要的「紧急事项」板块。旧报告无此字段时为空数组。
     urgent_items: List[UnresolvedIssue] = Field(default_factory=list)
+    # R-P1.5-8（阶段 10-C）：项目归属建议。旧报告为 None，界面不显示该卡片。
+    suggested_project: Optional[SuggestedProject] = None
     speaker_stats_note: str = "说话人识别未启用"
 
 

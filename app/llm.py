@@ -64,6 +64,7 @@ TEAM_SYSTEM_PROMPT = """
 行动项的 evidence 用于核对“谁承诺了什么”，不得省略。
 遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
 紧急事项只记录“带时间压力、需要尽快处理”的事项（如“今天必须定”“明天上线前要改完”），必须带原话；普通行动项、已完成安排、泛泛的“要注意”都不算，没有则返回空数组。
+如果用户消息里给了「当前团队已有项目」列表，可以额外给出项目归属建议 suggested_project：优先复用已有项目（existing_project_id 必须从给定列表里选，不得编造）；确实都不合适时才给 new_project_name；无法判断时三个字段都留空。绝对不要输出“这几场会属于同一个项目”这类解释性总结。
 行动项的截止时间不明确时填“未明确”。speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
 只输出符合指定 JSON Schema 的 JSON，不输出 Markdown 或解释。
 """.strip()
@@ -121,6 +122,12 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
                 "content": "需要尽快处理的事项",
                 "evidence": {"quote": "原话", "timestamp": "00:00:00"},
             }],
+            "suggested_project": {
+                "existing_project_id": "已有项目 id 或留空",
+                "new_project_name": "",
+                "confidence": 0.0,
+                "reason": "建议依据（一句话）",
+            },
             "speaker_stats_note": "",
         }
         fields = (
@@ -132,6 +139,8 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
             "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
             "urgent_items(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp；"
             "只收带时间压力、需尽快处理的事项，没有就返回空数组)；"
+            "suggested_project(可选对象，只有 existing_project_id/new_project_name/confidence/reason；"
+            "优先复用给定项目 id，不得编造；无法判断时给空对象)；"
             "speaker_stats_note(必填空字符串，由后端覆盖)"
         )
     elif issubclass(model_type, TeamChunkSummary):
@@ -382,6 +391,25 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
                     },
                 })
             normalized["urgent_items"] = cleaned_urgent
+
+        # R-P1.5-8：项目归属建议（只清洗结构，是否合法由上层对照团队项目校验）。
+        suggestion = payload.get("suggested_project")
+        if isinstance(suggestion, dict):
+            existing = str(suggestion.get("existing_project_id") or "").strip()
+            new_name = str(suggestion.get("new_project_name") or "").strip()
+            reason = str(suggestion.get("reason") or "").strip()
+            try:
+                confidence = float(suggestion.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            normalized["suggested_project"] = {
+                "existing_project_id": existing or None,
+                "new_project_name": new_name[:50] or None,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "reason": reason[:200],
+            }
+        elif suggestion is not None:
+            normalized.pop("suggested_project", None)
 
         if issubclass(model_type, TeamMeetingReport):
             suggested_title = next(
@@ -882,16 +910,32 @@ class LLMAnalyzer:
         )
         return SemanticAnalysis.model_validate(result.model_dump())
 
+    @staticmethod
+    def _project_context(projects: Optional[Sequence[Any]]) -> str:
+        """把团队已有项目拼成一行提示（R-P1.5-8）；没有项目时不加任何内容。"""
+        rows: List[str] = []
+        for item in projects or []:
+            identifier = getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None)
+            name = getattr(item, "name", None) or (item.get("name") if isinstance(item, dict) else None)
+            if identifier and name:
+                rows.append("{}({})".format(name, identifier))
+        if not rows:
+            return ""
+        return "\n当前团队已有项目：{}。项目建议只能从这些里选，不要编造。".format("、".join(rows))
+
     async def analyze_team(
-        self, transcript: Transcript, usage_context: Optional[Dict[str, Any]] = None
+        self, transcript: Transcript, usage_context: Optional[Dict[str, Any]] = None,
+        projects: Optional[Sequence[Any]] = None,
     ) -> TeamMeetingReport:
         if not transcript.segments:
             raise AnalysisError("没有可分析的转写内容")
+        project_context = self._project_context(projects)
         if len(transcript.text) <= self.settings.transcript_chunk_chars:
             result = await self._validated_call(
                 TeamMeetingReport,
                 TEAM_SYSTEM_PROMPT,
-                "请生成团队会议报告。\n\n带时间戳转写：\n" + format_segments(transcript.segments),
+                "请生成团队会议报告。\n\n带时间戳转写：\n"
+                + format_segments(transcript.segments) + project_context,
                 "team_final_direct",
                 transcript.segments,
                 usage_context,
@@ -913,7 +957,7 @@ class LLMAnalyzer:
             TEAM_SYSTEM_PROMPT,
             "以下分块按原顺序排列。去重归并；决策、遗留问题和紧急事项的引文只能从各分块 evidence 原样选取；"
             "紧急事项只保留真正带时间压力、需尽快处理的，宁少勿多。\n\n"
-            + json.dumps(summaries, ensure_ascii=False),
+            + json.dumps(summaries, ensure_ascii=False) + project_context,
             "team_final_merge",
             transcript.segments,
             usage_context,

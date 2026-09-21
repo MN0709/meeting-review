@@ -23,6 +23,7 @@
 - 声音授权：不再要求每位说话人分别勾选同意；点击“完成整理”时统一显示参会者名单并确认授权。
 - 团队声纹身份库：身份跨项目共享；姓名、角色和“关键决策人”由用户维护，声纹可单独删除。
 - 报告：①会议总览；②会议要点；③决策清单；④行动项；**④-2 我答应的任务（R-P1.5-5）**；⑤遗留问题；⑥说话人确认；⑦识别状态。点击引文时间戳可在**右侧逐字稿侧栏**定位高亮，也可点「看上下文」展开带说话人标签的转写上下文。**决策、行动项、遗留问题都带原话证据（D-028）：引文旁标「原话」，点「看上下文」展开原文核对；旧报告无行动项原话时明确显示「无法核对」，不伪造。**
+- AI 项目建议（R-P1.5-8）：**未归类**会议的报告顶部会出现一张带「**AI 建议**」角标的卡片，给出建议归入的已有项目（优先复用，不编造）或建议的新项目名，并附一句依据。三个动作都由人决定：**加入该项目 / 新建「建议名」并加入 / 用新名字新建并加入 / 不加入**；选「不加入」保持未分类、清除建议、**不留副作用**。**AI 永不自动移动会议**（有专门测试断言）；建议里出现团队不存在的项目 id 时**整条丢弃**；旧报告没有该字段时界面不显示卡片。团队还没有项目时不传项目列表，分析调用与之前完全一致。
 - 交付物状态与「待核对」（R-P1.5-7）：报告页顶部有「交付物状态」条——**逐字稿 / 文字报告 / 任务单 / 图片纪要+PDF** 各自独立成/败。某一项失败只标那一项「待核对」并给出「重试」按钮，**其它交付物照常可看**；重试只重跑失败的那一项（图片纪要与任务单的重试**不调用 AI**；文字报告的重试会调用 AI，界面先弹确认框）。转写需要原始录音、而录音已按隐私策略删除，因此不可重试，会明确提示重新上传。升级前创建的旧会议没有状态记录，会按「有逐字稿/有报告」推断为正常，不显示成「待生成」。
 - 图片纪要（R-P1.5-1）：报告底部「⑩ 图片纪要」把会议渲染成**四板块卡片长图**——① 这次会议的核心（总览 + 要点 + 带时间戳的关键决策）、② 紧急事项（会上明确要求「尽快 / 今天就 / 上线前」处理的事项，带原话时间戳）、③ 待办（未完成的行动项）、④ 我答应的任务；带时间戳的条目点击可跳到右侧逐字稿。点「导出 PDF」得到可外发的 PDF（HTML → PDF；渲染器优先 Playwright，缺失时自动回退本机 Chrome，都不通时返回 503 并把该交付物标「待核对」，不影响文字报告与逐字稿）。版式模板在 `app/deliverables/templates/card_v1.html`，与数据分离。
 - 术语热词表（R-P1.5-9）：「项目」页底部可维护团队热词（人名 / 术语），转写时作为 `initial_prompt` 注入以提高专名准确率。**已确认的成员姓名自动生效**（不落表，改名后自动跟随，界面标注来源且不可删）。热词**只影响转写**，不改变引文校验规则（引文仍必须是转写原文的完整一致子串）；`TEAM_TERMS_ENABLED=false` 或词表为空时，转写仍走**单参数调用**，行为与未引入热词时逐字节一致；提示长度上限 `TERM_PROMPT_MAX_CHARS`（默认 200 字）。实测：同一段真实音频对拍，热词写成「胡董」后 `古董` 10 次 → 0 次、`胡董` 0 → 10 次；但热词写成发音不符的「胡泊」时无效果（只对发音对得上的词起作用）。
@@ -163,6 +164,7 @@ curl http://127.0.0.1:8000/health
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
 - `POST /api/meetings/{id}/image-minutes`：**生成图片纪要四板块（R-P1.5-1）**。幂等、只读渲染，不写任何业务数据；返回 `{meeting_id, title, meta, parts:[{key,title,subtitle,items,empty_note}]}`，`key` 固定为 `core/urgent/todo/mine`。无报告 404，跨团队 403。
 - `GET /api/meetings/{id}/image-minutes.pdf`：**导出图片纪要 PDF**。响应 `application/pdf` + 中文文件名（RFC 5987）；渲染器不可用时返回 503 `renderer_unavailable`（可读中文原因），其它交付物不受影响。
+- `POST /api/meetings/{id}/suggested-project`：**处置 AI 项目建议（R-P1.5-8）**。`{action:"accept", project_id}` 归入指定项目；`{action:"rename", name}` 新建项目后归入；`{action:"dismiss"}` 保持未分类并清除建议。三者都要求人触发，**不存在自动移动**；未知 action 422、缺参 422、项目不存在 404、别人的项目/会议 403。
 - `GET /api/terms`：**术语热词表（R-P1.5-9）**。返回 `{items:[{id,term,note,source,updated_at}], prompt}`；`source` 为 `manual`（可删）或 `member`（来自已确认成员姓名，自动、不可删）。
 - `POST /api/terms`：新增/更新热词（`{term, note?}`）；空词或超过 40 字 → 422 `invalid_args`。`DELETE /api/terms/{id}`：删除手动词，未知 id 404；成员来源的词删不掉。
 - `GET /api/meetings/{id}/deliverables`：**四类交付物状态（R-P1.5-7）**。返回 `{meeting_id, needs_review, items:[{kind,label,status,error_code,message,retryable,updated_at}]}`；`kind` ∈ `transcript/report/tasks/image_minutes`，`status` ∈ `pending/ok/failed/needs_review`。跨团队 403，会议不存在 404。
@@ -287,13 +289,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：341 passed
+python -m pytest -q            # 本地完整环境：361 passed
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 341 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 361 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：

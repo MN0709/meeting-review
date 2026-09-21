@@ -47,6 +47,7 @@ from app.models import (
     ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
     DeliverableState, DeliverablesReport, RetryResult,
     TermCreate, TermItem, TermsPayload,
+    SuggestedProjectAction,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
@@ -177,7 +178,15 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
             if settings.agent_mode == "agent" and team_id:
                 report = await _run_agent_report(path.stem, team_id)
             else:
-                report = await build_team_report(analysis_transcript, analyzer)
+                # R-P1.5-8：带上当前团队已有项目，让模型优先复用而不是编造新名字。
+                # 团队还没有项目时**不传该参数**，调用与之前完全一致。
+                team_projects = database.list_projects(team_id)
+                if team_projects:
+                    report = await build_team_report(
+                        analysis_transcript, analyzer, projects=team_projects,
+                    )
+                else:
+                    report = await build_team_report(analysis_transcript, analyzer)
                 if settings.agent_mode == "shadow" and team_id:
                     await _shadow_agent_compare(path.stem, team_id, report)
         if speaker_result:
@@ -188,6 +197,7 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
             database.apply_suggested_title(
                 path.stem, team_id, getattr(report, "suggested_title", "")
             )
+            report = _sanitize_suggested_project(report, team_id)
             database.save_report(path.stem, team_id, report)
             _mark_deliverable(path.stem, team_id, "report", "ok")
             _mark_deliverable(path.stem, team_id, "tasks", "ok")
@@ -959,6 +969,78 @@ async def image_minutes_pdf(request: Request, meeting_id: str) -> Response:
             "Cache-Control": "no-store",
         },
     )
+
+
+def _sanitize_suggested_project(report: TeamMeetingReport, team_id: int) -> TeamMeetingReport:
+    """R-P1.5-8：项目建议必须落在本团队已有项目上，否则丢弃建议（不影响报告主字段）。
+
+    只丢弃建议，**绝不自动移动会议**——归属永远由人确认。
+    """
+    suggestion = getattr(report, "suggested_project", None)
+    if suggestion is None:
+        return report
+    allowed = {item.id for item in database.list_projects(team_id)}
+    if suggestion.existing_project_id and suggestion.existing_project_id not in allowed:
+        logger.info("suggested_project_dropped reason=unknown_project_id")
+        return report.model_copy(update={"suggested_project": None})
+    if not suggestion.existing_project_id and not suggestion.new_project_name:
+        return report.model_copy(update={"suggested_project": None})
+    return report
+
+
+@app.post("/api/meetings/{meeting_id}/suggested-project", response_model=MeetingListItem)
+async def resolve_suggested_project(
+    request: Request, meeting_id: str, payload: SuggestedProjectAction = Body(...),
+) -> MeetingListItem:
+    """R-P1.5-8：采纳 / 改名后加入 / 完全不加入。归属与新建都走人确认。"""
+    team_id = request.state.team_id
+    owner = database.owner_team_id(meeting_id)
+    if owner is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+    history = database.get_history(meeting_id, team_id)
+    if history is None:
+        raise APIError(404, "not_found", "这场会议还没有生成报告")
+
+    def clear_suggestion() -> None:
+        database.save_report(
+            meeting_id, team_id,
+            history.report.model_copy(update={"suggested_project": None}),
+        )
+
+    if payload.action == "dismiss":
+        clear_suggestion()
+        meeting = next(
+            (item for item in database.list_meetings(team_id) if item.id == meeting_id), None,
+        )
+        if meeting is None:
+            raise APIError(404, "not_found", "会议不存在")
+        return meeting
+
+    target_project_id = payload.project_id
+    if payload.action == "rename":
+        name = str(payload.name or "").strip()
+        if not name:
+            raise APIError(422, "invalid_args", "请填写新的项目名称")
+        created = database.create_project(uuid4().hex, team_id, name[:50])
+        target_project_id = created.id
+    if not target_project_id:
+        raise APIError(422, "invalid_args", "请指定要加入的项目")
+    owner_team = database.project_owner_team_id(target_project_id)
+    if owner_team is None:
+        raise APIError(404, "not_found", "项目不存在")
+    if owner_team != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的项目")
+    if not database.move_meeting(meeting_id, team_id, target_project_id):
+        raise APIError(404, "not_found", "会议不存在")
+    clear_suggestion()
+    meeting = next(
+        (item for item in database.list_meetings(team_id) if item.id == meeting_id), None,
+    )
+    if meeting is None:
+        raise APIError(404, "not_found", "会议不存在")
+    return meeting
 
 
 @app.get("/api/terms", response_model=TermsPayload)

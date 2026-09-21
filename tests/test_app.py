@@ -170,7 +170,9 @@ def test_service_import_fails_with_clear_message_without_team_tokens(tmp_path) -
         env=environment,
         capture_output=True,
         text=True,
-        timeout=10,
+        # 10 秒在本机高负载时会超时（子进程冷启动 import 全套依赖）；
+        # 这里测的是"报错信息清晰"，不是启动速度，故放宽到 60 秒。
+        timeout=60,
     )
 
     assert result.returncode != 0
