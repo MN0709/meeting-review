@@ -44,6 +44,7 @@ from app.models import (
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
     MyTaskItem, MyTasksResult, OwnerBackfillResult, OwnerEnrollResult, OwnerStatus,
+    ClaimOwnerVoiceRequest,
     AssignBatchRequest, AssignBatchResult, BatchProgress, BatchReviewItem, BatchReviewResult,
     BatchTaskProgress, UndoAssignmentResult,
     SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
@@ -555,6 +556,54 @@ async def owner_backfill(
         identified=sum(1 for item in results if item.get("self_name")),
         skipped_manual=sum(1 for item in results if item["status"] == "skipped_manual"),
         meetings=results,
+    )
+
+
+@app.post("/api/meetings/{meeting_id}/claim-owner-voice", response_model=OwnerEnrollResult)
+async def claim_owner_voice(
+    request: Request, meeting_id: str, payload: ClaimOwnerVoiceRequest = Body(...),
+) -> OwnerEnrollResult:
+    """R-P2-2/3 补充：用**本场会议里的某段声音**认领「我」并存成本人声纹。
+
+    解决「自己录的声纹与会议录音不在同一设备/环境、认不出来」的问题：
+    未来会议与这段声音在同一录音条件下，识别更可靠；同时把本场指认为人工结果（手动优先）。
+    """
+    team_id = request.state.team_id
+    owner_team = database.owner_team_id(meeting_id)
+    if owner_team is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner_team != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他工作区的会议")
+    if not payload.consent_confirmed:
+        raise APIError(422, "invalid_args", "请先确认「这段声音是我本人，同意保存为我的声纹」")
+    label = (payload.local_label or "").strip()
+    if not label:
+        raise APIError(422, "invalid_args", "请选择本场哪一个说话人是你")
+    speaker = database.meeting_speaker_embedding(meeting_id, team_id, label)
+    if speaker is None:
+        raise APIError(422, "invalid_args", "本场没有这个说话人，或该说话人没有可用的声音样本")
+    speech_seconds = float(speaker["speech_seconds"] or 0.0)
+    if speech_seconds < settings.owner_min_speech_seconds:
+        raise APIError(
+            422, "invalid_args",
+            "这段声音太短（约 {:.0f} 秒），无法作为你的声纹；请换一段更长的发言。".format(
+                speech_seconds
+            ),
+        )
+    database.save_owner_voiceprint(
+        team_id, settings.owner_name, json.loads(speaker["embedding_json"]),
+        settings.speaker_model, speech_seconds,
+    )
+    database.set_app_state("owner_onboarding_done", "1")
+    database.set_app_state("owner_voiceprint_skipped_at", "")
+    database.set_self_speaker(
+        meeting_id, team_id, member_id=speaker["member_id"], label=label,
+    )
+    backfilled = _run_owner_backfill(team_id, settings.owner_backfill_limit)
+    record = database.owner_voiceprint(team_id) or {}
+    return OwnerEnrollResult(
+        enrolled=True, name=settings.owner_name, sample_seconds=speech_seconds,
+        enrolled_at=str(record.get("enrolled_at") or ""), backfilled=backfilled,
     )
 
 

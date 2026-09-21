@@ -35,3 +35,10 @@ def test_my_tasks_is_gated_by_voiceprint_state() -> None:
 
 def test_not_identified_wording_never_guesses() -> None:
     assert "本场未识别到你（不猜测）" in HTML
+
+
+def test_claim_from_meeting_is_available() -> None:
+    """跨设备补救：可在整理弹窗里「认领本场说话人并记住声纹」。"""
+    assert 'id="claimOwnerVoice"' in HTML
+    assert "claim-owner-voice" in HTML
+    assert "指定并记住我的声纹" in HTML

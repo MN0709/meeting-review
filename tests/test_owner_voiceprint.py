@@ -16,6 +16,7 @@ os.environ.setdefault("DATABASE_PATH", "/tmp/meeting-review-pytest.db")
 
 import app.main as main_module
 from app.db import Database
+from app.models import TeamMeetingReport
 from app.speaker import SpeakerObservation
 
 AUTH_HEADERS = {"X-Access-Token": "test-access-token"}
@@ -183,3 +184,81 @@ def test_backfill_endpoint_skips_manual_and_limits(isolated) -> None:
     assert body["skipped_manual"] == 1
     assert body["identified"] == 1
     assert database.self_speaker("m-manual", team_id)["source"] == "manual"
+
+
+# --- 跨设备补救：用本场会议的声音认领「我」 -----------------------------------
+
+
+def _meeting_with_member(database: Database, meeting_id: str, embedding=(1.0, 0.0),
+                         speech=30.0, name="马宁") -> int:
+    team_id = _team(database)
+    database.create_meeting(meeting_id, team_id, "认领测试", Path("/tmp/c.wav"))
+    database.save_meeting_speakers(meeting_id, team_id, [SpeakerObservation(
+        local_label="说话人 1", embedding=list(embedding), speech_seconds=speech,
+        excerpts=["我来说两句"],
+    )])
+    database.confirm_meeting_speaker(
+        meeting_id, team_id, "说话人 1", name, "", False, False, "chinese",
+    )
+    return team_id
+
+
+def test_claim_from_meeting_saves_voiceprint_and_identifies(isolated, monkeypatch) -> None:
+    database, _ = isolated
+    team_id = _meeting_with_member(database, "m-claim")
+    _meeting_with_member(database, "m-other")
+    database.update_status("m-other", team_id, "完成")
+    database.save_report("m-other", team_id, TeamMeetingReport(
+        overview="x", meeting_points=[],
+        decisions=[],
+        action_items=[{"task": "写方案", "owner": "马宁", "deadline": "周五"}],
+        unresolved_issues=[],
+    ))
+    # 先用「不像」的麦克风声纹（与会议录音不同设备）→ 认不出来
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        _enroll(client, monkeypatch, embedding=(0.0, 1.0))
+        before = client.get("/api/meetings/m-other/my-tasks").json()
+        response = client.post(
+            "/api/meetings/m-claim/claim-owner-voice",
+            json={"local_label": "说话人 1", "consent_confirmed": True},
+        )
+        assert response.status_code == 200
+        after = client.get("/api/meetings/m-other/my-tasks").json()
+    assert before["self_speaker_set"] is False
+    assert before["reason"] == "not_identified"
+    # 认领本场说话人后：声纹被换成同通道的声音 → 另一场也能认出
+    record = database.owner_voiceprint(team_id)
+    assert record is not None and record["embedding"] == [1.0, 0.0]
+    assert after["self_speaker_set"] is True
+    assert after["self_name"] == "马宁"
+    assert after["count"] == 1 and after["items"][0]["task"] == "写方案"
+    # 本场被人工指认，手动优先
+    assert database.self_speaker("m-claim", team_id)["source"] == "manual"
+
+
+def test_claim_requires_consent(isolated) -> None:
+    database, _ = isolated
+    _meeting_with_member(database, "m-claim")
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        response = client.post(
+            "/api/meetings/m-claim/claim-owner-voice",
+            json={"local_label": "说话人 1", "consent_confirmed": False},
+        )
+    assert response.status_code == 422
+    assert database.owner_voiceprint(_team(database)) is None
+
+
+def test_claim_unknown_speaker_and_short_speech(isolated) -> None:
+    database, _ = isolated
+    _meeting_with_member(database, "m-claim", speech=5.0)
+    with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
+        unknown = client.post(
+            "/api/meetings/m-claim/claim-owner-voice",
+            json={"local_label": "说话人 9", "consent_confirmed": True},
+        )
+        short = client.post(
+            "/api/meetings/m-claim/claim-owner-voice",
+            json={"local_label": "说话人 1", "consent_confirmed": True},
+        )
+    assert unknown.status_code == 422
+    assert short.status_code == 422 and "太短" in short.json()["error"]["message"]

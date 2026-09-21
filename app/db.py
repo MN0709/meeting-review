@@ -844,6 +844,21 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def meeting_speaker_embedding(
+        self, meeting_id: str, team_id: int, local_label: str,
+    ) -> Optional[Dict[str, Any]]:
+        """取本场某个说话人的 embedding（用于「认领为我的声纹」）。"""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT local_label, member_id, embedding_json, speech_seconds
+                   FROM meeting_speakers
+                   WHERE meeting_id=? AND team_id=? AND local_label=?""",
+                (meeting_id, team_id, local_label),
+            ).fetchone()
+        if row is None or not row["embedding_json"]:
+            return None
+        return dict(row)
+
     def create_review_batch(
         self, batch_id: str, team_id: int, total: int, consent_version: str, ip: str,
     ) -> None:

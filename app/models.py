@@ -282,6 +282,13 @@ class OwnerBackfillResult(StrictModel):
     meetings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class ClaimOwnerVoiceRequest(StrictModel):
+    """R-P2-2/3 补充：用某场会议里的一个说话人认领「我」，并把该段声音存成本人声纹。"""
+
+    local_label: str = ""
+    consent_confirmed: bool = False
+
+
 # ---------------------------------------------------------------------------
 # R-P2-5 批量上传 / R-P2-6 自动归类
 # ---------------------------------------------------------------------------
