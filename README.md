@@ -133,6 +133,30 @@ python run.py
 
 打开 <http://127.0.0.1:8000>。健康检查无需团队口令：
 
+### 日常怎么用（自己操作）
+
+```bash
+# 启动（后台运行，日志写到 /tmp/meeting-review.log）
+cd meeting-review && nohup .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 >/tmp/meeting-review.log 2>&1 &
+
+# 看是否在跑
+curl -s http://127.0.0.1:8000/health          # {"status":"ok"}
+
+# 停止
+pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8000"
+```
+
+| 事项 | 位置 / 做法 |
+| --- | --- |
+| 数据库（会议、报告、交付物状态、热词、同意留证、分享链接） | `data/meeting-review.db` |
+| 备份（说话人过度合并缺陷修复前的整库快照） | `data/meeting-review.db.bak-20260921-152829` |
+| 恢复备份 | 先停服务，再 `cp data/meeting-review.db.bak-20260921-152829 data/meeting-review.db` |
+| 运行日志 | `/tmp/meeting-review.log`（出问题时先看这里的最后几行） |
+| 上传的原始录音 | **转写完成后即删除**（由隐私策略决定，不保留） |
+| 团队口令 / API Key | 只写在 `.env`（已被 `.gitignore` 排除，不会进仓库） |
+
+> 分享链接默认按请求地址生成（本机就是 `127.0.0.1:8000`）。要给**别人**打开，需要先做内网穿透或公网地址，再把 `.env` 里的 `SHARE_BASE_URL` 填成那个地址。
+
 不要直接双击 `static/index.html` 使用 `file://` 地址；该页面无法连接 FastAPI 后端。若误开，本地页面会显示原因并提供正确服务地址。
 
 ```bash
