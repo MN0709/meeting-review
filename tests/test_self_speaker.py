@@ -151,6 +151,7 @@ def test_self_speaker_by_local_label_matches_owner_exactly(isolated_database) ->
         assert saved.json() == {
             "self_speaker_set": True, "local_label": "说话人 1", "member_id": None,
             "member_name": None, "self_name": "说话人 1",
+            "source": None, "confidence": None,
         }
         tasks = client.get("/api/meetings/{}/my-tasks".format(MEETING)).json()
     assert tasks["self_speaker_set"] is True
@@ -208,6 +209,7 @@ def test_self_speaker_can_be_cleared(isolated_database) -> None:
     assert cleared.json() == {
         "self_speaker_set": False, "local_label": None, "member_id": None,
         "member_name": None, "self_name": None,
+        "source": None, "confidence": None,
     }
     assert tasks["count"] == 0 and tasks["self_speaker_set"] is False
     assert history["self_speaker"] is None

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import io
 import tempfile
@@ -12,8 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from app.audio_math import cosine_score
 from app.config import Settings
 from app.models import Transcript, TranscriptSegment
+from app.owner import OwnerDecision, SpeakerCandidate, decide_owner
 
 logger = logging.getLogger(__name__)
 _TORCHAUDIO_LOAD_LOCK = threading.RLock()
@@ -53,18 +54,10 @@ class SpeakerRecognitionResult:
     observations: list[SpeakerObservation]
     available: bool
     message: str
-
-
-def cosine_score(left: Sequence[float], right: Sequence[float]) -> float:
-    if len(left) != len(right) or not left:
-        return 0.0
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if not left_norm or not right_norm:
-        return 0.0
-    # WeSpeaker uses this normalized cosine range for recognition.
-    return max(0.0, min(1.0, (dot / (left_norm * right_norm) + 1.0) / 2.0))
+    # R-P2-3：「我」的识别结果（未识别时为 None + reason）。
+    owner_label: Optional[str] = None
+    owner_confidence: Optional[float] = None
+    owner_reason: str = "no_owner_voiceprint"
 
 
 def best_profile_match(
@@ -92,6 +85,12 @@ class SpeakerRecognizer:
         self.threshold = settings.speaker_match_threshold
         self.margin = settings.speaker_match_margin
         self.intra_merge_threshold = settings.speaker_intra_merge_threshold
+        # R-P2-3：本人声纹（更严）。
+        self.owner_enabled = settings.owner_voiceprint_enabled
+        self.owner_threshold = settings.owner_match_threshold
+        self.owner_min_speech_seconds = settings.owner_min_speech_seconds
+        self.owner_member_priority_margin = settings.owner_member_priority_margin
+        self.owner_name = settings.owner_name
         self._model = None
 
     def _load_model(self):
@@ -292,6 +291,7 @@ class SpeakerRecognizer:
     def process(
         self, audio_path: Path, transcript: Transcript,
         profiles: Sequence[KnownVoiceProfile] = (),
+        owner_embedding: Optional[Sequence[float]] = None,
     ) -> SpeakerRecognitionResult:
         if not self.enabled:
             return SpeakerRecognitionResult(
@@ -314,7 +314,9 @@ class SpeakerRecognizer:
         try:
             with self._normalized_wav(audio_path) as normalized_path:
                 with self._torchaudio_wav_fallback():
-                    return self._process_supported_audio(normalized_path, transcript, profiles)
+                    return self._process_supported_audio(
+                        normalized_path, transcript, profiles, owner_embedding,
+                    )
         except Exception as exc:
             logger.warning(
                 "speaker_audio_normalization_failed error_type=%s", type(exc).__name__,
@@ -324,9 +326,36 @@ class SpeakerRecognizer:
                 "本场音频无法进入说话人识别，已保留完整转写和报告",
             )
 
+    def extract_owner_embedding(self, audio_path: Path) -> tuple[list[float], float]:
+        """R-P2-2：从录入音频提取本人声纹，并返回有效语音秒数。
+
+        异常：`ValueError` = 音频不够/提不出特征（应回 422）；
+        `ImportError` / `SystemExit` = 声纹运行时/模型不可用（应回 503）。
+        """
+        self._load_model()
+        with self._normalized_wav(audio_path) as normalized_path:
+            with self._torchaudio_wav_fallback():
+                model = self._load_model()
+                turns = self._normalize_turns(model.diarize(str(normalized_path), normalized_path.stem))
+                if not turns:
+                    raise ValueError("未检测到有效语音，请重新录制（或换一段更清楚的音频）")
+                speech_seconds = sum(max(0.0, end - start) for start, end, _ in turns)
+                import torchaudio
+
+                pcm, sample_rate = torchaudio.load(str(normalized_path), normalize=True)
+                if pcm.size(0) > 1:
+                    pcm = pcm.mean(dim=0, keepdim=True)
+                embedding = self._cluster_embedding(
+                    model, pcm, sample_rate, [(start, end) for start, end, _ in turns]
+                )
+                if embedding is None:
+                    raise ValueError("未能提取到声纹特征，请重新录制")
+                return embedding, speech_seconds
+
     def _process_supported_audio(
         self, audio_path: Path, transcript: Transcript,
         profiles: Sequence[KnownVoiceProfile] = (),
+        owner_embedding: Optional[Sequence[float]] = None,
     ) -> SpeakerRecognitionResult:
         try:
             model = self._load_model()
@@ -443,10 +472,31 @@ class SpeakerRecognizer:
             segment.model_copy(update={"speaker_label": names.get(segment.speaker_label, segment.speaker_label)})
             for segment in segments
         ]
+        # R-P2-3：本人声纹判定（更严，宁可不认）。
+        owner = OwnerDecision(None, None, "disabled")
+        if self.owner_enabled and owner_embedding:
+            owner = decide_owner(
+                [
+                    SpeakerCandidate(
+                        label=item.local_label, embedding=item.embedding,
+                        speech_seconds=item.speech_seconds,
+                        matched_member_id=item.matched_member_id,
+                        matched_name=item.matched_name, confidence=item.confidence,
+                    )
+                    for item in observations
+                ],
+                owner_embedding, self.owner_name,
+                threshold=self.owner_threshold,
+                min_speech_seconds=self.owner_min_speech_seconds,
+                member_margin=self.owner_member_priority_margin,
+            )
         return SpeakerRecognitionResult(
             transcript=labeled,
             analysis_transcript=transcript.model_copy(update={"segments": analysis_segments}),
             observations=observations,
             available=True,
             message=f"已区分 {len(observations)} 位说话人",
+            owner_label=owner.label,
+            owner_confidence=owner.confidence,
+            owner_reason=owner.reason,
         )

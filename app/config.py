@@ -33,6 +33,21 @@ class Settings(BaseSettings):
     auth_enabled: bool = Field(default=False, alias="AUTH_ENABLED")
     owner_name: str = Field(default="我", alias="OWNER_NAME")
     debug_panels_enabled: bool = Field(default=False, alias="DEBUG_PANELS_ENABLED")
+
+    # --- R-P2-2/3/12 本人声纹（比成员匹配更严，误认必须为 0）-------------------
+    owner_voiceprint_enabled: bool = Field(default=True, alias="OWNER_VOICEPRINT_ENABLED")
+    # 本人声纹阈值（默认 0.80，高于成员阈值）；宁可显示「未识别到你」，不猜。
+    owner_match_threshold: float = Field(default=0.80, ge=0, le=1, alias="OWNER_MATCH_THRESHOLD")
+    # 该说话人更像某个已知成员且分差达此值时，不算「我」。
+    owner_member_priority_margin: float = Field(
+        default=0.03, ge=0, le=1, alias="OWNER_MEMBER_PRIORITY_MARGIN"
+    )
+    # 太短的说话人不算「我」。
+    owner_min_speech_seconds: float = Field(default=10, ge=0, alias="OWNER_MIN_SPEECH_SECONDS")
+    # 录入本人声纹所需的最少有效语音。
+    owner_min_enroll_seconds: float = Field(default=20, ge=0, alias="OWNER_MIN_ENROLL_SECONDS")
+    # 录入成功后自动回填的历史会议场次。
+    owner_backfill_limit: int = Field(default=2, ge=0, le=50, alias="OWNER_BACKFILL_LIMIT")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: Optional[str] = Field(default=None, alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")

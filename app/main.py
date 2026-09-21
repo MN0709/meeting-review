@@ -43,7 +43,8 @@ from app.models import (
     MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
-    MyTaskItem, MyTasksResult, SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
+    MyTaskItem, MyTasksResult, OwnerBackfillResult, OwnerEnrollResult, OwnerStatus,
+    SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
     ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
     DeliverableState, DeliverablesReport, RetryResult,
     ShareCreate, ShareCreated, ShareLinkItem, ShareLinksPayload,
@@ -51,6 +52,7 @@ from app.models import (
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
+from app.owner import SpeakerCandidate, decide_owner
 from app.security import AdmissionController, AdmissionError, AdmissionReservation, SHANGHAI_TZ
 from app import shares
 from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
@@ -63,6 +65,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "meeting-review-uploads"
 MIN_FREE_DISK_BYTES = 1024**3
 ALLOWED_EXTENSIONS: Set[str] = {".mp3", ".m4a", ".wav"}
+# R-P2-2：浏览器录音（MediaRecorder）常见为 webm/ogg，录入本人声纹时额外接受。
+OWNER_AUDIO_EXTENSIONS: Set[str] = ALLOWED_EXTENSIONS | {".webm", ".ogg", ".oga", ".opus"}
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 settings = get_settings()
@@ -152,8 +156,11 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
                 project_id=(usage_context or {}).get("project_id"),
             )
         ] if team_id else []
+        # R-P2-3：本人声纹（更严）与项目成员声纹一起参与判定；未录入时为 None。
+        owner_record = database.owner_voiceprint(team_id) if team_id else None
+        owner_embedding = owner_record["embedding"] if owner_record else None
         speaker_result = await run_in_threadpool(
-            speaker_recognizer.process, path, transcript, profiles
+            speaker_recognizer.process, path, transcript, profiles, owner_embedding
         )
     finally:
         path.unlink(missing_ok=True)
@@ -167,6 +174,12 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
         _mark_deliverable(path.stem, team_id, "transcript", "ok")
         if speaker_result:
             database.save_meeting_speakers(path.stem, team_id, speaker_result.observations)
+            # R-P2-3：写回「我」的识别结果；人工指认优先，不覆盖。
+            database.set_owner_identification(
+                path.stem, team_id,
+                speaker_result.owner_label, speaker_result.owner_confidence,
+                "voiceprint" if speaker_result.owner_label else None,
+            )
     if not progress("AI 分析中", "转写完成，正在进行 AI 分析…"):
         raise TaskAborted()
     try:
@@ -393,6 +406,152 @@ async def auth_check(request: Request) -> dict:
         "auth_enabled": settings.auth_enabled,
         "debug_panels": settings.debug_panels_enabled,
     }
+
+
+# --- R-P2-2/3/12：本人声纹、本人识别与历史回填 ------------------------------
+
+
+def _owner_status(team_id: int) -> OwnerStatus:
+    record = database.owner_voiceprint(team_id)
+    skipped_at = database.get_app_state("owner_voiceprint_skipped_at") or ""
+    onboarding_done = database.get_app_state("owner_onboarding_done") or ""
+    return OwnerStatus(
+        enrolled=record is not None,
+        skipped=bool(skipped_at.strip()) and record is None,
+        name=(record or {}).get("name") or settings.owner_name,
+        sample_seconds=(record or {}).get("sample_seconds"),
+        enrolled_at=(record or {}).get("enrolled_at"),
+        onboarding_done=bool(onboarding_done.strip()),
+    )
+
+
+def _run_owner_backfill(team_id: int, limit: int) -> list[Dict[str, Any]]:
+    """R-P2-12：只做本地 embedding 比对（不调 LLM、不重跑转写）。"""
+    record = database.owner_voiceprint(team_id)
+    if record is None or limit <= 0:
+        return []
+    results: list[Dict[str, Any]] = []
+    for meeting in database.list_backfill_meetings(team_id, limit):
+        if meeting.get("self_source") == "manual":
+            results.append({
+                "meeting_id": meeting["id"], "title": meeting["title"],
+                "status": "skipped_manual", "self_name": None, "confidence": None,
+            })
+            continue
+        rows = database.meeting_speaker_candidates(meeting["id"], team_id)
+        candidates = [
+            SpeakerCandidate(
+                label=str(row["local_label"]),
+                embedding=json.loads(row["embedding_json"]) if row["embedding_json"] else None,
+                speech_seconds=float(row["speech_seconds"] or 0.0),
+                matched_member_id=row["member_id"],
+                matched_name=row["member_name"],
+                confidence=row["confidence"],
+            )
+            for row in rows
+        ]
+        decision = decide_owner(
+            candidates, record["embedding"], record["name"] or settings.owner_name,
+            threshold=settings.owner_match_threshold,
+            min_speech_seconds=settings.owner_min_speech_seconds,
+            member_margin=settings.owner_member_priority_margin,
+        )
+        database.set_owner_identification(
+            meeting["id"], team_id, decision.label, decision.confidence,
+            "voiceprint" if decision.label else None,
+        )
+        results.append({
+            "meeting_id": meeting["id"], "title": meeting["title"],
+            "status": decision.reason, "self_name": decision.label,
+            "confidence": decision.confidence,
+        })
+    return results
+
+
+@app.get("/api/owner", response_model=OwnerStatus)
+async def owner_status(request: Request) -> OwnerStatus:
+    """R-P2-2：本人声纹状态（是否录入 / 是否跳过 / 引导是否完成）。"""
+    return _owner_status(request.state.team_id)
+
+
+@app.post("/api/owner/voiceprint", response_model=OwnerEnrollResult)
+async def owner_enroll(request: Request, file: UploadFile = File(...)) -> OwnerEnrollResult:
+    """R-P2-2：录入 / 重录本人声纹；有效语音不足 422，不写脏数据；成功后自动回填最近 2 场。"""
+    team_id = request.state.team_id
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in OWNER_AUDIO_EXTENSIONS:
+        raise APIError(415, "invalid_args", "声纹录入仅支持 mp3、m4a、wav、webm、ogg 音频")
+    temp_path = UPLOAD_DIR / "owner-{}{}".format(uuid4().hex, suffix)
+    try:
+        await _save_upload(file, temp_path)
+        try:
+            embedding, speech_seconds = await run_in_threadpool(
+                speaker_recognizer.extract_owner_embedding, temp_path
+            )
+        except ValueError as exc:
+            raise APIError(422, "invalid_args", str(exc)) from exc
+        except (ImportError, ModuleNotFoundError, SystemExit):
+            raise APIError(
+                503, "speaker_unavailable", "本机声纹运行时不可用，暂时无法录入声纹"
+            )
+        if speech_seconds < settings.owner_min_enroll_seconds:
+            raise APIError(
+                422, "invalid_args",
+                "有效语音不足 {:.0f} 秒（本次约 {:.1f} 秒），请重新录制".format(
+                    settings.owner_min_enroll_seconds, speech_seconds,
+                ),
+            )
+        database.save_owner_voiceprint(
+            team_id, settings.owner_name, embedding, settings.speaker_model, speech_seconds
+        )
+        database.set_app_state("owner_onboarding_done", "1")
+        database.set_app_state("owner_voiceprint_skipped_at", "")
+        backfilled = _run_owner_backfill(team_id, settings.owner_backfill_limit)
+        record = database.owner_voiceprint(team_id) or {}
+        return OwnerEnrollResult(
+            enrolled=True, name=settings.owner_name, sample_seconds=speech_seconds,
+            enrolled_at=str(record.get("enrolled_at") or ""), backfilled=backfilled,
+        )
+    finally:
+        await file.close()
+        temp_path.unlink(missing_ok=True)
+
+
+@app.delete("/api/owner/voiceprint", response_model=OwnerStatus)
+async def owner_voiceprint_delete(request: Request) -> OwnerStatus:
+    """R-P2-2：删除本人声纹；删除后「我答应的任务」回到未解锁。"""
+    team_id = request.state.team_id
+    database.delete_owner_voiceprint(team_id)
+    database.set_app_state("owner_onboarding_done", "1")
+    database.set_app_state("owner_voiceprint_skipped_at", "")
+    return _owner_status(team_id)
+
+
+@app.post("/api/owner/skip", response_model=OwnerStatus)
+async def owner_skip(request: Request) -> OwnerStatus:
+    """R-P2-2 ④：记录「跳过」；幂等，之后不再弹引导（仍可随时补录）。"""
+    database.set_app_state("owner_onboarding_done", "1")
+    database.set_app_state("owner_voiceprint_skipped_at", datetime.now(timezone.utc).isoformat())
+    return _owner_status(request.state.team_id)
+
+
+@app.post("/api/owner/backfill", response_model=OwnerBackfillResult)
+async def owner_backfill(
+    request: Request, limit: Optional[int] = Query(default=None, ge=0, le=50),
+) -> OwnerBackfillResult:
+    """R-P2-12：手动重跑回填；默认只回填最近 OWNER_BACKFILL_LIMIT 场。"""
+    team_id = request.state.team_id
+    if database.owner_voiceprint(team_id) is None:
+        raise APIError(422, "invalid_args", "还没有录入本人声纹，无法回填")
+    effective = settings.owner_backfill_limit if limit is None else limit
+    results = _run_owner_backfill(team_id, effective)
+    return OwnerBackfillResult(
+        requested_limit=effective,
+        scanned=len(results),
+        identified=sum(1 for item in results if item.get("self_name")),
+        skipped_manual=sum(1 for item in results if item["status"] == "skipped_manual"),
+        meetings=results,
+    )
 
 
 # R-P1-2 调试端点：枚举当前注册的工具。仅 team 内可用，且默认（pipeline）模式下
@@ -745,10 +904,16 @@ async def my_tasks(request: Request, meeting_id: str) -> MyTasksResult:
         or (item.get("owner") or "").strip() == "未明确"
     )
     current = database.self_speaker(meeting_id, team_id)
+    # R-P2-3 ⑤：本人声纹门控。skipped → 前端整块隐藏；enrolled 未识别 → 显示「本场未识别到你」。
+    record = database.owner_voiceprint(team_id)
+    skipped = bool((database.get_app_state("owner_voiceprint_skipped_at") or "").strip()) and record is None
+    state = "skipped" if skipped else ("enrolled" if record else "not_enrolled")
     if current is None:
+        reason = "not_identified" if record else ("skipped" if skipped else "not_enrolled")
         return MyTasksResult(
             meeting_id=meeting_id, self_speaker_set=False,
             count=0, owner_unknown=owner_unknown, items=[],
+            owner_voiceprint_state=state, reason=reason,
         )
     self_name = current["self_name"]
     mine = [
@@ -759,6 +924,7 @@ async def my_tasks(request: Request, meeting_id: str) -> MyTasksResult:
         meeting_id=meeting_id, self_speaker_set=True,
         local_label=current["local_label"], member_id=current["member_id"],
         self_name=self_name, count=len(mine), owner_unknown=owner_unknown, items=mine,
+        owner_voiceprint_state=state, reason=None,
     )
 
 

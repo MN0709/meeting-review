@@ -294,6 +294,17 @@ class Database:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                -- R-P2-2：本人声纹（全局唯一一行，id 固定为 1）。
+                CREATE TABLE IF NOT EXISTS owner_voiceprints(
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    team_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    embedding_json TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    sample_seconds REAL NOT NULL DEFAULT 0,
+                    enrolled_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 -- R-P1.5-9（阶段 10-B）：术语热词表。
                 -- R-P2-9：本版停用（界面与接口已删除），表保留以兼容历史库，不再读写。
                 CREATE TABLE IF NOT EXISTS team_terms(
@@ -345,6 +356,9 @@ class Database:
             # R-P2-4：声纹库从「团队全局」改为「项目级」。project_id 为空 = 未归类桶。
             self._ensure_column(connection, "members", "project_id", "TEXT REFERENCES projects(id)")
             self._ensure_column(connection, "speaker_profiles", "project_id", "TEXT")
+            # R-P2-3：「我」的来源与置信度。
+            self._ensure_column(connection, "meetings", "self_source", "TEXT")
+            self._ensure_column(connection, "meetings", "self_confidence", "REAL")
             self._ensure_column(connection, "agent_tasks", "message", "TEXT")
             self._ensure_column(connection, "agent_tasks", "request_id", "TEXT")
             self._ensure_column(connection, "agent_tasks", "long_meeting", "INTEGER NOT NULL DEFAULT 0")
@@ -848,11 +862,16 @@ class Database:
         self, meeting_id: str, team_id: int, *,
         member_id: Optional[int] = None, label: Optional[str] = None,
     ) -> bool:
-        """R-P1.5-5：写入/清除本场「我」的指认（两者都为空 = 清除）。"""
+        """R-P1.5-5：人工指认本场「我」（两者都为空 = 清除）。
+
+        R-P2-3 ⑥：人工指认优先——写入 source='manual'，后续声纹识别不再覆盖。
+        """
+        source = "manual" if (member_id is not None or label) else None
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE meetings SET self_member_id=?, self_label=? WHERE id=? AND team_id=?",
-                (member_id, label, meeting_id, team_id),
+                """UPDATE meetings SET self_member_id=?, self_label=?, self_source=?,
+                          self_confidence=NULL WHERE id=? AND team_id=?""",
+                (member_id, label, source, meeting_id, team_id),
             )
             return cursor.rowcount > 0
 
@@ -865,7 +884,8 @@ class Database:
         """
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                """SELECT m.self_member_id, m.self_label, mem.name AS member_name
+                """SELECT m.self_member_id, m.self_label, m.self_source, m.self_confidence,
+                          mem.name AS member_name
                    FROM meetings m LEFT JOIN members mem ON mem.id = m.self_member_id
                    WHERE m.id=? AND m.team_id=?""",
                 (meeting_id, team_id),
@@ -889,7 +909,90 @@ class Database:
             "local_label": label,
             "member_name": member_name,
             "self_name": member_name or label,
+            "source": row["self_source"],
+            "confidence": row["self_confidence"],
         }
+
+    # --- R-P2-2/3/12：本人声纹与「我」的识别 --------------------------------
+    def owner_voiceprint(self, team_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, team_id, name, embedding_json, model_version,
+                          sample_seconds, enrolled_at, updated_at
+                   FROM owner_voiceprints WHERE team_id=? AND id=1""",
+                (team_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "name": row["name"],
+            "embedding": json.loads(row["embedding_json"]),
+            "model_version": row["model_version"],
+            "sample_seconds": float(row["sample_seconds"]),
+            "enrolled_at": row["enrolled_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def save_owner_voiceprint(
+        self, team_id: int, name: str, embedding: list, model_version: str,
+        sample_seconds: float,
+    ) -> None:
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO owner_voiceprints(
+                       id, team_id, name, embedding_json, model_version,
+                       sample_seconds, enrolled_at, updated_at)
+                   VALUES(1,?,?,?,?,?,?,?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       team_id=excluded.team_id, name=excluded.name,
+                       embedding_json=excluded.embedding_json,
+                       model_version=excluded.model_version,
+                       sample_seconds=excluded.sample_seconds,
+                       updated_at=excluded.updated_at""",
+                (team_id, name, json.dumps(embedding), model_version, sample_seconds, now, now),
+            )
+
+    def delete_owner_voiceprint(self, team_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM owner_voiceprints WHERE id=1 AND team_id=?", (team_id,)
+            )
+        return cursor.rowcount > 0
+
+    def set_owner_identification(
+        self, meeting_id: str, team_id: int, label: Optional[str],
+        confidence: Optional[float], source: Optional[str],
+    ) -> bool:
+        """写回本场「我」的声纹识别结果；**人工指认优先，不覆盖**（R-P2-3 ⑥）。"""
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE meetings SET self_label=?, self_source=?, self_confidence=?
+                   WHERE id=? AND team_id=? AND (self_source IS NULL OR self_source!='manual')""",
+                (label, source, confidence, meeting_id, team_id),
+            )
+            return cursor.rowcount > 0
+
+    def list_backfill_meetings(self, team_id: int, limit: int) -> list[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, title, self_source FROM meetings
+                   WHERE team_id=? AND status='完成'
+                   ORDER BY created_at DESC, id DESC LIMIT ?""",
+                (team_id, int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def meeting_speaker_candidates(self, meeting_id: str, team_id: int) -> list[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT s.local_label, s.embedding_json, s.speech_seconds, s.member_id,
+                          s.confidence, mem.name AS member_name
+                   FROM meeting_speakers s LEFT JOIN members mem ON mem.id = s.member_id
+                   WHERE s.meeting_id=? AND s.team_id=? ORDER BY s.id""",
+                (meeting_id, team_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # R-P1.5-7（阶段 9-C）：交付物状态。四类交付物各自独立成/败。

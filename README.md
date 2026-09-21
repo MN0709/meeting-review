@@ -27,7 +27,8 @@
 - AI 项目建议（R-P1.5-8）：**未归类**会议的报告顶部会出现一张带「**AI 建议**」角标的卡片，给出建议归入的已有项目（优先复用，不编造）或建议的新项目名，并附一句依据。三个动作都由人决定：**加入该项目 / 新建「建议名」并加入 / 用新名字新建并加入 / 不加入**；选「不加入」保持未分类、清除建议、**不留副作用**。**AI 永不自动移动会议**（有专门测试断言）；建议里出现团队不存在的项目 id 时**整条丢弃**；旧报告没有该字段时界面不显示卡片。团队还没有项目时不传项目列表，分析调用与之前完全一致。
 - 交付物状态与「待核对」（R-P1.5-7）：报告页顶部有「交付物状态」条——**逐字稿 / 文字报告 / 任务单 / 图片纪要+PDF** 各自独立成/败。某一项失败只标那一项「待核对」并给出「重试」按钮，**其它交付物照常可看**；重试只重跑失败的那一项（图片纪要与任务单的重试**不调用 AI**；文字报告的重试会调用 AI，界面先弹确认框）。转写需要原始录音、而录音已按隐私策略删除，因此不可重试，会明确提示重新上传。升级前创建的旧会议没有状态记录，会按「有逐字稿/有报告」推断为正常，不显示成「待生成」。
 - 图片纪要（R-P1.5-1 / R-P2-8）：报告底部「图片纪要」把会议渲染成**卡片长图**——① 这次会议的核心（总览 + 要点）、② 待办（**含紧急**：紧急条目带「紧急」标签并排在最前）、③ 我答应的任务（**未识别到你时整块隐藏**）、④ 关键决策（带时间戳，可回到原话）。**同一内容不会重复出现在两个板块**。带时间戳的条目点击可跳到右侧逐字稿。点「导出 PDF」得到可外发的 PDF（HTML → PDF；渲染器优先 Playwright，缺失时自动回退本机 Chrome，都不通时返回 503 并把该交付物标「待核对」，不影响文字报告与逐字稿）。版式模板在 `app/deliverables/templates/card_v1.html`，与数据分离。
-- 我答应的任务（R-P1.5-5，M3 将接入本人声纹）：在「整理本次会议」里选「本场哪个说话人是我」（可选已命名成员，也可选未命名说话人），报告就只列**负责人完全等于你**的行动项。**未识别/未指定时显示「本场未识别到你（不猜测）」，绝不推断**；同时提示本场有多少条负责人为「未明确」、无法归属到任何人。
+- 本人声纹（R-P2-2/3/12）：首次进入首页出现「认识你」引导——浏览器直接录音（或上传 30~60 秒音频）建立**本人声纹**，也可**跳过**（跳过会明确告知「我答应的任务」无法解锁，之后可在首页随时补录/重录/删除）。录入成功后**自动回填最近 2 场**历史会议（只做本地声纹比对，不重新调用 AI、不重跑转写）。判定「我」比成员匹配更严（阈值 `OWNER_MATCH_THRESHOLD=0.80`）：需相似度达标、有效语音 ≥10 秒、本场**只有一个**说话人达标、且不更像已知成员；任一不满足就显示「本场未识别到你」，**认错必须为 0**。人工指认优先，声纹不覆盖。
+- 我答应的任务（R-P1.5-5 / R-P2-3）：报告里只列**负责人完全等于你**的行动项。**未识别/未指定时显示「本场未识别到你（不猜测）」，绝不推断**；同时提示本场有多少条负责人为「未明确」，无法归属到任何人。三级门控：未录声纹（跳过/未录）→ 整个板块隐藏；已录但本场未识别 → 空态「本场未识别到你」；已识别 → 列任务。仍可在「整理本次会议」里**手动指认**兜底（手动优先，声纹不覆盖）。
 
 旧的个人表现模型仍在 `models.py` 中标记为 legacy，以保留已有代码契约与测试；团队 UI 不呈现个人评分、口头禅或个人表现模块。
 
@@ -191,7 +192,12 @@ curl http://127.0.0.1:8000/health
   参数：`q`（必填，1–50 字）、`project_id?`、`from?`、`to?`（`YYYY-MM-DD` 按上海自然日解释，或完整 ISO8601）、`limit?`（默认 20，上限 50）。
   响应：`{"query", "count", "hits": [{meeting_id, meeting_title, project_id, project_name, start, end, timestamp, speaker_label, text_snippet}]}`；空结果返回 200 + `count=0`。
   同一场会议最多返回 5 条，避免单场会议淹没结果；严格 `team_id` 隔离（跨团队 403 且不返回数据）；不计入限频与每日名额；错误结构 `{"error": {"code", "message"}}`（`invalid_args` 422 / `not_found` 404 / `team_forbidden` 403）。
-- `GET /api/meetings/{id}/my-tasks`：**「我答应的任务」切面（R-P1.5-5）**。只返回 `owner` 与「我」完全一致的行动项；未指定时 `self_speaker_set=false` + 空列表，另给 `owner_unknown`（负责人为「未明确」的条数）。跨团队 403。
+- `GET /api/meetings/{id}/my-tasks`：**「我答应的任务」切面（R-P1.5-5 / R-P2-3）**。只返回 `owner` 与「我」完全一致的行动项；新增 `owner_voiceprint_state`（`skipped` / `enrolled` / `not_enrolled`）与 `reason`（`not_identified` 等），前端据此隐藏整块或显示「本场未识别到你」。另给 `owner_unknown`（负责人为「未明确」的条数）。跨工作区 403。
+- `GET /api/owner`：**本人声纹状态（R-P2-2）**。`{enrolled, skipped, name, sample_seconds, enrolled_at, onboarding_done}`。
+- `POST /api/owner/voiceprint`：**录入/重录本人声纹**。multipart `file`（mp3/m4a/wav/webm/ogg）；有效语音不足 `OWNER_MIN_ENROLL_SECONDS`（默认 20 秒）返回 422 且不写数据；成功后自动回填最近 2 场；运行时缺失返回 503。
+- `DELETE /api/owner/voiceprint`：删除本人声纹，回到未解锁。
+- `POST /api/owner/skip`：记录「跳过」（幂等），之后不再弹引导。
+- `POST /api/owner/backfill?limit=2`：手动重跑历史回填；不调用 AI。
 - `POST /api/meetings/{id}/self-speaker`：指定本场「我」对应哪个说话人（`{"local_label": "说话人 1"}` 或 `{"member_id": 3}`；传空对象表示清除）。非法说话人/非本场成员 422；无报告 404；跨团队 403。
 - `GET /api/projects`：列出当前团队项目文件夹及会议数量。
 - `GET /api/projects/{id}/memory`：聚合当前项目最近 3 场已完成会议的决策、行动项和遗留问题；包含来源会议。
@@ -235,6 +241,12 @@ curl http://127.0.0.1:8000/health
 | `AUTH_ENABLED` | 否 | `false` | **R-P2-1**：个人模式（默认）免鉴权、打开即用；`true` 时恢复口令校验。默认只监听 `127.0.0.1`，**禁止暴露公网** |
 | `OWNER_NAME` | 否 | `我` | 个人工作区 / 本人展示名 |
 | `DEBUG_PANELS_ENABLED` | 否 | `false` | 报告页是否显示成本 / Agent 步骤（排障用）；默认不显示 |
+| `OWNER_VOICEPRINT_ENABLED` | 否 | `true` | 是否识别「我」；关闭后隐藏「我答应的任务」 |
+| `OWNER_MATCH_THRESHOLD` | 否 | `0.80` | 本人声纹阈值（高于成员 0.72；认错更严重，宁可不认） |
+| `OWNER_MEMBER_PRIORITY_MARGIN` | 否 | `0.03` | 更像已知成员且分差达标时不算「我」 |
+| `OWNER_MIN_SPEECH_SECONDS` | 否 | `10` | 有效语音不足此秒数不算「我」 |
+| `OWNER_MIN_ENROLL_SECONDS` | 否 | `20` | 录入本人声纹所需的最少有效语音 |
+| `OWNER_BACKFILL_LIMIT` | 否 | `2` | 录入成功后自动回填的历史会议场次 |
 | `TEAM_TOKENS` | 否 | 空 | **改为可选**：仅 `AUTH_ENABLED=true` 时必填。`团队名:口令`；**口令强度：≥ 16 位，且不能是纯数字或纯英文；不合规服务拒绝启动**（R-P0-3） |
 | `OPENAI_API_KEY` | **是** | 无 | OpenAI 兼容 LLM 密钥 |
 | `OPENAI_BASE_URL` | 否 | SDK 默认 | 兼容服务 `/v1` 地址 |
@@ -338,13 +350,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：397 passed
+python -m pytest -q            # 本地完整环境：418 passed
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 397 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 418 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：

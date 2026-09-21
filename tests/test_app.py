@@ -1649,7 +1649,7 @@ def test_speaker_recognition_failure_is_visible_in_report(monkeypatch, tmp_path)
     monkeypatch.setattr(
         main_module.speaker_recognizer,
         "process",
-        lambda path, received, profiles: SpeakerRecognitionResult(
+        lambda path, received, profiles, owner_embedding=None: SpeakerRecognitionResult(
             received, received, [], False, "说话人识别失败，请稍后重试",
         ),
     )
@@ -1966,7 +1966,7 @@ def test_speaker_recognition_runs_before_audio_deletion_and_persists_labels(monk
     })
     monkeypatch.setattr(main_module.transcriber, "transcribe", lambda path: raw)
 
-    def fake_speaker(path, transcript, profiles):
+    def fake_speaker(path, transcript, profiles, owner_embedding=None):
         assert path.exists(), "声纹特征必须在原始音频删除前提取"
         assert transcript is raw
         return SpeakerRecognitionResult(

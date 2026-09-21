@@ -1,4 +1,4 @@
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -225,6 +225,9 @@ class SelfSpeakerResult(StrictModel):
     member_id: Optional[int] = None
     member_name: Optional[str] = None
     self_name: Optional[str] = None
+    # R-P2-3：「我」的来源（voiceprint / manual / None）与置信度。
+    source: Optional[str] = None
+    confidence: Optional[float] = None
 
 
 class MyTaskItem(StrictModel):
@@ -244,6 +247,36 @@ class MyTasksResult(StrictModel):
     count: int = Field(ge=0)
     owner_unknown: int = Field(ge=0)
     items: List[MyTaskItem]
+    # R-P2-3 ⑤：本人声纹门控状态：skipped / enrolled / not_enrolled；reason 说明未识别原因。
+    owner_voiceprint_state: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class OwnerStatus(StrictModel):
+    """R-P2-2：本人声纹状态。"""
+
+    enrolled: bool
+    skipped: bool
+    name: str
+    sample_seconds: Optional[float] = None
+    enrolled_at: Optional[str] = None
+    onboarding_done: bool = False
+
+
+class OwnerEnrollResult(StrictModel):
+    enrolled: bool
+    name: str
+    sample_seconds: float
+    enrolled_at: str
+    backfilled: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class OwnerBackfillResult(StrictModel):
+    requested_limit: int
+    scanned: int
+    identified: int
+    skipped_manual: int
+    meetings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
