@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Dict, Literal, Optional
 
-from pydantic import Field, SecretStr, ValidationError
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,7 +28,11 @@ class Settings(BaseSettings):
     app_host: str = Field(default="127.0.0.1", alias="APP_HOST")
     app_port: int = Field(default=8000, ge=1, le=65535, alias="APP_PORT")
     forwarded_allow_ips: str = Field(default="127.0.0.1", alias="FORWARDED_ALLOW_IPS")
-    team_tokens: SecretStr = Field(min_length=1, alias="TEAM_TOKENS")
+    # R-P2-1：个人模式（默认）不要求口令；AUTH_ENABLED=true 时才恢复口令校验。
+    team_tokens: Optional[SecretStr] = Field(default=None, alias="TEAM_TOKENS")
+    auth_enabled: bool = Field(default=False, alias="AUTH_ENABLED")
+    owner_name: str = Field(default="我", alias="OWNER_NAME")
+    debug_panels_enabled: bool = Field(default=False, alias="DEBUG_PANELS_ENABLED")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: Optional[str] = Field(default=None, alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
@@ -75,10 +79,6 @@ class Settings(BaseSettings):
     # 分享链接（R-P1.5-3）：固定 3 天有效；SHARE_BASE_URL 用于内网穿透/公网地址。
     share_ttl_hours: int = Field(default=72, gt=0, alias="SHARE_TTL_HOURS")
     share_base_url: Optional[str] = Field(default=None, alias="SHARE_BASE_URL")
-    # 术语热词注入（R-P1.5-9）。关闭后转写调用与未引入热词时完全一致。
-    team_terms_enabled: bool = Field(default=True, alias="TEAM_TERMS_ENABLED")
-    term_prompt_max_chars: int = Field(default=200, gt=0, alias="TERM_PROMPT_MAX_CHARS")
-
     # --- Agent 层开关（PRD v1.1 §13.1）-------------------------------------
     # 默认 pipeline：不设置任何 AGENT_* 时，行为与 P0 完全一致（零行为变化）。
     agent_mode: Literal["pipeline", "shadow", "agent"] = Field(
@@ -110,7 +110,12 @@ class Settings(BaseSettings):
     def parsed_team_tokens(self) -> Dict[str, str]:
         teams: Dict[str, str] = {}
         seen_tokens: set[str] = set()
-        for entry in self.team_tokens.get_secret_value().split(","):
+        raw = self.team_tokens.get_secret_value() if self.team_tokens is not None else ""
+        if not raw.strip():
+            if self.auth_enabled:
+                raise ValueError("AUTH_ENABLED=true 时必须配置 TEAM_TOKENS")
+            return teams
+        for entry in raw.split(","):
             if ":" not in entry:
                 raise ValueError("TEAM_TOKENS 格式错误，应为 团队名:口令,团队名:口令")
             name, token = (part.strip() for part in entry.split(":", 1))
@@ -121,8 +126,8 @@ class Settings(BaseSettings):
                 raise ValueError(problem)
             teams[name] = token
             seen_tokens.add(token)
-        if not teams:
-            raise ValueError("TEAM_TOKENS 至少需要配置一个团队")
+        if not teams and self.auth_enabled:
+            raise ValueError("AUTH_ENABLED=true 时需要至少配置一个团队口令")
         return teams
 
     def redacted_api_key_state(self) -> str:
@@ -132,19 +137,15 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    try:
-        settings = Settings()
-    except ValidationError as exc:
-        missing_team_tokens = any(error.get("loc") == ("TEAM_TOKENS",) for error in exc.errors())
-        if missing_team_tokens:
-            raise RuntimeError("缺少必填环境变量 TEAM_TOKENS，服务拒绝启动") from exc
-        raise
+    settings = Settings()
     try:
         settings.parsed_team_tokens()
     except ValueError as exc:
         raise RuntimeError(
             "TEAM_TOKENS 不合规，服务拒绝启动：{}\n"
             "修复指引：把每个团队的口令改成不少于 {} 位、且不是纯数字或纯字母的随机字符串，"
-            "然后重新启动服务（口令只写在 .env，不要提交到仓库）。".format(exc, MIN_TEAM_TOKEN_LENGTH)
+            "然后关闭 AUTH_ENABLED 或重新启动服务（口令只写在 .env，不要提交到仓库）。".format(
+                exc, MIN_TEAM_TOKEN_LENGTH
+            )
         ) from exc
     return settings

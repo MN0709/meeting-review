@@ -113,8 +113,10 @@ def test_health_returns_ok() -> None:
 
 def test_team_tokens_are_required_and_health_is_exempt(monkeypatch) -> None:
     monkeypatch.delenv("TEAM_TOKENS", raising=False)
-    with pytest.raises(ValidationError, match="TEAM_TOKENS"):
-        Settings(_env_file=None)
+    # R-P2-1：个人模式不要求口令；AUTH_ENABLED=true（进阶模式）时必须配置。
+    with pytest.raises(ValueError, match="TEAM_TOKENS"):
+        Settings(_env_file=None, AUTH_ENABLED=True).parsed_team_tokens()
+    assert Settings(_env_file=None, AUTH_ENABLED=False).parsed_team_tokens() == {}
 
     disk_checked = False
 
@@ -150,12 +152,8 @@ def test_team_tokens_are_upserted_on_startup_and_old_token_stops_working(tmp_pat
 
 @pytest.mark.parametrize("value", ["", "没有分隔符", "甲:a,甲:b", "甲:a,乙:a"])
 def test_invalid_team_token_configuration_is_rejected(value) -> None:
-    if not value:
-        with pytest.raises(ValidationError):
-            Settings(_env_file=None, TEAM_TOKENS=value)
-    else:
-        with pytest.raises(ValueError, match="TEAM_TOKENS"):
-            Settings(_env_file=None, TEAM_TOKENS=value).parsed_team_tokens()
+    with pytest.raises(ValueError, match="TEAM_TOKENS"):
+        Settings(_env_file=None, TEAM_TOKENS=value, AUTH_ENABLED=True).parsed_team_tokens()
 
 
 def test_service_import_fails_with_clear_message_without_team_tokens(tmp_path) -> None:
@@ -163,6 +161,7 @@ def test_service_import_fails_with_clear_message_without_team_tokens(tmp_path) -
     environment = os.environ.copy()
     environment.pop("TEAM_TOKENS", None)
     environment["PYTHONPATH"] = str(project_dir)
+    environment["AUTH_ENABLED"] = "true"
 
     result = subprocess.run(
         [sys.executable, "-c", "import app.main"],
@@ -176,7 +175,18 @@ def test_service_import_fails_with_clear_message_without_team_tokens(tmp_path) -
     )
 
     assert result.returncode != 0
-    assert "缺少必填环境变量 TEAM_TOKENS，服务拒绝启动" in result.stderr
+    assert "TEAM_TOKENS" in result.stderr
+
+    # R-P2-1：个人模式（AUTH_ENABLED=false）没有口令也能导入启动。
+    personal = subprocess.run(
+        [sys.executable, "-c", "import app.main"],
+        cwd=tmp_path,
+        env={**environment, "AUTH_ENABLED": "false"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert personal.returncode == 0, personal.stderr
 
 
 def test_hourly_rate_limit_and_rollback() -> None:
@@ -735,7 +745,9 @@ def test_team_payload_normalizes_overview_and_unresolved_issue_shape() -> None:
 
 def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     html = (Path(__file__).parent.parent / "static" / "index.html").read_text(encoding="utf-8")
-    assert "speaker_stats_note" in html
+    # R-P2-7：独立的「识别状态」面板已删除（说话人确认里的统计说明仍保留）
+    assert 'id="speakerStats"' not in html
+    assert "关键结论" in html
     assert "说话人识别将于下一版本支持" not in html  # comes from the API contract
     assert "setTimeout(resolve,ms)" in html
     assert "meeting-review-task-id" in html
@@ -765,7 +777,7 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "/speakers/" in html
     assert "/voiceprint" in html
     assert "innerHTML" not in html
-    assert "请输入你的团队口令" in html
+    assert "服务已开启口令校验（进阶模式）" in html
     assert "location.protocol==='file:'" in html
     assert "打开正确服务地址" in html
     assert "你打开的是本地网页文件，无法连接后端服务" in html
@@ -799,7 +811,7 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert 'id="meetingsView"' in html
     assert 'id="projectsView"' in html
     assert 'id="projectDetailView"' in html
-    assert "会脉 · 团队会议记忆" in html
+    assert "会脉 · 我的会议记忆" in html
     assert '<div class="brand">团队复盘</div>' not in html
     assert "@media(max-width:760px){.app-shell{grid-template-columns:104px minmax(0,1fr)}" in html
     assert ".app-sidebar{position:sticky;z-index:10;top:0;height:100vh" in html
@@ -818,7 +830,8 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "localStorage.setItem(PROJECT_STORAGE_KEY" in html
     assert "localStorage.setItem(HISTORY_SCOPE_STORAGE_KEY" in html
     assert "① 会议总览" in html
-    assert "⑤ 遗留问题" in html
+    assert "③ 关键结论" in html
+    assert "待跟进" in html
     assert "查看 ${evidence.timestamp} 附近的转写原文" in html
     assert "body.transcript||[]" in html
     assert "textContent=report.overview" in html
@@ -832,7 +845,7 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
 
 
 def test_fastapi_uses_product_name() -> None:
-    assert main_module.app.title == "会脉 · 团队会议记忆"
+    assert main_module.app.title == "会脉 · 我的会议记忆"
 
 
 def test_existing_database_adds_project_column_without_losing_meetings(tmp_path) -> None:

@@ -110,7 +110,9 @@ class Database:
             logger.warning("fts5_rebuild_skipped error_type=%s", type(exc).__name__)
         return True
 
-    def initialize(self, team_tokens: Dict[str, str]) -> None:
+    def initialize(
+        self, team_tokens: Dict[str, str], owner_name: str = "我", auth_enabled: bool = False,
+    ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as connection:
             connection.executescript(
@@ -283,7 +285,14 @@ class Database:
                     ip TEXT NULL,
                     result_code TEXT NOT NULL
                 );
-                -- R-P1.5-9（阶段 10-B）：团队术语热词表。
+                -- R-P2-2/3/11：个人模式的键值状态（schema 版本 / 个人工作区 / 本人声纹引导）。
+                CREATE TABLE IF NOT EXISTS app_state(
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                -- R-P1.5-9（阶段 10-B）：术语热词表。
+                -- R-P2-9：本版停用（界面与接口已删除），表保留以兼容历史库，不再读写。
                 CREATE TABLE IF NOT EXISTS team_terms(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     team_id INTEGER NOT NULL,
@@ -372,14 +381,26 @@ class Database:
                        ON CONFLICT(name) DO UPDATE SET token_hash=excluded.token_hash""",
                     (name, _token_hash(token), _utc_now()),
                 )
-            rows = connection.execute(
-                "SELECT id, name FROM teams WHERE name IN ({})".format(
-                    ",".join("?" for _ in team_tokens)
-                ),
-                tuple(team_tokens),
-            ).fetchall()
+            rows = (
+                connection.execute(
+                    "SELECT id, name FROM teams WHERE name IN ({})".format(
+                        ",".join("?" for _ in team_tokens)
+                    ),
+                    tuple(team_tokens),
+                ).fetchall()
+                if team_tokens
+                else []
+            )
             by_name = {row["name"]: row["id"] for row in rows}
             self._tokens = {token: by_name[name] for name, token in team_tokens.items()}
+            if auth_enabled:
+                # 进阶模式：不会创建额外工作区；仅当只有一个团队时记录为个人工作区。
+                existing = connection.execute(
+                    "SELECT id FROM teams ORDER BY id LIMIT 2"
+                ).fetchall()
+                self._owner_workspace_id = int(existing[0]["id"]) if len(existing) == 1 else None
+            else:
+                self._owner_workspace_id = self._ensure_personal_workspace(connection, owner_name)
             self._backfill_action_items(connection)
 
     @staticmethod
@@ -837,39 +858,57 @@ class Database:
 
     # ------------------------------------------------------------------
     # R-P1.5-9（阶段 10-B）：团队术语热词表（手动维护部分）。
-    # 已确认成员姓名不落表，由 terms 模块在组装时合并（成员改名自动生效）。
-    # ------------------------------------------------------------------
+    # --- R-P2-1/2/11：个人工作区与 app_state --------------------------------
+    def _ensure_personal_workspace(self, connection: sqlite3.Connection, owner_name: str) -> int:
+        """解析个人工作区（单行 teams 的 id）。
 
-    def upsert_term(self, team_id: int, term: str, note: str = "") -> int:
-        now = _utc_now()
-        with self._lock, self._connect() as connection:
-            connection.execute(
-                """INSERT INTO team_terms(team_id,term,note,created_at,updated_at)
-                   VALUES(?,?,?,?,?)
-                   ON CONFLICT(team_id,term) DO UPDATE SET
-                       note=excluded.note, updated_at=excluded.updated_at""",
-                (team_id, term, note, now, now),
-            )
-            row = connection.execute(
-                "SELECT id FROM team_terms WHERE team_id=? AND term=?", (team_id, term)
-            ).fetchone()
-        return int(row["id"])
-
-    def delete_term(self, team_id: int, term_id: int) -> bool:
-        with self._lock, self._connect() as connection:
+        优先用 app_state 里记录过的 id；否则复用现有唯一团队（升级自 v1.2 的真实库），
+        没有团队时新建一个以 OWNER_NAME 命名的工作区。
+        """
+        recorded = self._app_state_value(connection, "owner_workspace_id")
+        if recorded is not None:
+            row = connection.execute("SELECT id FROM teams WHERE id=?", (recorded,)).fetchone()
+            if row is not None:
+                return int(row["id"])
+        existing = connection.execute(
+            "SELECT id FROM teams ORDER BY id LIMIT 2"
+        ).fetchall()
+        if len(existing) == 1:
+            workspace_id = int(existing[0]["id"])
+        else:
+            name = (owner_name or "我").strip() or "我"
             cursor = connection.execute(
-                "DELETE FROM team_terms WHERE id=? AND team_id=?", (term_id, team_id),
+                "INSERT INTO teams(name, token_hash, created_at) VALUES(?,?,?)",
+                (name, _token_hash(_utc_now()), _utc_now()),
             )
-            return cursor.rowcount > 0
+            workspace_id = int(cursor.lastrowid)
+        self._app_state_set(connection, "owner_workspace_id", str(workspace_id))
+        return workspace_id
 
-    def list_terms(self, team_id: int) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _app_state_value(connection: sqlite3.Connection, key: str) -> Optional[str]:
+        row = connection.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    @staticmethod
+    def _app_state_set(connection: sqlite3.Connection, key: str, value: str) -> None:
+        connection.execute(
+            """INSERT INTO app_state(key, value, updated_at) VALUES(?,?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            (key, value, _utc_now()),
+        )
+
+    def get_app_state(self, key: str) -> Optional[str]:
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                """SELECT id,term,note,updated_at FROM team_terms
-                   WHERE team_id=? ORDER BY term""",
-                (team_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+            return self._app_state_value(connection, key)
+
+    def set_app_state(self, key: str, value: str) -> None:
+        with self._lock, self._connect() as connection:
+            self._app_state_set(connection, key, value)
+
+    def owner_workspace_id(self) -> Optional[int]:
+        """个人模式下的固定工作区 id（服务启动时已解析并缓存）。"""
+        return getattr(self, "_owner_workspace_id", None)
 
     # ------------------------------------------------------------------
     # R-P1.5-3（阶段 11／M4）：分享链接与访问审计。

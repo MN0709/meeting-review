@@ -46,14 +46,13 @@ from app.models import (
     MyTaskItem, MyTasksResult, SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
     ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
     DeliverableState, DeliverablesReport, RetryResult,
-    TermCreate, TermItem, TermsPayload,
     ShareCreate, ShareCreated, ShareLinkItem, ShareLinksPayload,
     SuggestedProjectAction,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
 from app.security import AdmissionController, AdmissionError, AdmissionReservation, SHANGHAI_TZ
-from app import shares, terms
+from app import shares
 from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
 from app.transcription import WhisperTranscriber, probe_audio_duration
 from app.speaker import KnownVoiceProfile, SpeakerRecognizer
@@ -133,17 +132,9 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
     if not progress("转写中", "正在转写，长会议可能需要较长时间…"):
         raise TaskAborted()
     speaker_result = None
-    # R-P1.5-9：把团队热词作为转写提示（未配置/关闭时为 None，行为与现状一致）。
-    term_prompt = terms.build_team_prompt(
-        database, team_id,
-        enabled=settings.team_terms_enabled, max_chars=settings.term_prompt_max_chars,
-    )
     try:
-        # 未配置热词时**只用单参数调用**，与引入热词之前逐字节一致（R-P1.5-9 验收要求）。
-        if term_prompt:
-            transcript = await run_in_threadpool(transcriber.transcribe, path, term_prompt)
-        else:
-            transcript = await run_in_threadpool(transcriber.transcribe, path)
+        # R-P2-9：删除术语热词后，转写恢复为单参数调用（不再组装 initial_prompt）。
+        transcript = await run_in_threadpool(transcriber.transcribe, path)
         duration = transcript.duration_seconds
         if not math.isfinite(duration) or duration > settings.max_audio_minutes * 60:
             raise TaskProcessingError(
@@ -271,22 +262,35 @@ task_manager = InMemoryTaskManager(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    database.initialize(settings.parsed_team_tokens())
+    database.initialize(
+        settings.parsed_team_tokens(),
+        owner_name=settings.owner_name,
+        auth_enabled=settings.auth_enabled,
+    )
     # R-P1-8：先从库里恢复未完成任务，再清理临时目录（保留待续跑任务的音频）。
     task_manager.hydrate()
     prepare_upload_dir(keep=task_manager.resume_paths())
     await task_manager.start()
     logger.info(
-        "startup model=%s api_key=%s database=%s",
+        "startup model=%s api_key=%s database=%s auth_enabled=%s host=%s",
         settings.openai_model,
         settings.redacted_api_key_state(),
         settings.database_path,
+        settings.auth_enabled,
+        settings.app_host,
     )
+    # R-P2-1 红线 12：个人模式免鉴权，必须只监听本机，禁止直接暴露公网。
+    if not settings.auth_enabled:
+        logger.warning(
+            "个人模式：无鉴权（AUTH_ENABLED=false），服务只监听 %s，请勿暴露到公网；"
+            "如需外发访问或分享链接，请先开启 AUTH_ENABLED=true 或在前置反向代理上加认证。",
+            settings.app_host,
+        )
     yield
     await task_manager.stop()
 
 
-app = FastAPI(title="会脉 · 团队会议记忆", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="会脉 · 我的会议记忆", version="0.4.0", lifespan=lifespan)
 
 
 class APIError(Exception):
@@ -322,13 +326,17 @@ async def request_context_and_gates(request: Request, call_next):
         # 但只有 GET /api/shares/... 这一条路径豁免，其它 /api/* 仍必须鉴权。
         if _is_public_share_read(request.method, request.url.path):
             request.state.team_id = None
-        else:
+        elif settings.auth_enabled:
+            # R-P2-1：只有在进阶模式（AUTH_ENABLED=true）才恢复口令校验。
             team_id = database.authenticate(request.headers.get("X-Access-Token", ""))
             if team_id is None:
                 response = JSONResponse(status_code=403, content={"detail": "团队口令错误"})
                 response.headers["X-Request-ID"] = request_id
                 return response
             request.state.team_id = team_id
+        else:
+            # R-P2-1：个人模式，一律解析到个人工作区，不再要求任何请求头。
+            request.state.team_id = database.owner_workspace_id()
 
     if request.method == "POST" and request.url.path == "/api/review":
         reservation: Optional[AdmissionReservation] = None
@@ -373,7 +381,14 @@ async def index() -> FileResponse:
 
 @app.get("/api/auth/check")
 async def auth_check(request: Request) -> dict:
-    return {"status": "ok", "team_id": request.state.team_id}
+    """R-P2-1：个人模式恒返回当前工作区；AUTH_ENABLED=true 时该端点仍需口令。"""
+    return {
+        "status": "ok",
+        "team_id": request.state.team_id,
+        "workspace": settings.owner_name,
+        "auth_enabled": settings.auth_enabled,
+        "debug_panels": settings.debug_panels_enabled,
+    }
 
 
 # R-P1-2 调试端点：枚举当前注册的工具。仅 team 内可用，且默认（pipeline）模式下
@@ -926,7 +941,7 @@ def _image_minutes_meta(history, self_name: Optional[str]) -> str:
     if speakers:
         lines.append("本场说话人：{}".format("、".join(speakers)))
     lines.append(
-        "「我」：{}".format(self_name) if self_name else "「我」：未指定你自己（不推测）"
+        "「我」：{}".format(self_name) if self_name else "「我」：本场未识别到你（不推测）"
     )
     return "\n".join(lines)
 
@@ -944,6 +959,7 @@ async def image_minutes(request: Request, meeting_id: str) -> ImageMinutesResult
                 ImageMinutesItem(
                     text=item["text"],
                     timestamp=item.get("timestamp"), meta=item.get("meta"),
+                    urgent=bool(item.get("urgent")),
                 )
                 for item in part["items"]
             ],
@@ -1168,7 +1184,7 @@ async def read_share(request: Request, token: str) -> JSONResponse:
                     "empty_note": part["empty_note"],
                     "items": [
                         {"text": item["text"], "timestamp": item.get("timestamp"),
-                         "meta": item.get("meta")}
+                         "meta": item.get("meta"), "urgent": bool(item.get("urgent"))}
                         for item in part["items"]
                     ],
                 }
@@ -1228,48 +1244,6 @@ async def read_share_clip(request: Request, token: str, clip_id: int) -> Respons
 async def share_page(token: str) -> HTMLResponse:
     """最小只读分享页；令牌本身在接口里校验。"""
     return HTMLResponse(shares.render_page())
-
-
-@app.get("/api/terms", response_model=TermsPayload)
-async def list_terms(request: Request) -> TermsPayload:
-    """R-P1.5-9：当前团队热词表（手动 + 已确认成员姓名）。"""
-    team_id = request.state.team_id
-    items = [
-        TermItem(
-            id=item["id"], term=item["term"], note=item["note"] or "",
-            source=item["source"], updated_at=item["updated_at"],
-        )
-        for item in terms.collect_terms(database, team_id)
-    ]
-    return TermsPayload(items=items, prompt=terms.build_prompt(
-        [item.term for item in items], settings.term_prompt_max_chars,
-    ))
-
-
-@app.post("/api/terms", response_model=TermItem)
-async def create_term(request: Request, payload: TermCreate = Body(...)) -> TermItem:
-    """新增或更新一个热词（只影响转写质量；不改引文校验规则）。"""
-    team_id = request.state.team_id
-    term = terms.normalize_term(payload.term)
-    if not term:
-        raise APIError(422, "invalid_args", "热词不能为空")
-    if len(term) > terms.MAX_TERM_CHARS:
-        raise APIError(422, "invalid_args", "热词最长 {} 个字".format(terms.MAX_TERM_CHARS))
-    term_id = database.upsert_term(team_id, term, str(payload.note or "").strip())
-    row = next(
-        (item for item in database.list_terms(team_id) if item["id"] == term_id), None,
-    )
-    return TermItem(
-        id=term_id, term=term, note=(row or {}).get("note") or "",
-        source="manual", updated_at=(row or {}).get("updated_at"),
-    )
-
-
-@app.delete("/api/terms/{term_id}")
-async def delete_term(request: Request, term_id: int) -> dict:
-    if not database.delete_term(request.state.team_id, term_id):
-        raise APIError(404, "not_found", "热词不存在")
-    return {"status": "ok"}
 
 
 @app.get("/api/meetings/{meeting_id}/deliverables", response_model=DeliverablesReport)

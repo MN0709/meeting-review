@@ -184,14 +184,15 @@ def test_share_transcript_and_tasks_only_when_selected(isolated_database) -> Non
     assert "transcript" not in tasks_body
 
 
-def test_share_image_minutes_parts_are_four_and_ordered(isolated_database) -> None:
+def test_share_image_minutes_parts_are_merged_and_ordered(isolated_database) -> None:
     database = isolated_database
     _seed(database, _team_id(database))
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
         token = _create(client, ["image_minutes"]).json()["token"]
     with TestClient(main_module.app) as client:
         body = client.get("/api/shares/{}".format(token)).json()
-    assert [part["key"] for part in body["image_minutes"]] == ["core", "urgent", "todo", "mine"]
+    # R-P2-8：紧急并入待办；未识别到「我」时「我答应的任务」整块隐藏。
+    assert [part["key"] for part in body["image_minutes"]] == ["core", "todo", "decisions"]
 
 
 def test_share_voice_lists_clips_and_serves_audio(isolated_database) -> None:
@@ -367,7 +368,7 @@ def test_other_api_still_requires_token(isolated_database) -> None:
     """分享只是受限出口：其它 /api/* 仍然必须带团队口令。"""
     with TestClient(main_module.app) as client:
         assert client.get("/api/meetings").status_code == 403
-        assert client.get("/api/terms").status_code == 403
+        assert client.get("/api/projects").status_code == 403
         assert client.get("/api/meetings/{}/deliverables".format(MEETING)).status_code == 403
 
 

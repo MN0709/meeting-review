@@ -1,12 +1,12 @@
-# 会脉 · 团队会议记忆
+# 会脉 · 我的会议记忆
 
 > 当前 10 天产品化迭代的状态、风险和每日验收入口见 [PROJECT_CONTROL.md](PROJECT_CONTROL.md)，详细路线见 [docs/ROADMAP_10_DAYS.md](docs/ROADMAP_10_DAYS.md)。
 
-`meeting-review` 面向需要沉淀连续内部会议的团队，不限定团队职能、固定成员或参会人数。服务在本机完成转写、说话人分离与声纹匹配，再生成带原话证据的团队报告。用户首次把“说话人 1”确认为真实姓名并授权保存声纹后，后续会议会自动尝试识别；低置信度或多个候选过于接近时必须回退为“待确认”。
+`meeting-review` 是**个人会议记忆**工具：一个人可以同时在多个项目里开会、一天多场；把录音丢进来，服务在本机完成转写、说话人分离与声纹匹配，再生成带原话证据的报告。用户首次把“说话人 1”确认为真实姓名并授权保存声纹后，后续会议会自动尝试识别；低置信度或多个候选过于接近时必须回退为“待确认”。
 
-页面使用团队口令登录。口令保存在浏览器 `localStorage`，全部业务请求通过 `X-Access-Token` 发送，不使用 Cookie。上传后页面每 2 秒查询任务状态；会议完成后也可从团队历史页重新打开报告。
+**默认个人模式（R-P2-1）**：打开即用，不需要口令。服务只监听 `127.0.0.1`，启动日志会提示「个人模式，无鉴权，请勿暴露公网」。若要在本机多人使用或对外暴露，把 `.env` 的 `AUTH_ENABLED` 改成 `true` 并配置 `TEAM_TOKENS` 恢复口令校验（回归测试已覆盖）。上传后页面每 2 秒查询任务状态；会议完成后可从历史页重新打开报告。
 
-## 页面与团队报告
+## 页面与报告
 
 - 上传：可填写会议标题，支持 MP3/M4A/WAV，默认最大 300 MB、4 小时；2-4 小时录音建议使用 M4A/MP3。**必须先勾选同意**（「我已知晓：音频将上传至本服务用于本次转写，其中包含他人声音」）才能开始；未勾选时前端按钮禁用，绕过前端直接调接口返回 422 且不建会议、不入队、不留临时文件（R-P1.5-6）。同意后写入 `consent_records` 留证：协议版本号（`CONSENT_VERSION`，默认 `v1`）+ 同意时间 + 来源 IP；改文案升版本时旧记录不被覆盖。
 - 会后整理：报告生成后自动打开“整理本次会议”，用户可确认/编辑 AI 建议标题，并根据原话片段确认说话人；允许稍后处理。**若标题仍是“未命名会议”（用户从未填写或修改），报告生成后会自动采用 AI 建议标题（D-027）；用户自己填过或改过的标题不会被覆盖。**
@@ -21,14 +21,13 @@
 - 项目连续回顾：选择项目后聚合最近 3 场已完成会议的决策、行动项和遗留问题；每项标明来源会议，行动项可人工设置状态。
 - 说话人确认：报告中展示本场说话人、可点击回听的代表片段、时长、自动匹配置信度和状态。同一声音被过度切成多个标签时会先尝试合并（阈值 `SPEAKER_INTRA_MERGE_THRESHOLD`，默认 0.85），**但两个簇各自命中不同的已知成员时一律不合并**（身份优先于相似度，2026-09-21 真实录音校准后新增），最终身份仍由用户确认。
 - 声音授权：不再要求每位说话人分别勾选同意；点击“完成整理”时统一显示参会者名单并确认授权。
-- 团队声纹身份库：身份跨项目共享；姓名、角色和“关键决策人”由用户维护，声纹可单独删除。
-- 报告：①会议总览；②会议要点；③决策清单；④行动项；**④-2 我答应的任务（R-P1.5-5）**；⑤遗留问题；⑥说话人确认；⑦识别状态。点击引文时间戳可在**右侧逐字稿侧栏**定位高亮，也可点「看上下文」展开带说话人标签的转写上下文。**决策、行动项、遗留问题都带原话证据（D-028）：引文旁标「原话」，点「看上下文」展开原文核对；旧报告无行动项原话时明确显示「无法核对」，不伪造。**
+- 声纹身份库：姓名、角色和“关键决策人”由用户维护，声纹可单独删除。（R-P2-4 会把声纹库按项目隔离，见 M2。）
+- 报告（R-P2-7 瘦身后）：交付物状态（顶部）、① 会议总览、② 会议要点、**我答应的任务**、**③ 关键结论**、说话人确认、逐字稿侧栏、图片纪要。其中「③ 关键结论」内部合并三小组——**决策 / 行动项 / 待跟进**，每组为空时显示明确空态。⑦ 识别状态、⑧ 本次会议成本、⑨ Agent 步骤**默认从界面移除**（接口保留，`DEBUG_PANELS_ENABLED=true` 时才显示）。点击引文时间戳可在**右侧逐字稿侧栏**定位高亮，也可点「看上下文」展开带说话人标签的转写上下文。**决策、行动项、遗留问题都带原话证据（D-028）：引文旁标「原话」，点「看上下文」展开原文核对；旧报告无行动项原话时明确显示「无法核对」，不伪造。**
 - 逐项勾选分享（R-P1.5-3）：报告页右上「分享」→ 勾选要外发的内容（图片纪要 / 精简纪要 / 逐字稿 / 代表语音片段 / 任务单，**默认全不勾**）→ 生成只读链接。**未勾选的字段后端根本不会出现在响应里**（不是前端隐藏）；链接**固定 3 天有效**（`SHARE_TTL_HOURS=72`）、可随时撤销、每次访问写 `share_audit`（令牌哈希 / 时间 / IP / 结果码）。数据库**只存令牌的 sha256 哈希**（原文只在创建时返回一次），因此链接列表用 `share_id` 撤销。分享读取是独立受限出口：只有 `GET /api/shares/**` 免团队口令，其余 `/api/*` 仍然必须鉴权；分享页（`/s/{token}`）不复用团队单页，也看不到团队成员身份库、其它会议与成本数据。代表语音走 `/api/shares/{token}/clips/{id}`，**未勾选语音时读片段返回 403**。分享页会明确标注有效期与「完整录音已删除，仅含代表性片段」。
 - AI 项目建议（R-P1.5-8）：**未归类**会议的报告顶部会出现一张带「**AI 建议**」角标的卡片，给出建议归入的已有项目（优先复用，不编造）或建议的新项目名，并附一句依据。三个动作都由人决定：**加入该项目 / 新建「建议名」并加入 / 用新名字新建并加入 / 不加入**；选「不加入」保持未分类、清除建议、**不留副作用**。**AI 永不自动移动会议**（有专门测试断言）；建议里出现团队不存在的项目 id 时**整条丢弃**；旧报告没有该字段时界面不显示卡片。团队还没有项目时不传项目列表，分析调用与之前完全一致。
 - 交付物状态与「待核对」（R-P1.5-7）：报告页顶部有「交付物状态」条——**逐字稿 / 文字报告 / 任务单 / 图片纪要+PDF** 各自独立成/败。某一项失败只标那一项「待核对」并给出「重试」按钮，**其它交付物照常可看**；重试只重跑失败的那一项（图片纪要与任务单的重试**不调用 AI**；文字报告的重试会调用 AI，界面先弹确认框）。转写需要原始录音、而录音已按隐私策略删除，因此不可重试，会明确提示重新上传。升级前创建的旧会议没有状态记录，会按「有逐字稿/有报告」推断为正常，不显示成「待生成」。
-- 图片纪要（R-P1.5-1）：报告底部「⑩ 图片纪要」把会议渲染成**四板块卡片长图**——① 这次会议的核心（总览 + 要点 + 带时间戳的关键决策）、② 紧急事项（会上明确要求「尽快 / 今天就 / 上线前」处理的事项，带原话时间戳）、③ 待办（未完成的行动项）、④ 我答应的任务；带时间戳的条目点击可跳到右侧逐字稿。点「导出 PDF」得到可外发的 PDF（HTML → PDF；渲染器优先 Playwright，缺失时自动回退本机 Chrome，都不通时返回 503 并把该交付物标「待核对」，不影响文字报告与逐字稿）。版式模板在 `app/deliverables/templates/card_v1.html`，与数据分离。
-- 术语热词表（R-P1.5-9）：「项目」页底部可维护团队热词（人名 / 术语），转写时作为 `initial_prompt` 注入以提高专名准确率。**已确认的成员姓名自动生效**（不落表，改名后自动跟随，界面标注来源且不可删）。热词**只影响转写**，不改变引文校验规则（引文仍必须是转写原文的完整一致子串）；`TEAM_TERMS_ENABLED=false` 或词表为空时，转写仍走**单参数调用**，行为与未引入热词时逐字节一致；提示长度上限 `TERM_PROMPT_MAX_CHARS`（默认 200 字）。实测：同一段真实音频对拍，热词写成「胡董」后 `古董` 10 次 → 0 次、`胡董` 0 → 10 次；但热词写成发音不符的「胡泊」时无效果（只对发音对得上的词起作用）。
-- 我答应的任务（R-P1.5-5）：在「整理本次会议」里选「本场哪个说话人是我」（可选已命名成员，也可选未命名说话人），报告「④-2」就只列**负责人完全等于你**的行动项。**未指定时一律显示「未指定你自己」，绝不推断**；同时提示本场有多少条负责人为「未明确」、无法归属到任何人。
+- 图片纪要（R-P1.5-1 / R-P2-8）：报告底部「图片纪要」把会议渲染成**卡片长图**——① 这次会议的核心（总览 + 要点）、② 待办（**含紧急**：紧急条目带「紧急」标签并排在最前）、③ 我答应的任务（**未识别到你时整块隐藏**）、④ 关键决策（带时间戳，可回到原话）。**同一内容不会重复出现在两个板块**。带时间戳的条目点击可跳到右侧逐字稿。点「导出 PDF」得到可外发的 PDF（HTML → PDF；渲染器优先 Playwright，缺失时自动回退本机 Chrome，都不通时返回 503 并把该交付物标「待核对」，不影响文字报告与逐字稿）。版式模板在 `app/deliverables/templates/card_v1.html`，与数据分离。
+- 我答应的任务（R-P1.5-5，M3 将接入本人声纹）：在「整理本次会议」里选「本场哪个说话人是我」（可选已命名成员，也可选未命名说话人），报告就只列**负责人完全等于你**的行动项。**未识别/未指定时显示「本场未识别到你（不猜测）」，绝不推断**；同时提示本场有多少条负责人为「未明确」、无法归属到任何人。
 
 旧的个人表现模型仍在 `models.py` 中标记为 legacy，以保留已有代码契约与测试；团队 UI 不呈现个人评分、口头禅或个人表现模块。
 
@@ -37,7 +36,7 @@
 ```text
 meeting-review/
 ├── app/
-│   ├── config.py          # TEAM_TOKENS、长会限制和服务配置
+│   ├── config.py          # 个人模式开关、长会限制和服务配置
 │   ├── db.py              # SQLite 建表、团队同步和持久化查询
 │   ├── llm.py             # 团队/legacy 分块分析、校验与降级
 │   ├── main.py            # FastAPI、团队鉴权、上传和历史接口
@@ -48,7 +47,7 @@ meeting-review/
 │   ├── stats.py           # legacy 个人精确统计
 │   ├── tasks.py           # 单 worker FIFO 队列、超时与清理
 │   └── transcription.py   # PyAV 预检和 faster-whisper 转写
-├── static/index.html      # 登录、上传、进度、历史和团队报告
+├── static/index.html      # 上传、进度、历史和报告（单文件）
 ├── tests/                 # 无真实 Whisper/LLM 依赖的单元测试
 ├── .env.example
 ├── Dockerfile
@@ -119,8 +118,8 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# 编辑 .env：填写 TEAM_TOKENS 和 OPENAI_API_KEY
-# TEAM_TOKENS 的口令有强度要求（启动时校验，不合规会直接拒绝启动）：
+# 编辑 .env：填写 OPENAI_API_KEY 即可（个人模式默认无需口令）。
+# 进阶模式（本机多人 / 对外暴露）：AUTH_ENABLED=true，并填 TEAM_TOKENS，口令有强度要求：
 #   · 长度 ≥ 16 位
 #   · 不能是纯数字，也不能是纯英文
 #   生成示例：python3 -c "import secrets;print('mr-'+secrets.token_urlsafe(16))"
@@ -149,11 +148,11 @@ pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8000"
 | 事项 | 位置 / 做法 |
 | --- | --- |
 | 数据库（会议、报告、交付物状态、热词、同意留证、分享链接） | `data/meeting-review.db` |
-| 备份（说话人过度合并缺陷修复前的整库快照） | `data/meeting-review.db.bak-20260921-152829` |
-| 恢复备份 | 先停服务，再 `cp data/meeting-review.db.bak-20260921-152829 data/meeting-review.db` |
+| 备份（最近一次：M1 改动前的整库快照） | `data/meeting-review.db.bak-20260922-014714`（更早：`...bak-20260921-152829`） |
+| 恢复备份 | 先停服务，再 `cp data/meeting-review.db.bak-20260922-014714 data/meeting-review.db` |
 | 运行日志 | `/tmp/meeting-review.log`（出问题时先看这里的最后几行） |
 | 上传的原始录音 | **转写完成后即删除**（由隐私策略决定，不保留） |
-| 团队口令 / API Key | 只写在 `.env`（已被 `.gitignore` 排除，不会进仓库） |
+| 口令（仅进阶模式）/ API Key | 只写在 `.env`（已被 `.gitignore` 排除，不会进仓库） |
 
 > 分享链接默认按请求地址生成（本机就是 `127.0.0.1:8000`）。要给**别人**打开，需要先做内网穿透或公网地址，再把 `.env` 里的 `SHARE_BASE_URL` 填成那个地址。
 
@@ -167,7 +166,7 @@ curl http://127.0.0.1:8000/health
 ## API
 
 - `GET /health`：免鉴权健康检查。
-- `GET /api/auth/check`：校验团队口令并返回团队 ID，错误为 403。
+- `GET /api/auth/check`：返回当前工作区与开关：`{status, team_id, workspace, auth_enabled, debug_panels}`。个人模式（`AUTH_ENABLED=false`）恒返回个人工作区；`AUTH_ENABLED=true` 时仍校验口令，错误为 403。
 - `GET /api/agent/tools`：Agent 工具调试端点，枚举注册的 12 个工具（8 只读 + 1 规划 + 3 能力），并导出动态系统提示词。**默认关闭**：`AGENT_MODE=pipeline` 时该路由不存在（404）；仅 `shadow`/`agent` 模式且 team 内可访问。
 - `GET /api/usage`：按 `stage` / 会议聚合 LLM 用量与估算成本，严格限定在本团队内。
   参数：`meeting_id?`、`project_id?`、`from?`、`to?`（ISO8601）；跨团队 403，非法日期 422，表为空返回空数组。
@@ -187,17 +186,16 @@ curl http://127.0.0.1:8000/health
 - `GET /api/tasks/{task_id}`：先查内存中的处理中或 30 分钟内终态任务；内存未命中时回落 SQLite（重启后仍可读）；跨团队访问返回 403。
 - `GET /api/meetings`：当前团队会议列表，可用 `project_id` 或 `unclassified=true` 过滤；一级目录查询可传 `include_children=true` 汇总二级目录。
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
-- `POST /api/meetings/{id}/image-minutes`：**生成图片纪要四板块（R-P1.5-1）**。幂等、只读渲染，不写任何业务数据；返回 `{meeting_id, title, meta, parts:[{key,title,subtitle,items,empty_note}]}`，`key` 固定为 `core/urgent/todo/mine`。无报告 404，跨团队 403。
+- `POST /api/meetings/{id}/image-minutes`：**生成图片纪要（R-P1.5-1 / R-P2-8）**。幂等、只读渲染，不写任何业务数据；返回 `{meeting_id, title, meta, parts:[{key,title,subtitle,items,empty_note}]}`，`key` ∈ `core/todo/mine/decisions`（**紧急已并入待办**，条目带 `urgent=true`；未识别到「我」时不返回 `mine`）。无报告 404，跨工作区 403。
 - `GET /api/meetings/{id}/image-minutes.pdf`：**导出图片纪要 PDF**。响应 `application/pdf` + 中文文件名（RFC 5987）；渲染器不可用时返回 503 `renderer_unavailable`（可读中文原因），其它交付物不受影响。
 - `POST /api/meetings/{id}/share`：**生成分享链接（R-P1.5-3）**。`{scopes:[...]}`，`scopes` ∈ `image_minutes/report/transcript/voice/tasks`；返回一次性可见的 `token` 与 `url`；空勾选或未知项 422、无报告 404、无口令 403。
 - `GET /api/meetings/{id}/shares`：列出本场链接（`share_id` / 勾选范围 / 有效期 / 是否生效 / 访问次数 / 令牌前缀；**不回显令牌原文**）。`DELETE /api/meetings/{id}/shares/{share_id 或 token}` 撤销，立即失效，重复撤销 404。
 - `GET /api/shares/{token}`：**免团队口令**读取分享内容；**只返回被勾选的键**；过期 410 `share_expired`、已撤销 410 `share_revoked`、不存在或篡改 404。`GET /api/shares/{token}/clips/{id}` 提供分享范围内的代表语音（未勾语音 403）。`GET /s/{token}` 是最小只读分享页。
 - `POST /api/meetings/{id}/suggested-project`：**处置 AI 项目建议（R-P1.5-8）**。`{action:"accept", project_id}` 归入指定项目；`{action:"rename", name}` 新建项目后归入；`{action:"dismiss"}` 保持未分类并清除建议。三者都要求人触发，**不存在自动移动**；未知 action 422、缺参 422、项目不存在 404、别人的项目/会议 403。
-- `GET /api/terms`：**术语热词表（R-P1.5-9）**。返回 `{items:[{id,term,note,source,updated_at}], prompt}`；`source` 为 `manual`（可删）或 `member`（来自已确认成员姓名，自动、不可删）。
-- `POST /api/terms`：新增/更新热词（`{term, note?}`）；空词或超过 40 字 → 422 `invalid_args`。`DELETE /api/terms/{id}`：删除手动词，未知 id 404；成员来源的词删不掉。
+- - **术语热词（R-P2-9）已删除**：`GET/POST /api/terms` 与 `DELETE /api/terms/{id}` 不再存在（404），`app/terms.py` 已移除，转写恢复为单参数调用。
 - `GET /api/meetings/{id}/deliverables`：**四类交付物状态（R-P1.5-7）**。返回 `{meeting_id, needs_review, items:[{kind,label,status,error_code,message,retryable,updated_at}]}`；`kind` ∈ `transcript/report/tasks/image_minutes`，`status` ∈ `pending/ok/failed/needs_review`。跨团队 403，会议不存在 404。
 - `POST /api/meetings/{id}/retry?kind=`：**按交付物重试，不重跑已成功的部分**。`image_minutes` 会真的再渲染一次 PDF；`tasks` 按现有报告重建；`report` 会**重新调用 AI**（失败写 `analysis_failed`）；`transcript` 返回 409 `not_retryable`；未知 kind 422。
-- `GET /api/meetings/{id}/agent-trace`：**只读**返回这场会议里 Agent 的每一步工具调用（会话 / 步 / 工具 / 判定 / 结果 / 耗时），按 `team_id` 隔离，跨团队 403。它是页面第 ⑨ 节「Agent 步骤（只读）」的数据源，也是 M1 的产品验收入口。
+- `GET /api/meetings/{id}/agent-trace`：**只读**返回这场会议里 Agent 的每一步工具调用（会话 / 步 / 工具 / 判定 / 结果 / 耗时），按 `team_id` 隔离，跨团队 403。R-P2-7 后**默认不在界面展示**（`DEBUG_PANELS_ENABLED=true` 时才显示），接口保留供排障。
 - `PATCH /api/meetings/{id}/title`：用户接受或编辑 AI 建议标题后更新会议标题；跨团队访问返回 403。
 - `PATCH /api/meetings/{id}/project`：经用户确认后移动到当前团队的另一文件夹，保留转写稿和报告。
 - `PATCH /api/action-items/{id}`：把行动项状态更新为待确认、进行中、已完成或已取消；跨团队访问返回 403。
@@ -214,7 +212,10 @@ curl http://127.0.0.1:8000/health
 
 | 变量 | 必需 | 默认值 | 用途 |
 |---|---:|---|---|
-| `TEAM_TOKENS` | **是** | 无 | `团队名:口令,团队名:口令`；启动时解析并 upsert 到 `teams`，本地也必须配置。**口令强度：≥ 16 位，且不能是纯数字或纯英文；不合规服务直接拒绝启动**（见 R-P0-3） |
+| `AUTH_ENABLED` | 否 | `false` | **R-P2-1**：个人模式（默认）免鉴权、打开即用；`true` 时恢复口令校验。默认只监听 `127.0.0.1`，**禁止暴露公网** |
+| `OWNER_NAME` | 否 | `我` | 个人工作区 / 本人展示名 |
+| `DEBUG_PANELS_ENABLED` | 否 | `false` | 报告页是否显示成本 / Agent 步骤（排障用）；默认不显示 |
+| `TEAM_TOKENS` | 否 | 空 | **改为可选**：仅 `AUTH_ENABLED=true` 时必填。`团队名:口令`；**口令强度：≥ 16 位，且不能是纯数字或纯英文；不合规服务拒绝启动**（R-P0-3） |
 | `OPENAI_API_KEY` | **是** | 无 | OpenAI 兼容 LLM 密钥 |
 | `OPENAI_BASE_URL` | 否 | SDK 默认 | 兼容服务 `/v1` 地址 |
 | `OPENAI_MODEL` | 否 | `gpt-4o-mini` | 分析模型 |
@@ -286,7 +287,7 @@ git clone <YOUR_REPOSITORY_URL> meeting-review
 cd meeting-review
 cp .env.example .env
 chmod 600 .env
-nano .env   # 填写 TEAM_TOKENS、OPENAI_API_KEY 等
+nano .env   # 个人模式填 OPENAI_API_KEY 即可；进阶模式再填 AUTH_ENABLED=true / TEAM_TOKENS
 sudo docker compose up -d --build
 sudo docker compose ps
 sudo docker compose logs -f meeting-review

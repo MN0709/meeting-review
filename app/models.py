@@ -256,10 +256,12 @@ class ImageMinutesItem(StrictModel):
     text: str = Field(min_length=1)
     timestamp: Optional[str] = None
     meta: Optional[str] = None
+    # R-P2-8 ②：紧急事项并入待办后，用标签区分（不再是独立板块）。
+    urgent: bool = False
 
 
 class ImageMinutesPart(StrictModel):
-    key: Literal["core", "urgent", "todo", "mine"]
+    key: Literal["core", "todo", "mine", "decisions"]
     title: str
     subtitle: str
     items: List[ImageMinutesItem]
@@ -299,30 +301,6 @@ class RetryResult(StrictModel):
     kind: str
     status: str
     message: str
-
-
-# ---------------------------------------------------------------------------
-# 术语热词（R-P1.5-9，阶段 10-B）
-# ---------------------------------------------------------------------------
-
-
-class TermItem(StrictModel):
-    id: Optional[int] = None
-    term: str = Field(min_length=1)
-    note: str = ""
-    source: Literal["manual", "member"] = "manual"
-    updated_at: Optional[str] = None
-
-
-class TermCreate(StrictModel):
-    # 长度/空值由接口统一校验，保证错误结构是 {"error": {...}}（与其它新端点一致）
-    term: str = ""
-    note: str = ""
-
-
-class TermsPayload(StrictModel):
-    items: List[TermItem]
-    prompt: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

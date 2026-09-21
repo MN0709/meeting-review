@@ -88,58 +88,90 @@ def _seed(database: Database, team_id: int, *, with_urgent: bool = True, owners=
 
 def test_parts_have_fixed_order_and_titles() -> None:
     parts = build_parts(report=report(), action_rows=ACTION_ROWS, self_name="胡泊")
-    assert [part["key"] for part in parts] == ["core", "urgent", "todo", "mine"]
+    assert [part["key"] for part in parts] == ["core", "todo", "mine", "decisions"]
     assert [part["title"] for part in parts] == [
-        "① 这次会议的核心是什么", "② 紧急事项是什么",
-        "③ 待办是什么", "④ 我答应的任务是什么",
+        "① 这次会议的核心", "② 待办（含紧急）",
+        "③ 我答应的任务", "④ 关键决策",
     ]
 
 
-def test_core_comes_from_overview_points_and_decisions() -> None:
+def test_core_is_overview_and_points_and_decisions_are_separate() -> None:
     parts = build_parts(report=report(), action_rows=ACTION_ROWS, self_name="胡泊")
-    texts = [item["text"] for item in parts[0]["items"]]
-    assert texts == [
+    core = next(part for part in parts if part["key"] == "core")
+    assert [item["text"] for item in core["items"]] == [
         "会议确认本周上线内测，并明确发布准备工作的负责人。",
         "确定本周上线内测",
         "发布清单周五前完成",
-        "本周上线内测",  # 关键决策（带时间戳，可回到原话）
     ]
-    assert parts[0]["items"][0].get("timestamp") is None
-    assert parts[0]["items"][3]["timestamp"] == "00:00:02"
+    decisions = next(part for part in parts if part["key"] == "decisions")
+    assert [item["text"] for item in decisions["items"]] == ["本周上线内测"]
+    assert decisions["items"][0]["timestamp"] == "00:00:02"
+    assert "决策人：胡泊" in decisions["items"][0]["meta"]
 
 
-def test_urgent_items_carry_quote_and_timestamp() -> None:
+def test_urgent_items_merged_into_todo_and_first() -> None:
     parts = build_parts(report=report(), action_rows=ACTION_ROWS, self_name="胡泊")
-    items = parts[1]["items"]
-    assert [item["text"] for item in items] == ["今天必须定稿"]
-    assert items[0]["timestamp"] == "00:00:10"
+    todo = next(part for part in parts if part["key"] == "todo")
+    assert [item["text"] for item in todo["items"]] == ["今天必须定稿", "准备发布清单"]
+    assert todo["items"][0]["urgent"] is True
+    assert todo["items"][0]["timestamp"] == "00:00:10"
+
+
+def test_urgent_matching_action_item_is_not_duplicated() -> None:
+    """R-P2-8 ③：同一内容（文本或同一引文）不得同时出现在两个板块。"""
+    payload = report(
+        action_items=[{
+            "task": "今天必须定稿", "owner": "胡泊", "deadline": "今天",
+            "evidence": {"quote": "今天必须定稿", "timestamp": "00:00:10"},
+        }],
+        urgent_items=[{
+            "content": "今天必须定稿",
+            "evidence": {"quote": "今天必须定稿", "timestamp": "00:00:10"},
+        }],
+    )
+    parts = build_parts(
+        report=payload,
+        action_rows=[{"item_index": 0, "status": "待确认"}],
+        self_name="胡泊",
+    )
+    todo = next(part for part in parts if part["key"] == "todo")
+    assert [item["text"] for item in todo["items"]] == ["今天必须定稿"]
+    assert todo["items"][0]["urgent"] is True
 
 
 def test_todo_excludes_finished_items() -> None:
     parts = build_parts(report=report(), action_rows=ACTION_ROWS, self_name="胡泊")
-    todo = [item["text"] for item in parts[2]["items"]]
-    assert todo == ["准备发布清单"]  # 「同步给客户」已完成，不算待办
-    assert "状态：待确认" in parts[2]["items"][0]["meta"]
+    todo = next(part for part in parts if part["key"] == "todo")
+    texts = [item["text"] for item in todo["items"]]
+    assert "同步给客户" not in texts  # 已完成，不算待办
+    assert "准备发布清单" in texts
+    prepared = next(item for item in todo["items"] if item["text"] == "准备发布清单")
+    assert "状态：待确认" in prepared["meta"]
 
 
-def test_mine_only_contains_my_own_tasks() -> None:
+def test_mine_only_contains_my_own_open_tasks() -> None:
     parts = build_parts(report=report(), action_rows=ACTION_ROWS, self_name="马宁")
     # 马宁自己的那条已完成 → 不在待办；胡泊的不属于马宁
-    assert parts[3]["items"] == []
-    assert parts[3]["empty_note"] == "本次没有未完成的待办。" or parts[3]["empty_note"] == "未指定你自己。"
+    mine = next(part for part in parts if part["key"] == "mine")
+    assert mine["items"] == []
+    assert mine["empty_note"] == "本场没有你负责的待办。"
 
 
-def test_mine_is_empty_and_explicit_when_self_unknown() -> None:
-    """红线 8：没指定「我」时不得推断。"""
+def test_mine_block_is_hidden_when_self_unknown() -> None:
+    """R-P2-8 ④ / R-P2-3 ⑤：未识别到「我」时整块隐藏，不显示占位。"""
     parts = build_parts(report=report(), action_rows=ACTION_ROWS, self_name=None)
-    assert parts[3]["items"] == []
-    assert parts[3]["empty_note"] == "未指定你自己。"
+    assert [part["key"] for part in parts] == ["core", "todo", "decisions"]
 
 
 def test_empty_parts_have_explicit_notes() -> None:
-    parts = build_parts(report=report(urgent_items=[]), action_rows=ACTION_ROWS, self_name="胡泊")
-    assert parts[1]["items"] == []
-    assert parts[1]["empty_note"] == "本次未识别到紧急事项。"
+    parts = build_parts(
+        report=report(urgent_items=[], action_items=[], decisions=[]), action_rows=[], self_name="胡泊",
+    )
+    todo = next(part for part in parts if part["key"] == "todo")
+    assert todo["items"] == []
+    assert todo["empty_note"] == "本次没有待办事项。"
+    decisions = next(part for part in parts if part["key"] == "decisions")
+    assert decisions["empty_note"] == "本次未识别到关键决策。"
 
 
 def test_no_invented_sentences() -> None:
@@ -163,9 +195,10 @@ def test_no_invented_sentences() -> None:
 def test_render_html_contains_four_cards_in_order() -> None:
     html_text = render_html(report=report(), action_rows=ACTION_ROWS, self_name="胡泊",
                             title="测试会议", meta="2026-09-21", footer="会脉")
-    order = [html_text.index("c-core"), html_text.index("c-urgent"),
-             html_text.index("c-todo"), html_text.index("c-mine")]
+    order = [html_text.index("c-core"), html_text.index("c-todo"),
+             html_text.index("c-mine"), html_text.index("c-decisions")]
     assert order == sorted(order)
+    assert "紧急" in html_text
 
 
 def test_render_html_escapes_dangerous_text() -> None:
@@ -176,9 +209,11 @@ def test_render_html_escapes_dangerous_text() -> None:
 
 
 def test_render_html_shows_empty_notes() -> None:
-    html_text = render_html(report=report(urgent_items=[]), action_rows=[], self_name=None)
-    assert "本次未识别到紧急事项。" in html_text
-    assert "未指定你自己。" in html_text
+    html_text = render_html(
+        report=report(urgent_items=[], action_items=[], decisions=[]), action_rows=[], self_name=None,
+    )
+    assert "本次没有待办事项。" in html_text
+    assert "本次未识别到关键决策。" in html_text
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +221,7 @@ def test_render_html_shows_empty_notes() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_image_minutes_endpoint_returns_four_parts(isolated_database) -> None:
+def test_image_minutes_endpoint_returns_parts(isolated_database) -> None:
     team_id = _team_id(isolated_database)
     _seed(isolated_database, team_id)
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
@@ -195,9 +230,11 @@ def test_image_minutes_endpoint_returns_four_parts(isolated_database) -> None:
     body = response.json()
     assert body["meeting_id"] == MEETING
     assert body["title"] == "周会"
-    assert [part["key"] for part in body["parts"]] == ["core", "urgent", "todo", "mine"]
-    assert body["parts"][1]["items"][0]["timestamp"] == "00:00:10"
-    assert "未指定你自己" in body["meta"]
+    # 未指定「我」→ 整块隐藏；紧急事项并入待办
+    assert [part["key"] for part in body["parts"]] == ["core", "todo", "decisions"]
+    todo = next(part for part in body["parts"] if part["key"] == "todo")
+    assert todo["items"][0]["timestamp"] == "00:00:10"
+    assert "本场未识别到你" in body["meta"]
 
 
 def test_image_minutes_is_idempotent(isolated_database) -> None:
@@ -274,7 +311,7 @@ def test_pdf_endpoint_other_team_is_forbidden(isolated_database, monkeypatch) ->
 
 
 def test_old_meeting_report_without_urgent_items_still_works(isolated_database) -> None:
-    """旧报告没有 urgent_items 字段时，图片纪要仍可生成，该板块显示空态。"""
+    """旧报告没有 urgent_items 字段时，图片纪要仍可生成，且不出现「紧急」标签。"""
     team_id = _team_id(isolated_database)
     payload = report().model_dump()
     payload.pop("urgent_items", None)
@@ -282,8 +319,9 @@ def test_old_meeting_report_without_urgent_items_still_works(isolated_database) 
     isolated_database.save_report(MEETING, team_id, TeamMeetingReport.model_validate(payload))
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
         body = client.post("/api/meetings/{}/image-minutes".format(MEETING)).json()
-    assert body["parts"][1]["items"] == []
-    assert body["parts"][1]["empty_note"] == "本次未识别到紧急事项。"
+    assert [part["key"] for part in body["parts"]] == ["core", "todo", "decisions"]
+    todo = next(part for part in body["parts"] if part["key"] == "todo")
+    assert all(item.get("urgent") is not True for item in todo["items"])
 
 
 # --------------------------------------------------------------------------
