@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from app.agent.builtin_hooks import build_default_hooks
 from app.agent.goal import GoalJudge, build_goal_evaluator
@@ -47,12 +47,13 @@ from app.models import (
     ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
     DeliverableState, DeliverablesReport, RetryResult,
     TermCreate, TermItem, TermsPayload,
+    ShareCreate, ShareCreated, ShareLinkItem, ShareLinksPayload,
     SuggestedProjectAction,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
 from app.security import AdmissionController, AdmissionError, AdmissionReservation, SHANGHAI_TZ
-from app import terms
+from app import shares, terms
 from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
 from app.transcription import WhisperTranscriber, probe_audio_duration
 from app.speaker import KnownVoiceProfile, SpeakerRecognizer
@@ -317,12 +318,17 @@ async def request_context_and_gates(request: Request, call_next):
     request.state.request_id = request_id
     logger.info("request_started request_id=%s method=%s path=%s", request_id, request.method, request.url.path)
     if request.url.path.startswith("/api/"):
-        team_id = database.authenticate(request.headers.get("X-Access-Token", ""))
-        if team_id is None:
-            response = JSONResponse(status_code=403, content={"detail": "团队口令错误"})
-            response.headers["X-Request-ID"] = request_id
-            return response
-        request.state.team_id = team_id
+        # R-P1.5-3：分享读取是**独立的受限出口**，不带团队口令也能读；
+        # 但只有 GET /api/shares/... 这一条路径豁免，其它 /api/* 仍必须鉴权。
+        if _is_public_share_read(request.method, request.url.path):
+            request.state.team_id = None
+        else:
+            team_id = database.authenticate(request.headers.get("X-Access-Token", ""))
+            if team_id is None:
+                response = JSONResponse(status_code=403, content={"detail": "团队口令错误"})
+                response.headers["X-Request-ID"] = request_id
+                return response
+            request.state.team_id = team_id
 
     if request.method == "POST" and request.url.path == "/api/review":
         reservation: Optional[AdmissionReservation] = None
@@ -390,6 +396,13 @@ if settings.agent_mode != "pipeline":
                 for spec in agent_tool_registry.list_tools()
             ],
         }
+
+
+SHARE_READ_PREFIX = "/api/shares/"
+
+
+def _is_public_share_read(method: str, path: str) -> bool:
+    return method == "GET" and path.startswith(SHARE_READ_PREFIX)
 
 
 def _client_ip(request: Request) -> str:
@@ -1041,6 +1054,180 @@ async def resolve_suggested_project(
     if meeting is None:
         raise APIError(404, "not_found", "会议不存在")
     return meeting
+
+
+@app.post("/api/meetings/{meeting_id}/share", response_model=ShareCreated)
+async def create_share(
+    request: Request, meeting_id: str, payload: ShareCreate = Body(...),
+) -> ShareCreated:
+    """R-P1.5-3：按勾选生成分享链接（链接 3 天有效，可撤销）。"""
+    team_id = request.state.team_id
+    owner = database.owner_team_id(meeting_id)
+    if owner is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+    if database.get_history(meeting_id, team_id) is None:
+        raise APIError(404, "not_found", "这场会议还没有生成报告，暂时无法分享")
+    invalid = shares.invalid_scopes(payload.scopes)
+    if invalid:
+        raise APIError(422, "invalid_args", "未知的分享项：{}".format("、".join(invalid[:5])))
+    scopes = shares.normalize_scopes(payload.scopes)
+    if not scopes:
+        raise APIError(422, "invalid_args", "请至少勾选一项要分享的内容")
+
+    token = shares.new_token()
+    deadline = shares.expires_at(settings.share_ttl_hours)
+    supplied = request.headers.get("X-Access-Token", "")
+    database.create_share_link(
+        shares.token_hash(token), team_id, meeting_id, scopes, deadline,
+        created_by_token_hash=shares.token_hash(supplied) if supplied else None,
+    )
+    base = (settings.share_base_url or "").rstrip("/")
+    if not base:
+        base = "{}://{}".format(request.url.scheme, request.headers.get("host") or "127.0.0.1:8000")
+    return ShareCreated(
+        url="{}/s/{}".format(base, token), token=token, scopes=scopes, expires_at=deadline,
+    )
+
+
+@app.get("/api/meetings/{meeting_id}/shares", response_model=ShareLinksPayload)
+async def list_shares(request: Request, meeting_id: str) -> ShareLinksPayload:
+    """列出本场已生成的分享链接（只回显令牌前缀，不回显原文）。"""
+    team_id = request.state.team_id
+    owner = database.owner_team_id(meeting_id)
+    if owner is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+    items = []
+    for row in database.list_share_links(meeting_id, team_id):
+        revoked = row.get("revoked_at") is not None
+        items.append(ShareLinkItem(
+            share_id=int(row["share_id"]),
+            token_prefix=str(row["token_hash"])[:8], scopes=row["scopes"],
+            expires_at=row["expires_at"], created_at=row["created_at"],
+            revoked_at=row.get("revoked_at"), view_count=int(row.get("view_count") or 0),
+            active=not revoked and not shares.is_expired(row),
+        ))
+    return ShareLinksPayload(items=items)
+
+
+@app.delete("/api/meetings/{meeting_id}/shares/{token_or_id}")
+async def revoke_share(request: Request, meeting_id: str, token_or_id: str) -> dict:
+    """撤销分享链接（可传列表里的 share_id，或创建时拿到的令牌）；立即失效。
+
+    数据库只存令牌哈希，因此列表接口不回显原文——界面用 `share_id` 撤销。
+    """
+    team_id = request.state.team_id
+    owner = database.owner_team_id(meeting_id)
+    if owner is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+    if token_or_id.isdigit():
+        revoked = database.revoke_share_link_by_id(int(token_or_id), team_id)
+    else:
+        revoked = database.revoke_share_link(shares.token_hash(token_or_id), team_id)
+    if not revoked:
+        raise APIError(404, "not_found", "分享链接不存在或已撤销")
+    return {"status": "ok"}
+
+
+@app.get("/api/shares/{token}")
+async def read_share(request: Request, token: str) -> JSONResponse:
+    """分享读取：**无需团队口令**；只返回被勾选的内容；过期/撤销返回 410。"""
+    digest = shares.token_hash(token)
+    record = database.share_link(digest)
+    ip = _client_ip(request)
+    if record is None:
+        return JSONResponse(status_code=404, content={
+            "error": {"code": "not_found", "message": "分享链接不存在"}})
+    team_id, meeting_id = int(record["team_id"]), str(record["meeting_id"])
+    if record.get("revoked_at") is not None:
+        database.record_share_access(digest, team_id, meeting_id, "revoked", ip)
+        return JSONResponse(status_code=410, content={
+            "error": {"code": "share_revoked", "message": "这条分享链接已被作者撤销"}})
+    if shares.is_expired(record):
+        database.record_share_access(digest, team_id, meeting_id, "expired", ip)
+        return JSONResponse(status_code=410, content={
+            "error": {"code": "share_expired", "message": "这条分享链接已超过 3 天有效期"}})
+    history = database.get_history(meeting_id, team_id)
+    if history is None:
+        return JSONResponse(status_code=404, content={
+            "error": {"code": "not_found", "message": "会议内容已不可用"}})
+
+    image_payload = None
+    if shares.SCOPE_IMAGE_MINUTES in (record.get("scopes") or []):
+        action_rows = database.list_meeting_action_items(meeting_id, team_id)
+        current = database.self_speaker(meeting_id, team_id)
+        image_payload = {
+            "parts": [
+                {
+                    "key": part["key"], "title": part["title"], "subtitle": part["subtitle"],
+                    "empty_note": part["empty_note"],
+                    "items": [
+                        {"text": item["text"], "timestamp": item.get("timestamp"),
+                         "meta": item.get("meta")}
+                        for item in part["items"]
+                    ],
+                }
+                for part in build_parts(
+                    report=history.report, action_rows=action_rows,
+                    self_name=(current or {}).get("self_name"),
+                )
+            ],
+        }
+    clips = []
+    if shares.SCOPE_VOICE in (record.get("scopes") or []):
+        for speaker in history.speakers:
+            for clip in speaker.clips:
+                clips.append({
+                    "id": clip.id, "speaker_label": speaker.display_name,
+                    "start": clip.start, "end": clip.end,
+                    "timestamp": format_timestamp(clip.start), "text": clip.text,
+                })
+    payload = shares.build_payload(
+        record=record, history=history, image_minutes=image_payload, my_tasks=None, clips=clips,
+    )
+    database.count_share_view(digest)
+    database.record_share_access(digest, team_id, meeting_id, "ok", ip)
+    return JSONResponse(
+        content=payload,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@app.get("/api/shares/{token}/clips/{clip_id}")
+async def read_share_clip(request: Request, token: str, clip_id: int) -> Response:
+    """分享范围内的代表语音片段；**必须该链接勾选了「代表语音」**，且片段属于被分享的会议。"""
+    digest = shares.token_hash(token)
+    record = database.share_link(digest)
+    if record is None or record.get("revoked_at") is not None or shares.is_expired(record):
+        raise APIError(404, "not_found", "分享链接不可用")
+    if shares.SCOPE_VOICE not in (record.get("scopes") or []):
+        raise APIError(403, "team_forbidden", "这条分享链接没有包含语音片段")
+    team_id, meeting_id = int(record["team_id"]), str(record["meeting_id"])
+    history = database.get_history(meeting_id, team_id)
+    allowed = {
+        clip.id
+        for speaker in (history.speakers if history else [])
+        for clip in speaker.clips
+    }
+    if clip_id not in allowed:
+        raise APIError(404, "not_found", "语音片段不存在")
+    result = database.speaker_clip(clip_id, team_id)
+    if result is None:
+        raise APIError(404, "not_found", "语音片段不存在")
+    mime_type, audio = result
+    return Response(content=audio, media_type=mime_type,
+                    headers={"Cache-Control": "private, max-age=600"})
+
+
+@app.get("/s/{token}", include_in_schema=False)
+async def share_page(token: str) -> HTMLResponse:
+    """最小只读分享页；令牌本身在接口里校验。"""
+    return HTMLResponse(shares.render_page())
 
 
 @app.get("/api/terms", response_model=TermsPayload)

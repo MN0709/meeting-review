@@ -325,6 +325,37 @@ class TermsPayload(StrictModel):
     prompt: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# 分享（R-P1.5-3，阶段 11／M4）
+# ---------------------------------------------------------------------------
+
+
+class ShareCreate(StrictModel):
+    scopes: List[str] = Field(default_factory=list)
+
+
+class ShareCreated(StrictModel):
+    url: str
+    token: str
+    scopes: List[str]
+    expires_at: str
+
+
+class ShareLinkItem(StrictModel):
+    share_id: int
+    token_prefix: str
+    scopes: List[str]
+    expires_at: str
+    created_at: str
+    revoked_at: Optional[str] = None
+    view_count: int = Field(ge=0, default=0)
+    active: bool = True
+
+
+class ShareLinksPayload(StrictModel):
+    items: List[ShareLinkItem]
+
+
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
     transcript: List[TranscriptSegment]

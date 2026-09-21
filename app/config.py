@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     )
     # 上传同意协议版本（R-P1.5-6）。文案变更时递增，旧记录不被覆盖。
     consent_version: str = Field(default="v1", alias="CONSENT_VERSION")
+    # 分享链接（R-P1.5-3）：固定 3 天有效；SHARE_BASE_URL 用于内网穿透/公网地址。
+    share_ttl_hours: int = Field(default=72, gt=0, alias="SHARE_TTL_HOURS")
+    share_base_url: Optional[str] = Field(default=None, alias="SHARE_BASE_URL")
     # 术语热词注入（R-P1.5-9）。关闭后转写调用与未引入热词时完全一致。
     team_terms_enabled: bool = Field(default=True, alias="TEAM_TERMS_ENABLED")
     term_prompt_max_chars: int = Field(default=200, gt=0, alias="TERM_PROMPT_MAX_CHARS")

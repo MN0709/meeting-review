@@ -260,6 +260,29 @@ class Database:
                     duration_ms INTEGER NULL,
                     created_at TEXT NOT NULL
                 );
+                -- R-P1.5-3（阶段 11／M4）：分享链接与访问审计。只存令牌哈希。
+                CREATE TABLE IF NOT EXISTS share_links(
+                    token_hash TEXT PRIMARY KEY,
+                    team_id INTEGER NOT NULL,
+                    meeting_id TEXT NOT NULL,
+                    scopes_json TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    created_by_token_hash TEXT NULL,
+                    revoked_at TEXT NULL,
+                    view_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_share_links_meeting
+                    ON share_links(meeting_id, team_id);
+                CREATE TABLE IF NOT EXISTS share_audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    share_token_hash TEXT NOT NULL,
+                    team_id INTEGER NOT NULL,
+                    meeting_id TEXT NOT NULL,
+                    accessed_at TEXT NOT NULL,
+                    ip TEXT NULL,
+                    result_code TEXT NOT NULL
+                );
                 -- R-P1.5-9（阶段 10-B）：团队术语热词表。
                 CREATE TABLE IF NOT EXISTS team_terms(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -630,6 +653,12 @@ class Database:
                 "DELETE FROM consent_records WHERE meeting_id=? AND team_id=?",
                 (meeting_id, team_id),
             )
+            connection.execute(
+                "DELETE FROM share_links WHERE meeting_id=? AND team_id=?", (meeting_id, team_id),
+            )
+            connection.execute(
+                "DELETE FROM share_audit WHERE meeting_id=? AND team_id=?", (meeting_id, team_id),
+            )
             connection.execute("DELETE FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id))
 
     def update_status(self, meeting_id: str, team_id: int, status: str) -> None:
@@ -839,6 +868,100 @@ class Database:
                 """SELECT id,term,note,updated_at FROM team_terms
                    WHERE team_id=? ORDER BY term""",
                 (team_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # R-P1.5-3（阶段 11／M4）：分享链接与访问审计。
+    # 表里只存令牌哈希；原文仅在创建时返回一次。
+    # ------------------------------------------------------------------
+
+    def create_share_link(
+        self, token_hash: str, team_id: int, meeting_id: str, scopes: List[str],
+        expires_at: str, created_by_token_hash: Optional[str] = None,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO share_links(
+                       token_hash,team_id,meeting_id,scopes_json,expires_at,created_at,
+                       created_by_token_hash,revoked_at,view_count)
+                   VALUES(?,?,?,?,?,?,?,NULL,0)""",
+                (token_hash, team_id, meeting_id, json.dumps(list(scopes), ensure_ascii=False),
+                 expires_at, _utc_now(), created_by_token_hash),
+            )
+
+    def share_link(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT token_hash,team_id,meeting_id,scopes_json,expires_at,created_at,
+                          revoked_at,view_count
+                   FROM share_links WHERE token_hash=?""",
+                (token_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["scopes"] = json.loads(item.pop("scopes_json"))
+        return item
+
+    def list_share_links(self, meeting_id: str, team_id: int) -> List[Dict[str, Any]]:
+        """列表带 `share_id`（SQLite rowid），用于撤销——数据库里没有令牌原文，无法回显。"""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT rowid AS share_id, token_hash, scopes_json, expires_at, created_at,
+                          revoked_at, view_count
+                   FROM share_links WHERE meeting_id=? AND team_id=? ORDER BY created_at DESC""",
+                (meeting_id, team_id),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["scopes"] = json.loads(item.pop("scopes_json"))
+            items.append(item)
+        return items
+
+    def revoke_share_link(self, token_hash: str, team_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE share_links SET revoked_at=?
+                   WHERE token_hash=? AND team_id=? AND revoked_at IS NULL""",
+                (_utc_now(), token_hash, team_id),
+            )
+            return cursor.rowcount > 0
+
+    def revoke_share_link_by_id(self, share_id: int, team_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE share_links SET revoked_at=?
+                   WHERE rowid=? AND team_id=? AND revoked_at IS NULL""",
+                (_utc_now(), int(share_id), team_id),
+            )
+            return cursor.rowcount > 0
+
+    def count_share_view(self, token_hash: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE share_links SET view_count=view_count+1 WHERE token_hash=?", (token_hash,),
+            )
+
+    def record_share_access(
+        self, token_hash: str, team_id: int, meeting_id: str, result_code: str,
+        ip: Optional[str] = None,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO share_audit(
+                       share_token_hash,team_id,meeting_id,accessed_at,ip,result_code)
+                   VALUES(?,?,?,?,?,?)""",
+                (token_hash, team_id, meeting_id, _utc_now(), ip, result_code),
+            )
+
+    def share_audit_rows(self, meeting_id: str, team_id: int) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT share_token_hash,accessed_at,ip,result_code FROM share_audit
+                   WHERE meeting_id=? AND team_id=? ORDER BY id""",
+                (meeting_id, team_id),
             ).fetchall()
         return [dict(row) for row in rows]
 
