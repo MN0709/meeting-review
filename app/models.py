@@ -284,6 +284,30 @@ class RetryResult(StrictModel):
     message: str
 
 
+# ---------------------------------------------------------------------------
+# 术语热词（R-P1.5-9，阶段 10-B）
+# ---------------------------------------------------------------------------
+
+
+class TermItem(StrictModel):
+    id: Optional[int] = None
+    term: str = Field(min_length=1)
+    note: str = ""
+    source: Literal["manual", "member"] = "manual"
+    updated_at: Optional[str] = None
+
+
+class TermCreate(StrictModel):
+    # 长度/空值由接口统一校验，保证错误结构是 {"error": {...}}（与其它新端点一致）
+    term: str = ""
+    note: str = ""
+
+
+class TermsPayload(StrictModel):
+    items: List[TermItem]
+    prompt: Optional[str] = None
+
+
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
     transcript: List[TranscriptSegment]

@@ -60,16 +60,17 @@ class WhisperTranscriber:
                     )
         return self._model
 
-    def transcribe(self, audio_path: Path) -> Transcript:
+    def transcribe(self, audio_path: Path, initial_prompt: Optional[str] = None) -> Transcript:
         model = self._get_model()
         metadata_duration = probe_audio_duration(audio_path)
         if metadata_duration is not None and metadata_duration > LONG_AUDIO_CHUNK_SECONDS:
-            return self._transcribe_long_audio(model, audio_path, metadata_duration)
+            return self._transcribe_long_audio(model, audio_path, metadata_duration, initial_prompt)
         raw_segments, info = model.transcribe(
             str(audio_path),
             language="zh",
             vad_filter=True,
             beam_size=5,
+            initial_prompt=initial_prompt,
         )
         segments = [
             TranscriptSegment(start=item.start, end=item.end, text=item.text.strip())
@@ -115,6 +116,7 @@ class WhisperTranscriber:
 
     def _transcribe_long_audio(
         self, model: Any, audio_path: Path, metadata_duration: float,
+        initial_prompt: Optional[str] = None,
     ) -> Transcript:
         segments: list[TranscriptSegment] = []
         offset = 0.0
@@ -127,6 +129,7 @@ class WhisperTranscriber:
                 language="zh",
                 vad_filter=True,
                 beam_size=5,
+                initial_prompt=initial_prompt,
             )
             language = str(getattr(info, "language", language) or language)
             chunk_duration = len(audio) / WHISPER_SAMPLE_RATE

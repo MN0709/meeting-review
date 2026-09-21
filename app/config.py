@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     )
     # 上传同意协议版本（R-P1.5-6）。文案变更时递增，旧记录不被覆盖。
     consent_version: str = Field(default="v1", alias="CONSENT_VERSION")
+    # 术语热词注入（R-P1.5-9）。关闭后转写调用与未引入热词时完全一致。
+    team_terms_enabled: bool = Field(default=True, alias="TEAM_TERMS_ENABLED")
+    term_prompt_max_chars: int = Field(default=200, gt=0, alias="TERM_PROMPT_MAX_CHARS")
 
     # --- Agent 层开关（PRD v1.1 §13.1）-------------------------------------
     # 默认 pipeline：不设置任何 AGENT_* 时，行为与 P0 完全一致（零行为变化）。

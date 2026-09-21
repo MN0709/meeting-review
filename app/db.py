@@ -260,6 +260,17 @@ class Database:
                     duration_ms INTEGER NULL,
                     created_at TEXT NOT NULL
                 );
+                -- R-P1.5-9（阶段 10-B）：团队术语热词表。
+                CREATE TABLE IF NOT EXISTS team_terms(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    term TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(team_id, term)
+                );
+                CREATE INDEX IF NOT EXISTS idx_team_terms_team ON team_terms(team_id, term);
                 -- R-P1.5-6（阶段 10-A）：上传同意留证。
                 CREATE TABLE IF NOT EXISTS consent_records(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -794,6 +805,42 @@ class Database:
     # ------------------------------------------------------------------
     # R-P1.5-6（阶段 10-A）：上传同意留证。
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # R-P1.5-9（阶段 10-B）：团队术语热词表（手动维护部分）。
+    # 已确认成员姓名不落表，由 terms 模块在组装时合并（成员改名自动生效）。
+    # ------------------------------------------------------------------
+
+    def upsert_term(self, team_id: int, term: str, note: str = "") -> int:
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO team_terms(team_id,term,note,created_at,updated_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(team_id,term) DO UPDATE SET
+                       note=excluded.note, updated_at=excluded.updated_at""",
+                (team_id, term, note, now, now),
+            )
+            row = connection.execute(
+                "SELECT id FROM team_terms WHERE team_id=? AND term=?", (team_id, term)
+            ).fetchone()
+        return int(row["id"])
+
+    def delete_term(self, team_id: int, term_id: int) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM team_terms WHERE id=? AND team_id=?", (term_id, team_id),
+            )
+            return cursor.rowcount > 0
+
+    def list_terms(self, team_id: int) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id,term,note,updated_at FROM team_terms
+                   WHERE team_id=? ORDER BY term""",
+                (team_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_consent(
         self, meeting_id: str, team_id: int, consent_version: str, ip: Optional[str] = None,

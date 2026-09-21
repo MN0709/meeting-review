@@ -46,10 +46,12 @@ from app.models import (
     MyTaskItem, MyTasksResult, SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
     ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
     DeliverableState, DeliverablesReport, RetryResult,
+    TermCreate, TermItem, TermsPayload,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
 from app.security import AdmissionController, AdmissionError, AdmissionReservation, SHANGHAI_TZ
+from app import terms
 from app.tasks import InMemoryTaskManager, ProgressCallback, TaskAborted, TaskProcessingError, TaskRecord
 from app.transcription import WhisperTranscriber, probe_audio_duration
 from app.speaker import KnownVoiceProfile, SpeakerRecognizer
@@ -129,8 +131,17 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
     if not progress("转写中", "正在转写，长会议可能需要较长时间…"):
         raise TaskAborted()
     speaker_result = None
+    # R-P1.5-9：把团队热词作为转写提示（未配置/关闭时为 None，行为与现状一致）。
+    term_prompt = terms.build_team_prompt(
+        database, team_id,
+        enabled=settings.team_terms_enabled, max_chars=settings.term_prompt_max_chars,
+    )
     try:
-        transcript = await run_in_threadpool(transcriber.transcribe, path)
+        # 未配置热词时**只用单参数调用**，与引入热词之前逐字节一致（R-P1.5-9 验收要求）。
+        if term_prompt:
+            transcript = await run_in_threadpool(transcriber.transcribe, path, term_prompt)
+        else:
+            transcript = await run_in_threadpool(transcriber.transcribe, path)
         duration = transcript.duration_seconds
         if not math.isfinite(duration) or duration > settings.max_audio_minutes * 60:
             raise TaskProcessingError(
@@ -948,6 +959,48 @@ async def image_minutes_pdf(request: Request, meeting_id: str) -> Response:
             "Cache-Control": "no-store",
         },
     )
+
+
+@app.get("/api/terms", response_model=TermsPayload)
+async def list_terms(request: Request) -> TermsPayload:
+    """R-P1.5-9：当前团队热词表（手动 + 已确认成员姓名）。"""
+    team_id = request.state.team_id
+    items = [
+        TermItem(
+            id=item["id"], term=item["term"], note=item["note"] or "",
+            source=item["source"], updated_at=item["updated_at"],
+        )
+        for item in terms.collect_terms(database, team_id)
+    ]
+    return TermsPayload(items=items, prompt=terms.build_prompt(
+        [item.term for item in items], settings.term_prompt_max_chars,
+    ))
+
+
+@app.post("/api/terms", response_model=TermItem)
+async def create_term(request: Request, payload: TermCreate = Body(...)) -> TermItem:
+    """新增或更新一个热词（只影响转写质量；不改引文校验规则）。"""
+    team_id = request.state.team_id
+    term = terms.normalize_term(payload.term)
+    if not term:
+        raise APIError(422, "invalid_args", "热词不能为空")
+    if len(term) > terms.MAX_TERM_CHARS:
+        raise APIError(422, "invalid_args", "热词最长 {} 个字".format(terms.MAX_TERM_CHARS))
+    term_id = database.upsert_term(team_id, term, str(payload.note or "").strip())
+    row = next(
+        (item for item in database.list_terms(team_id) if item["id"] == term_id), None,
+    )
+    return TermItem(
+        id=term_id, term=term, note=(row or {}).get("note") or "",
+        source="manual", updated_at=(row or {}).get("updated_at"),
+    )
+
+
+@app.delete("/api/terms/{term_id}")
+async def delete_term(request: Request, term_id: int) -> dict:
+    if not database.delete_term(request.state.team_id, term_id):
+        raise APIError(404, "not_found", "热词不存在")
+    return {"status": "ok"}
 
 
 @app.get("/api/meetings/{meeting_id}/deliverables", response_model=DeliverablesReport)
