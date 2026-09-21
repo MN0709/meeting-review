@@ -9,12 +9,14 @@
 ## 页面与报告
 
 - 上传：可填写会议标题，支持 MP3/M4A/WAV，默认最大 300 MB、4 小时；2-4 小时录音建议使用 M4A/MP3。**必须先勾选同意**（「我已知晓：音频将上传至本服务用于本次转写，其中包含他人声音」）才能开始；未勾选时前端按钮禁用，绕过前端直接调接口返回 422 且不建会议、不入队、不留临时文件（R-P1.5-6）。同意后写入 `consent_records` 留证：协议版本号（`CONSENT_VERSION`，默认 `v1`）+ 同意时间 + 来源 IP；改文案升版本时旧记录不被覆盖。
+- 批量上传（R-P2-5）：上传区支持一次选/拖入多个录音（`BATCH_MAX_FILES`，默认 20），**一次勾选同意**、逐文件落 `consent_records`；单个文件失败不影响其他；项目**可留空**（会议先进入「未归类」）；首页有「有 N 场会待归类」入口，上传后显示逐文件进度。
+- 自动归类（R-P2-6）：报告生成的 `suggested_project` 作为信号——**高置信（`AUTO_ASSIGN_THRESHOLD`，默认 0.75）且指向已存在项目**时，由确定性代码自动归入（可**一键撤销**、`project_assignments` 留痕）；低置信或新项目**不自动**，进「待归类」收件箱由人批量确认；**永不自动新建项目**。`AUTO_PROJECT_ASSIGN_ENABLED=false` 时回到「只建议、不自动」。
 - 会后整理：报告生成后自动打开“整理本次会议”，用户可确认/编辑 AI 建议标题，并根据原话片段确认说话人；允许稍后处理。**若标题仍是“未命名会议”（用户从未填写或修改），报告生成后会自动采用 AI 建议标题（D-027）；用户自己填过或改过的标题不会被覆盖。**
 - 导航：登录后左侧有“首页 / 全部会议 / 项目 / 搜索”；主页专注上传，不再同屏堆叠历史和项目记忆。
 - 跨会议搜索（R-P1.5-4）：“搜索”页输入一句话，在**当前团队全部历史会议**的转写原文里查找；结果带会议名、项目、时间戳、说话人与命中片段，点击直接跳到那场会议并定位。底层复用 FTS5 转写索引（中文 ≥ 3 字走 FTS5，更短或含特殊字符自动回退 `LIKE`），不占上传限频与每日名额。
 - 逐字稿常驻侧栏（R-P1.5-2）：报告页右侧常驻逐字稿（桌面左右分栏，≤ 900 px 折叠为底部抽屉）。侧栏文本与 `GET /api/meetings/{id}` 的 `transcript` 逐字一致；自带关键词过滤与上一个/下一个跳转；点报告里任一时间戳 → 侧栏滚到那段并高亮；长会议按 200 段分批渲染，滚动到底自动续。
 - 项目：“项目”页的每个文件夹就是一个项目，用户界面不展示二级目录；点击文件夹进入独立项目页。新上传先选择项目，标题仍可不填。
-- 会议归档调整：历史页允许用户手动选择另一个项目，确认后移动；弹窗会标记并置灰当前项目，转写稿和报告不变，AI 不会自动执行移动。
+- 会议归档调整：历史页允许用户手动选择另一个项目，确认后移动（记入 `project_assignments`，来源 `manual`）；弹窗会标记并置灰当前项目，转写稿和报告不变。AI 侧的自动归类只发生在**高置信既有项目**场景，且在会议标题旁显示「AI 自动归类」角标与「撤销归类」。
 - 删除项目时必须选择：保留会议并移入“未分类”，或连同会议、转写稿和报告一起删除。永久删除前会二次警告且不可恢复；含处理中会议的项目禁止连带删除。
 - 处理进度：排队中、转写中、AI 分析中、完成或失败；超过 30 分钟的已知音频会提示用户可以关闭页面，任务仍在后台继续，完成后从历史记录查看。
 - 会议历史：“全部会议”页按时间列出团队历史；项目详情页只列出该项目的会议。数据库保留的旧二级数据会自动归并到所属项目，不单独展示。
@@ -208,7 +210,11 @@ curl http://127.0.0.1:8000/health
 - 旧 `GET /api/members`、`PATCH /api/members/{id}`、`DELETE /api/members/{id}/voiceprint`、`POST /api/members/{id}/merge` 保留但**已废弃**，界面不再调用。
 - `POST /api/projects`：创建项目文件夹，可传 `parent_id` 创建第二级；第三层会被拒绝。`PATCH /api/projects/{id}` 修改名称。
 - `DELETE /api/projects/{id}`：默认把会议移入未分类；显式传入 `delete_meetings=true` 才连同终态会议、转写稿和报告删除。
-- `POST /api/review`：multipart 字段 `file`、可选 `title` 和可选 `project_id`，成功返回 HTTP 202 与任务 ID；新版页面要求先选文件夹，API 保留未分类兼容能力。
+- `POST /api/review`：单文件上传（契约不变）。multipart 字段 `file`、可选 `title` 和可选 `project_id`，成功返回 HTTP 202 与任务 ID；**不选项目也能上传**（会议进入「未归类」，交给自动归类/人工确认）。
+- `POST /api/reviews`：**批量上传（R-P2-5）**。`files[]`（≤`BATCH_MAX_FILES`）+ 可选 `project_id` + `consent_confirmed`；返回 `{batch_id,total,accepted,items:[{filename,task_id,ok,error}]}`；**单个文件失败不影响其他**。
+- `GET /api/reviews/{batch_id}`：批次逐文件进度。
+- `POST /api/meetings/assign-batch`：**批量确认归类（R-P2-6）**。`{meeting_ids, project_id}` 或 `{meeting_ids, action:"accept_suggestions"}`（采纳各自建议，只对既有项目生效）。
+- `POST /api/meetings/{id}/undo-assignment`：**撤销自动归类**，回到原项目（通常未归类），写 `undone_at` 留痕。
 - `GET /api/tasks/{task_id}`：先查内存中的处理中或 30 分钟内终态任务；内存未命中时回落 SQLite（重启后仍可读）；跨团队访问返回 403。
 - `GET /api/meetings`：当前团队会议列表，可用 `project_id` 或 `unclassified=true` 过滤；一级目录查询可传 `include_children=true` 汇总二级目录。
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
@@ -247,6 +253,10 @@ curl http://127.0.0.1:8000/health
 | `OWNER_MIN_SPEECH_SECONDS` | 否 | `10` | 有效语音不足此秒数不算「我」 |
 | `OWNER_MIN_ENROLL_SECONDS` | 否 | `20` | 录入本人声纹所需的最少有效语音 |
 | `OWNER_BACKFILL_LIMIT` | 否 | `2` | 录入成功后自动回填的历史会议场次 |
+| `BATCH_UPLOAD_ENABLED` | 否 | `true` | 批量上传开关 |
+| `BATCH_MAX_FILES` | 否 | `20` | 单批文件上限 |
+| `AUTO_PROJECT_ASSIGN_ENABLED` | 否 | `true` | 高置信自动归类开关；关闭后退回「只建议」 |
+| `AUTO_ASSIGN_THRESHOLD` | 否 | `0.75` | 自动归类置信度线 |
 | `TEAM_TOKENS` | 否 | 空 | **改为可选**：仅 `AUTH_ENABLED=true` 时必填。`团队名:口令`；**口令强度：≥ 16 位，且不能是纯数字或纯英文；不合规服务拒绝启动**（R-P0-3） |
 | `OPENAI_API_KEY` | **是** | 无 | OpenAI 兼容 LLM 密钥 |
 | `OPENAI_BASE_URL` | 否 | SDK 默认 | 兼容服务 `/v1` 地址 |
@@ -350,13 +360,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：418 passed
+python -m pytest -q            # 本地完整环境：440 passed
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 418 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 440 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：

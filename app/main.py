@@ -8,7 +8,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, time, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 
 from urllib.parse import quote
@@ -44,6 +44,8 @@ from app.models import (
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
     MyTaskItem, MyTasksResult, OwnerBackfillResult, OwnerEnrollResult, OwnerStatus,
+    AssignBatchRequest, AssignBatchResult, BatchProgress, BatchReviewItem, BatchReviewResult,
+    BatchTaskProgress, UndoAssignmentResult,
     SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
     ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
     DeliverableState, DeliverablesReport, RetryResult,
@@ -210,6 +212,8 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
             database.save_report(path.stem, team_id, report)
             _mark_deliverable(path.stem, team_id, "report", "ok")
             _mark_deliverable(path.stem, team_id, "tasks", "ok")
+            # R-P2-6：高置信自动归入**已存在**项目（可撤销、永不自动新建）。
+            _auto_assign_from_suggestion(path.stem, team_id, report)
         return report
     except AnalysisError as exc:
         if team_id:
@@ -613,22 +617,54 @@ async def _save_upload(upload: UploadFile, path: Path) -> None:
         raise HTTPException(status_code=400, detail="上传文件为空")
 
 
+def _auto_assign_from_suggestion(meeting_id: str, team_id: Optional[int], report: Any) -> None:
+    """R-P2-6：只把**高置信、指向已存在项目**的建议自动归入；永不自动新建项目。"""
+    if not settings.auto_project_assign_enabled or not team_id:
+        return
+    suggestion = getattr(report, "suggested_project", None)
+    if suggestion is None or not getattr(suggestion, "existing_project_id", None):
+        return
+    confidence = float(getattr(suggestion, "confidence", 0.0) or 0.0)
+    if confidence < settings.auto_assign_threshold:
+        return
+    try:
+        database.assign_meeting_auto(
+            meeting_id, team_id, suggestion.existing_project_id,
+            confidence, getattr(suggestion, "reason", None),
+        )
+    except Exception as exc:  # 自动归类失败不能影响报告主链路
+        logger.warning(
+            "auto_assign_failed meeting_id=%s error_type=%s", meeting_id, type(exc).__name__,
+        )
+
+
 @app.post("/api/review", response_model=TaskAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def review(
     request: Request, file: UploadFile = File(...), title: str = Form(default=""),
     project_id: str = Form(default=""), consent_confirmed: bool = Form(default=False),
 ) -> TaskAccepted:
+    """单文件上传（R-P2-5 ④：契约与门禁顺序不变）。"""
+    return await _ingest_audio(
+        request, file, title, project_id, consent_confirmed,
+        task_id=uuid4().hex, batch_id=None,
+    )
+
+
+async def _ingest_audio(
+    request: Request, file: UploadFile, title: str, project_id: str,
+    consent_confirmed: bool, *, task_id: str, batch_id: Optional[str],
+) -> TaskAccepted:
+    """单个音频的入库核心：校验 → 存盘 → 建会议 → 落同意 → 入队；失败不留残留。"""
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail="仅支持 mp3、m4a 和 wav 文件")
     clean_title = title.strip()[:100] or DEFAULT_MEETING_TITLE
-    clean_project_id = project_id.strip() or None
+    clean_project_id = (project_id or "").strip() or None
     if clean_project_id is not None:
         _assert_team_owns_project(clean_project_id, request.state.team_id)
     submitted = False
     created = False
     temp_path: Optional[Path] = None
-    task_id = uuid4().hex
     try:
         temp_path = UPLOAD_DIR / f"{task_id}{suffix}"
         await _save_upload(file, temp_path)
@@ -656,6 +692,8 @@ async def review(
             temp_path, request.state.request_id, task_id=task_id,
             team_id=request.state.team_id, long_meeting=long_meeting,
         )
+        if batch_id:
+            database.set_task_batch(task_id, batch_id)
         submitted = True
         return accepted
     except HTTPException:
@@ -673,6 +711,82 @@ async def review(
                 temp_path.unlink(missing_ok=True)
             if created:
                 database.delete_meeting(task_id, request.state.team_id)
+
+
+@app.post("/api/reviews", response_model=BatchReviewResult, status_code=status.HTTP_202_ACCEPTED)
+async def review_batch(
+    request: Request, files: List[UploadFile] = File(...), project_id: str = Form(default=""),
+    consent_confirmed: bool = Form(default=False),
+) -> BatchReviewResult:
+    """R-P2-5：批量上传。一次同意、逐文件落同意记录；**单个文件失败不影响其他**。"""
+    if not settings.batch_upload_enabled:
+        raise APIError(403, "batch_disabled", "批量上传已关闭")
+    if not files:
+        raise APIError(422, "invalid_args", "请至少选择一个音频文件")
+    if len(files) > settings.batch_max_files:
+        raise APIError(
+            422, "invalid_args",
+            "一次最多上传 {} 个文件（本次 {} 个）".format(settings.batch_max_files, len(files)),
+        )
+    if not consent_confirmed:
+        raise APIError(422, "invalid_args", "请先勾选同意，再批量上传")
+    clean_project_id = project_id.strip() or None
+    if clean_project_id is not None:
+        _assert_team_owns_project(clean_project_id, request.state.team_id)
+    _ensure_disk_capacity()
+    try:
+        reservation = admission.reserve(_client_ip(request))
+    except AdmissionError as exc:
+        raise APIError(exc.status_code, "rate_limited", str(exc)) from exc
+    batch_id = uuid4().hex
+    database.create_review_batch(
+        batch_id, request.state.team_id, len(files), settings.consent_version, _client_ip(request)
+    )
+    items: List[BatchReviewItem] = []
+    accepted_count = 0
+    for index, file in enumerate(files):
+        filename = file.filename or "audio-{}".format(index + 1)
+        try:
+            accepted = await _ingest_audio(
+                request, file, "", clean_project_id, True,
+                task_id=uuid4().hex, batch_id=batch_id,
+            )
+            accepted_count += 1
+            items.append(BatchReviewItem(filename=filename, task_id=accepted.task_id, ok=True))
+        except HTTPException as exc:
+            items.append(BatchReviewItem(filename=filename, ok=False, error=str(exc.detail)))
+        except Exception as exc:  # 单个文件失败不能拖垮整批
+            logger.warning(
+                "batch_file_failed index=%d error_type=%s", index, type(exc).__name__,
+                exc_info=True,
+            )
+            items.append(BatchReviewItem(
+                filename=filename, ok=False, error="这个文件处理失败，已跳过",
+            ))
+    if accepted_count == 0:
+        admission.rollback(reservation)
+    return BatchReviewResult(
+        batch_id=batch_id, total=len(files), accepted=accepted_count, items=items,
+    )
+
+
+@app.get("/api/reviews/{batch_id}", response_model=BatchProgress)
+async def review_batch_progress(request: Request, batch_id: str) -> BatchProgress:
+    """R-P2-5：批次逐文件进度。"""
+    data = database.review_batch(batch_id, request.state.team_id)
+    if data is None:
+        raise APIError(404, "not_found", "批次不存在")
+    tasks = [
+        BatchTaskProgress(
+            task_id=row["task_id"], status=row["status"],
+            stage=row.get("stage"), message=row.get("message"),
+        )
+        for row in data["tasks"]
+    ]
+    return BatchProgress(
+        batch_id=data["batch_id"], total=data["total"],
+        created_at=data["created_at"], accepted=len(tasks), tasks=tasks,
+    )
 
 
 def _assert_team_owns_meeting(meeting_id: str, team_id: int) -> None:
@@ -1674,6 +1788,67 @@ async def project_member_merge(
         raise APIError(404, "not_found", "成员不存在")
     return MemberMergeResult(
         target_member_id=payload.target_member_id, merged_meetings=affected,
+    )
+
+
+@app.post("/api/meetings/assign-batch", response_model=AssignBatchResult)
+async def assign_batch(
+    request: Request, payload: AssignBatchRequest = Body(...),
+) -> AssignBatchResult:
+    """R-P2-6：批量确认归类（由人确认）。accept_suggestions = 逐场采纳各自建议，只对既有项目生效。"""
+    team_id = request.state.team_id
+    if not payload.meeting_ids:
+        raise APIError(422, "invalid_args", "请选择要归类的会议")
+    if payload.action == "accept_suggestions":
+        pass
+    elif payload.project_id:
+        _assert_team_owns_project(payload.project_id, team_id)
+    else:
+        raise APIError(422, "invalid_args", "请选择目标项目，或用 accept_suggestions 采纳建议")
+    assigned = 0
+    skipped = 0
+    for meeting_id in payload.meeting_ids:
+        owner = database.owner_team_id(meeting_id)
+        if owner is None or owner != team_id:
+            skipped += 1
+            continue
+        target = payload.project_id
+        confidence = None
+        if payload.action == "accept_suggestions":
+            history = database.get_history(meeting_id, team_id)
+            suggestion = getattr(history.report, "suggested_project", None) if history else None
+            target = getattr(suggestion, "existing_project_id", None) if suggestion else None
+            confidence = getattr(suggestion, "confidence", None) if suggestion else None
+            if not target:
+                skipped += 1
+                continue
+        if database.move_meeting(
+            meeting_id, team_id, target, source="manual", confidence=confidence,
+        ):
+            assigned += 1
+        else:
+            skipped += 1
+    wanted = set(payload.meeting_ids)
+    meetings = [item for item in database.list_meetings(team_id) if item.id in wanted]
+    return AssignBatchResult(assigned=assigned, skipped=skipped, meetings=meetings)
+
+
+@app.post("/api/meetings/{meeting_id}/undo-assignment", response_model=UndoAssignmentResult)
+async def undo_assignment(request: Request, meeting_id: str) -> UndoAssignmentResult:
+    """R-P2-6 ①/红线 16：撤销最近一次自动归类，回到原项目（通常为未归类），并留痕。"""
+    team_id = request.state.team_id
+    owner = database.owner_team_id(meeting_id)
+    if owner is None:
+        raise APIError(404, "not_found", "会议不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他工作区的会议")
+    if not database.undo_assignment(meeting_id, team_id):
+        raise APIError(404, "not_found", "这场会议没有可撤销的自动归类")
+    meeting = next((item for item in database.list_meetings(team_id) if item.id == meeting_id), None)
+    if meeting is None:
+        raise APIError(404, "not_found", "会议不存在")
+    return UndoAssignmentResult(
+        meeting_id=meeting_id, undone=True, project_id=meeting.project_id,
     )
 
 

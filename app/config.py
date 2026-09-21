@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     owner_min_enroll_seconds: float = Field(default=20, ge=0, alias="OWNER_MIN_ENROLL_SECONDS")
     # 录入成功后自动回填的历史会议场次。
     owner_backfill_limit: int = Field(default=2, ge=0, le=50, alias="OWNER_BACKFILL_LIMIT")
+
+    # --- R-P2-5 批量上传 -----------------------------------------------------
+    batch_upload_enabled: bool = Field(default=True, alias="BATCH_UPLOAD_ENABLED")
+    batch_max_files: int = Field(default=20, ge=1, le=200, alias="BATCH_MAX_FILES")
+
+    # --- R-P2-6 高置信自动归类 -----------------------------------------------
+    # 关闭后回到 v1.2 行为：只给建议，不自动移动。
+    auto_project_assign_enabled: bool = Field(default=True, alias="AUTO_PROJECT_ASSIGN_ENABLED")
+    auto_assign_threshold: float = Field(default=0.75, ge=0, le=1, alias="AUTO_ASSIGN_THRESHOLD")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: Optional[str] = Field(default=None, alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")

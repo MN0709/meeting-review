@@ -305,6 +305,30 @@ class Database:
                     enrolled_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                -- R-P2-6：归类留痕（人工/自动都记，支持撤销）。
+                CREATE TABLE IF NOT EXISTS project_assignments(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    meeting_id TEXT NOT NULL,
+                    from_project_id TEXT NULL,
+                    to_project_id TEXT NULL,
+                    source TEXT NOT NULL CHECK(source IN ('manual','auto')),
+                    confidence REAL NULL,
+                    reason TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    undone_at TEXT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_project_assignments_meeting
+                    ON project_assignments(team_id, meeting_id, id DESC);
+                -- R-P2-5：批量上传批次。
+                CREATE TABLE IF NOT EXISTS review_batches(
+                    batch_id TEXT PRIMARY KEY,
+                    team_id INTEGER NOT NULL,
+                    total INTEGER NOT NULL,
+                    consent_version TEXT NOT NULL,
+                    ip TEXT NULL,
+                    created_at TEXT NOT NULL
+                );
                 -- R-P1.5-9（阶段 10-B）：术语热词表。
                 -- R-P2-9：本版停用（界面与接口已删除），表保留以兼容历史库，不再读写。
                 CREATE TABLE IF NOT EXISTS team_terms(
@@ -359,6 +383,11 @@ class Database:
             # R-P2-3：「我」的来源与置信度。
             self._ensure_column(connection, "meetings", "self_source", "TEXT")
             self._ensure_column(connection, "meetings", "self_confidence", "REAL")
+            # R-P2-6：归类来源与置信度。
+            self._ensure_column(connection, "meetings", "assignment_source", "TEXT")
+            self._ensure_column(connection, "meetings", "assignment_confidence", "REAL")
+            # R-P2-5：任务所属批次。
+            self._ensure_column(connection, "agent_tasks", "batch_id", "TEXT")
             self._ensure_column(connection, "agent_tasks", "message", "TEXT")
             self._ensure_column(connection, "agent_tasks", "request_id", "TEXT")
             self._ensure_column(connection, "agent_tasks", "long_meeting", "INTEGER NOT NULL DEFAULT 0")
@@ -711,15 +740,38 @@ class Database:
                 "UPDATE meetings SET status=? WHERE id=? AND team_id=?", (status, meeting_id, team_id)
             )
 
-    def move_meeting(self, meeting_id: str, team_id: int, project_id: str) -> bool:
+    def move_meeting(
+        self, meeting_id: str, team_id: int, project_id: str, *,
+        source: str = "manual", confidence: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> bool:
         now = _utc_now()
         with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT project_id FROM meetings WHERE id=? AND team_id=?",
+                (meeting_id, team_id),
+            ).fetchone()
+            if row is None:
+                return False
+            from_project_id = row["project_id"]
             cursor = connection.execute(
-                "UPDATE meetings SET project_id=? WHERE id=? AND team_id=?",
-                (project_id, meeting_id, team_id),
+                """UPDATE meetings SET project_id=?, assignment_source=?, assignment_confidence=?
+                   WHERE id=? AND team_id=?""",
+                (project_id, source if from_project_id != project_id else None,
+                 confidence if from_project_id != project_id else None, meeting_id, team_id),
             )
             if cursor.rowcount != 1:
                 return False
+            # R-P2-6：归类留痕（人工与自动都记）。
+            if from_project_id != project_id:
+                connection.execute(
+                    """INSERT INTO project_assignments(
+                           team_id, meeting_id, from_project_id, to_project_id, source,
+                           confidence, reason, created_at, undone_at)
+                       VALUES(?,?,?,?,?,?,?,?,NULL)""",
+                    (team_id, meeting_id, from_project_id, project_id, source,
+                     confidence, reason, now),
+                )
             # R-P2-4 ④：未归类成员随会议迁入目标项目（只动 project_id 为空的人）。
             connection.execute(
                 """UPDATE members SET project_id=?
@@ -737,6 +789,93 @@ class Database:
                 (project_id, now, meeting_id, team_id),
             )
         return True
+
+    def assign_meeting_auto(
+        self, meeting_id: str, team_id: int, project_id: str,
+        confidence: Optional[float], reason: Optional[str] = None,
+    ) -> bool:
+        """R-P2-6：只把**未归类**会议自动归入**已存在**项目（永不自动新建）。"""
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT project_id FROM meetings WHERE id=? AND team_id=?",
+                (meeting_id, team_id),
+            ).fetchone()
+            owner = connection.execute(
+                "SELECT team_id FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+        if row is None or owner is None or int(owner["team_id"]) != team_id:
+            return False
+        if row["project_id"] is not None:
+            return False
+        return self.move_meeting(
+            meeting_id, team_id, project_id, source="auto",
+            confidence=confidence, reason=reason,
+        )
+
+    def undo_assignment(self, meeting_id: str, team_id: int) -> bool:
+        """R-P2-6 ①/红线 16：撤销最近一次自动归类，回到原项目（通常为未归类），并留痕。"""
+        now = _utc_now()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, from_project_id FROM project_assignments
+                   WHERE meeting_id=? AND team_id=? AND source='auto' AND undone_at IS NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (meeting_id, team_id),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                """UPDATE meetings SET project_id=?, assignment_source=NULL,
+                          assignment_confidence=NULL WHERE id=? AND team_id=?""",
+                (row["from_project_id"], meeting_id, team_id),
+            )
+            connection.execute(
+                "UPDATE project_assignments SET undone_at=? WHERE id=?", (now, row["id"])
+            )
+        return True
+
+    def list_assignments(self, meeting_id: str, team_id: int) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT id, from_project_id, to_project_id, source, confidence, reason,
+                          created_at, undone_at FROM project_assignments
+                   WHERE meeting_id=? AND team_id=? ORDER BY id DESC""",
+                (meeting_id, team_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_review_batch(
+        self, batch_id: str, team_id: int, total: int, consent_version: str, ip: str,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO review_batches(
+                       batch_id, team_id, total, consent_version, ip, created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (batch_id, team_id, total, consent_version, ip, _utc_now()),
+            )
+
+    def review_batch(self, batch_id: str, team_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """SELECT batch_id, total, consent_version, created_at
+                   FROM review_batches WHERE batch_id=? AND team_id=?""",
+                (batch_id, team_id),
+            ).fetchone()
+            if row is None:
+                return None
+            task_rows = connection.execute(
+                """SELECT task_id, status, stage, message, created_at FROM agent_tasks
+                   WHERE team_id=? AND batch_id=? ORDER BY created_at""",
+                (team_id, batch_id),
+            ).fetchall()
+        return {**dict(row), "tasks": [dict(item) for item in task_rows]}
+
+    def set_task_batch(self, task_id: str, batch_id: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE agent_tasks SET batch_id=? WHERE task_id=?", (batch_id, task_id)
+            )
 
     def update_meeting_title(self, meeting_id: str, team_id: int, title: str) -> bool:
         with self._lock, self._connect() as connection:
@@ -1514,7 +1653,8 @@ class Database:
             conditions.append("project_id IS NULL")
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                """SELECT id,title,project_id,duration_seconds,status,created_at FROM meetings
+                """SELECT id,title,project_id,duration_seconds,status,created_at,
+                          assignment_source,assignment_confidence FROM meetings
                    WHERE {} ORDER BY created_at DESC""".format(" AND ".join(conditions)),
                 tuple(parameters),
             ).fetchall()
@@ -1524,7 +1664,7 @@ class Database:
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """SELECT m.id,m.title,m.project_id,m.duration_seconds,m.status,m.created_at,
-                          m.speaker_consent_at,r.json
+                          m.speaker_consent_at,m.assignment_source,m.assignment_confidence,r.json
                    FROM meetings m JOIN reports r ON r.meeting_id=m.id
                    WHERE m.id=? AND m.team_id=?""",
                 (meeting_id, team_id),
@@ -1561,6 +1701,8 @@ class Database:
             id=row["id"], title=row["title"], project_id=row["project_id"],
             duration_seconds=row["duration_seconds"],
             status=row["status"], created_at=row["created_at"],
+            assignment_source=row["assignment_source"],
+            assignment_confidence=row["assignment_confidence"],
             report=TeamMeetingReport.model_validate(report_payload),
             transcript=[TranscriptSegment.model_validate(dict(item)) for item in transcript_rows],
             speaker_consent_confirmed=row["speaker_consent_at"] is not None,

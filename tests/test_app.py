@@ -826,7 +826,7 @@ def test_frontend_uses_team_report_and_safe_text_rendering() -> None:
     assert "当前：${project.name}" in html
     assert "include_children=true" in html
     assert "还没有项目，点击上方“＋ 新建项目”创建第一个项目" in html
-    assert "还没有会议。回到首页选择项目并上传一段录音" in html
+    assert "还没有会议。回到首页上传一段录音" in html
     assert "localStorage.setItem(PROJECT_STORAGE_KEY" in html
     assert "localStorage.setItem(HISTORY_SCOPE_STORAGE_KEY" in html
     assert "① 会议总览" in html

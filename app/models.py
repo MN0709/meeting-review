@@ -198,6 +198,9 @@ class MeetingListItem(StrictModel):
     duration_seconds: float
     status: str
     created_at: str
+    # R-P2-6：归类来源（auto / manual / None）与置信度。
+    assignment_source: Optional[str] = None
+    assignment_confidence: Optional[float] = None
 
 
 class MeetingMoveRequest(StrictModel):
@@ -277,6 +280,59 @@ class OwnerBackfillResult(StrictModel):
     identified: int
     skipped_manual: int
     meetings: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# R-P2-5 批量上传 / R-P2-6 自动归类
+# ---------------------------------------------------------------------------
+
+
+class BatchReviewItem(StrictModel):
+    filename: str
+    task_id: Optional[str] = None
+    ok: bool
+    error: Optional[str] = None
+
+
+class BatchReviewResult(StrictModel):
+    batch_id: str
+    total: int
+    accepted: int
+    items: List[BatchReviewItem]
+
+
+class BatchTaskProgress(StrictModel):
+    task_id: str
+    status: str
+    stage: Optional[str] = None
+    message: Optional[str] = None
+
+
+class BatchProgress(StrictModel):
+    batch_id: str
+    total: int
+    created_at: str
+    accepted: int
+    tasks: List[BatchTaskProgress]
+
+
+class AssignBatchRequest(StrictModel):
+    meeting_ids: List[str] = Field(default_factory=list)
+    project_id: Optional[str] = None
+    # accept_suggestions：逐场采纳各自的 AI 建议（只对既有项目生效）。
+    action: Optional[Literal["accept_suggestions"]] = None
+
+
+class AssignBatchResult(StrictModel):
+    assigned: int
+    skipped: int
+    meetings: List[MeetingListItem] = Field(default_factory=list)
+
+
+class UndoAssignmentResult(StrictModel):
+    meeting_id: str
+    undone: bool
+    project_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
