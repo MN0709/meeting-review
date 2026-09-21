@@ -110,6 +110,8 @@ class TeamMeetingReport(StrictModel):
     decisions: List[DecisionItem]
     action_items: List[ActionItem]
     unresolved_issues: List[UnresolvedIssue]
+    # R-P1.5-1（阶段 9-B）：图片纪要的「紧急事项」板块。旧报告无此字段时为空数组。
+    urgent_items: List[UnresolvedIssue] = Field(default_factory=list)
     speaker_stats_note: str = "说话人识别未启用"
 
 
@@ -118,6 +120,7 @@ class TeamChunkSummary(StrictModel):
     decisions: List[DecisionItem]
     action_items: List[ActionItem]
     unresolved_issues: List[UnresolvedIssue]
+    urgent_items: List[UnresolvedIssue] = Field(default_factory=list)
 
 
 TaskStage = Literal["排队中", "上传完成", "转写中", "说话人识别中", "AI 分析中", "完成", "失败"]
@@ -222,6 +225,33 @@ class MyTasksResult(StrictModel):
     count: int = Field(ge=0)
     owner_unknown: int = Field(ge=0)
     items: List[MyTaskItem]
+
+
+# ---------------------------------------------------------------------------
+# 图片纪要（R-P1.5-1，阶段 9-B）
+# 四板块顺序固定；内容只来自报告与行动项，不新增句子。
+# ---------------------------------------------------------------------------
+
+
+class ImageMinutesItem(StrictModel):
+    text: str = Field(min_length=1)
+    timestamp: Optional[str] = None
+    meta: Optional[str] = None
+
+
+class ImageMinutesPart(StrictModel):
+    key: Literal["core", "urgent", "todo", "mine"]
+    title: str
+    subtitle: str
+    items: List[ImageMinutesItem]
+    empty_note: Optional[str] = None
+
+
+class ImageMinutesResult(StrictModel):
+    meeting_id: str
+    title: str
+    meta: str
+    parts: List[ImageMinutesPart]
 
 
 class MeetingHistory(MeetingListItem):

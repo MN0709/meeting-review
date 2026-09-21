@@ -63,15 +63,17 @@ TEAM_SYSTEM_PROMPT = """
 每条决策、行动项和遗留问题都必须包含输入中完全一致的原话和时间戳，不得改写引文；无法确认决策人或负责人时填“未明确”，但仍必须给出对应原话（evidence）。
 行动项的 evidence 用于核对“谁承诺了什么”，不得省略。
 遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
+紧急事项只记录“带时间压力、需要尽快处理”的事项（如“今天必须定”“明天上线前要改完”），必须带原话；普通行动项、已完成安排、泛泛的“要注意”都不算，没有则返回空数组。
 行动项的截止时间不明确时填“未明确”。speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
 只输出符合指定 JSON Schema 的 JSON，不输出 Markdown 或解释。
 """.strip()
 
 TEAM_CHUNK_SYSTEM_PROMPT = """
-你负责从团队正式会议的一个转写分块中提取会议要点、明确决策、行动项和遗留问题。
-每条决策、行动项和遗留问题必须保留完全一致的逐字原话及时间戳，不得改写引文；无法确认决策人、负责人或截止时间时填“未明确”，但仍必须给出对应原话（evidence）。
+你负责从团队正式会议的一个转写分块中提取会议要点、明确决策、行动项、遗留问题和紧急事项。
+每条决策、行动项、遗留问题和紧急事项必须保留完全一致的逐字原话及时间戳，不得改写引文；无法确认决策人、负责人或截止时间时填“未明确”，但仍必须给出对应原话（evidence）。
 行动项的 evidence 用于核对“谁承诺了什么”，不得省略。
 遗留问题只记录明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
+紧急事项只记录本块里“带时间压力、需要尽快处理”的事项，必须带原话；普通行动项、已完成安排、泛泛的“要注意”都不算，没有则返回空数组。
 不要分析个人表现，不要补写分块中不存在的信息。只输出符合指定 JSON Schema 的 JSON。
 """.strip()
 
@@ -115,6 +117,10 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
                 "content": "尚未解决的问题",
                 "evidence": {"quote": "原话", "timestamp": "00:00:00"},
             }],
+            "urgent_items": [{
+                "content": "需要尽快处理的事项",
+                "evidence": {"quote": "原话", "timestamp": "00:00:00"},
+            }],
             "speaker_stats_note": "",
         }
         fields = (
@@ -124,6 +130,8 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
             "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
             "evidence 只有 quote/timestamp)；"
             "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
+            "urgent_items(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp；"
+            "只收带时间压力、需尽快处理的事项，没有就返回空数组)；"
             "speaker_stats_note(必填空字符串，由后端覆盖)"
         )
     elif issubclass(model_type, TeamChunkSummary):
@@ -132,12 +140,14 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
             "decisions": [{"content": "决策内容", "decision_maker": "未明确", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "unresolved_issues": [{"content": "尚未解决的问题", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
+            "urgent_items": [{"content": "需要尽快处理的事项", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
         }
         fields = (
             "meeting_points(必填字符串数组)；decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
             "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
             "evidence 只有 quote/timestamp)；"
-            "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)"
+            "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
+            "urgent_items(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp；没有就返回空数组)"
         )
     elif issubclass(model_type, SemanticAnalysis):
         example = {
@@ -283,7 +293,7 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
     if issubclass(model_type, (TeamMeetingReport, TeamChunkSummary)):
         normalized: Dict[str, Any] = {
             key: copy.deepcopy(payload[key])
-            for key in ("meeting_points", "decisions", "action_items", "unresolved_issues")
+            for key in ("meeting_points", "decisions", "action_items", "unresolved_issues", "urgent_items")
             if key in payload
         }
         actions = normalized.get("action_items")
@@ -351,6 +361,27 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
                     },
                 })
             normalized["unresolved_issues"] = cleaned_issues
+
+        # R-P1.5-1：紧急事项与遗留问题结构一致，复用同一套清洗规则（引文不改写）。
+        urgent = normalized.get("urgent_items")
+        if isinstance(urgent, list):
+            cleaned_urgent = []
+            for item in urgent:
+                if not isinstance(item, dict) or not isinstance(item.get("evidence"), dict):
+                    continue
+                evidence = item["evidence"]
+                content = next(
+                    (item.get(key) for key in ("content", "item", "description", "task") if item.get(key)),
+                    "",
+                )
+                cleaned_urgent.append({
+                    "content": str(content),
+                    "evidence": {
+                        "quote": evidence.get("quote", ""),
+                        "timestamp": evidence.get("timestamp", ""),
+                    },
+                })
+            normalized["urgent_items"] = cleaned_urgent
 
         if issubclass(model_type, TeamMeetingReport):
             suggested_title = next(
@@ -513,7 +544,8 @@ def validate_chunk_evidence(summary: ChunkSummary, segments: Sequence[Transcript
 def validate_team_evidence(report: TeamMeetingReport, segments: Sequence[TranscriptSegment]) -> None:
     _validate_quotes(
         [decision.evidence for decision in report.decisions]
-        + [issue.evidence for issue in report.unresolved_issues],
+        + [issue.evidence for issue in report.unresolved_issues]
+        + [item.evidence for item in getattr(report, "urgent_items", []) or []],
         segments,
     )
 
@@ -535,7 +567,8 @@ def validate_team_action_evidence(report: Any, segments: Sequence[TranscriptSegm
 def validate_team_chunk_evidence(report: TeamChunkSummary, segments: Sequence[TranscriptSegment]) -> None:
     _validate_quotes(
         [decision.evidence for decision in report.decisions]
-        + [issue.evidence for issue in report.unresolved_issues],
+        + [issue.evidence for issue in report.unresolved_issues]
+        + [item.evidence for item in getattr(report, "urgent_items", []) or []],
         segments,
     )
 
@@ -878,7 +911,8 @@ class LLMAnalyzer:
         result = await self._validated_call(
             TeamMeetingReport,
             TEAM_SYSTEM_PROMPT,
-            "以下分块按原顺序排列。去重归并；决策和遗留问题的引文只能从各分块 evidence 原样选取。\n\n"
+            "以下分块按原顺序排列。去重归并；决策、遗留问题和紧急事项的引文只能从各分块 evidence 原样选取；"
+            "紧急事项只保留真正带时间压力、需尽快处理的，宁少勿多。\n\n"
             + json.dumps(summaries, ensure_ascii=False),
             "team_final_merge",
             transcript.segments,

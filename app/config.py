@@ -63,6 +63,14 @@ class Settings(BaseSettings):
         default=None, ge=0, alias="LLM_PRICE_COMPLETION_PER_1K"
     )
 
+    # --- 交付物：图片纪要（R-P1.5-1）----------------------------------------
+    # 版式模板名（模板与数据分离；改版式只改模板文件，不改代码）。
+    image_minutes_template: str = Field(default="card_v1", alias="IMAGE_MINUTES_TEMPLATE")
+    # PDF 渲染器：auto（Playwright 优先，回退本机 Chrome）/ playwright / chrome / none
+    pdf_renderer: Literal["auto", "playwright", "chrome", "none"] = Field(
+        default="auto", alias="PDF_RENDERER"
+    )
+
     # --- Agent 层开关（PRD v1.1 §13.1）-------------------------------------
     # 默认 pipeline：不设置任何 AGENT_* 时，行为与 P0 完全一致（零行为变化）。
     agent_mode: Literal["pipeline", "shadow", "agent"] = Field(

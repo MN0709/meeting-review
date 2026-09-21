@@ -23,6 +23,7 @@
 - 声音授权：不再要求每位说话人分别勾选同意；点击“完成整理”时统一显示参会者名单并确认授权。
 - 团队声纹身份库：身份跨项目共享；姓名、角色和“关键决策人”由用户维护，声纹可单独删除。
 - 报告：①会议总览；②会议要点；③决策清单；④行动项；**④-2 我答应的任务（R-P1.5-5）**；⑤遗留问题；⑥说话人确认；⑦识别状态。点击引文时间戳可在**右侧逐字稿侧栏**定位高亮，也可点「看上下文」展开带说话人标签的转写上下文。**决策、行动项、遗留问题都带原话证据（D-028）：引文旁标「原话」，点「看上下文」展开原文核对；旧报告无行动项原话时明确显示「无法核对」，不伪造。**
+- 图片纪要（R-P1.5-1）：报告底部「⑩ 图片纪要」把会议渲染成**四板块卡片长图**——① 这次会议的核心（总览 + 要点 + 带时间戳的关键决策）、② 紧急事项（会上明确要求「尽快 / 今天就 / 上线前」处理的事项，带原话时间戳）、③ 待办（未完成的行动项）、④ 我答应的任务；带时间戳的条目点击可跳到右侧逐字稿。点「导出 PDF」得到可外发的 PDF（HTML → PDF；渲染器优先 Playwright，缺失时自动回退本机 Chrome，都不通时返回 503 并把该交付物标「待核对」，不影响文字报告与逐字稿）。版式模板在 `app/deliverables/templates/card_v1.html`，与数据分离。
 - 我答应的任务（R-P1.5-5）：在「整理本次会议」里选「本场哪个说话人是我」（可选已命名成员，也可选未命名说话人），报告「④-2」就只列**负责人完全等于你**的行动项。**未指定时一律显示「未指定你自己」，绝不推断**；同时提示本场有多少条负责人为「未明确」、无法归属到任何人。
 
 旧的个人表现模型仍在 `models.py` 中标记为 legacy，以保留已有代码契约与测试；团队 UI 不呈现个人评分、口头禅或个人表现模块。
@@ -158,6 +159,8 @@ curl http://127.0.0.1:8000/health
 - `GET /api/tasks/{task_id}`：先查内存中的处理中或 30 分钟内终态任务；内存未命中时回落 SQLite（重启后仍可读）；跨团队访问返回 403。
 - `GET /api/meetings`：当前团队会议列表，可用 `project_id` 或 `unclassified=true` 过滤；一级目录查询可传 `include_children=true` 汇总二级目录。
 - `GET /api/meetings/{id}`：从 SQLite 读取当前团队历史报告与转写片段，用于时间戳上下文；跨团队访问返回 403。
+- `POST /api/meetings/{id}/image-minutes`：**生成图片纪要四板块（R-P1.5-1）**。幂等、只读渲染，不写任何业务数据；返回 `{meeting_id, title, meta, parts:[{key,title,subtitle,items,empty_note}]}`，`key` 固定为 `core/urgent/todo/mine`。无报告 404，跨团队 403。
+- `GET /api/meetings/{id}/image-minutes.pdf`：**导出图片纪要 PDF**。响应 `application/pdf` + 中文文件名（RFC 5987）；渲染器不可用时返回 503 `renderer_unavailable`（可读中文原因），其它交付物不受影响。
 - `GET /api/meetings/{id}/agent-trace`：**只读**返回这场会议里 Agent 的每一步工具调用（会话 / 步 / 工具 / 判定 / 结果 / 耗时），按 `team_id` 隔离，跨团队 403。它是页面第 ⑨ 节「Agent 步骤（只读）」的数据源，也是 M1 的产品验收入口。
 - `PATCH /api/meetings/{id}/title`：用户接受或编辑 AI 建议标题后更新会议标题；跨团队访问返回 403。
 - `PATCH /api/meetings/{id}/project`：经用户确认后移动到当前团队的另一文件夹，保留转写稿和报告。
@@ -275,13 +278,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：260 passed
+python -m pytest -q            # 本地完整环境：293 passed
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 260 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 293 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：

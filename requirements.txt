@@ -12,3 +12,6 @@ httpx>=0.27,<1.0
 ruff>=0.14,<1.0
 # Apache-2.0 WeSpeaker，固定官方仓库版本；首次识别会下载中文声纹模型。
 wespeaker @ https://github.com/wenet-e2e/wespeaker/archive/dfa741957e5c11f477623b6e583d67d0af25ee88.zip
+# R-P1.5-1 图片纪要导出 PDF（可选）：未安装或未下载浏览器时自动回退本机 Chrome；
+# 两条路都不通时该交付物标记「待核对」，不影响其它交付物。
+playwright>=1.47,<2.0

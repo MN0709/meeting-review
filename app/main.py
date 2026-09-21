@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set
 from uuid import uuid4
 
+from urllib.parse import quote
+
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -25,6 +27,8 @@ from app.agent.tools import default_registry as agent_tool_registry
 from app.agent.tools.catalog import register_all_tools
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
+from app.deliverables.image_minutes import DEFAULT_TEMPLATE, build_parts, render_html
+from app.deliverables.render import RendererUnavailable, render_pdf
 from app.llm import (
     AnalysisError, LLMAnalyzer, format_timestamp, usage_scope,
     validate_team_action_evidence, validate_team_evidence,
@@ -40,6 +44,7 @@ from app.models import (
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
     MyTaskItem, MyTasksResult, SearchHit, SearchResponse, SelfSpeakerResult, SelfSpeakerUpdate,
+    ImageMinutesItem, ImageMinutesPart, ImageMinutesResult,
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
@@ -737,6 +742,92 @@ async def set_self_speaker(
     return SelfSpeakerResult(
         self_speaker_set=True, local_label=label, member_id=speaker.member_id,
         member_name=member_name, self_name=member_name or label,
+    )
+
+
+def _image_minutes_inputs(meeting_id: str, team_id: int):
+    """图片纪要所需的只读数据：历史（报告/标题/元信息）、行动项状态、本场「我」。"""
+    history = database.get_history(meeting_id, team_id)
+    if history is None:
+        owner = database.owner_team_id(meeting_id)
+        if owner is None:
+            raise APIError(404, "not_found", "会议不存在")
+        if owner != team_id:
+            raise APIError(403, "team_forbidden", "无权访问其他团队的会议")
+        raise APIError(404, "not_found", "这场会议还没有生成报告，无法生成图片纪要")
+    action_rows = database.list_meeting_action_items(meeting_id, team_id)
+    current = database.self_speaker(meeting_id, team_id)
+    return history, action_rows, (current or {}).get("self_name")
+
+
+def _image_minutes_meta(history, self_name: Optional[str]) -> str:
+    speakers = [item.display_name for item in history.speakers if item.display_name]
+    lines = [
+        "会议：{}".format(history.title),
+        "时间：{} ｜ 时长：{}".format(history.created_at[:10], format_timestamp(history.duration_seconds)),
+    ]
+    if speakers:
+        lines.append("本场说话人：{}".format("、".join(speakers)))
+    lines.append(
+        "「我」：{}".format(self_name) if self_name else "「我」：未指定你自己（不推测）"
+    )
+    return "\n".join(lines)
+
+
+@app.post("/api/meetings/{meeting_id}/image-minutes", response_model=ImageMinutesResult)
+async def image_minutes(request: Request, meeting_id: str) -> ImageMinutesResult:
+    """R-P1.5-1：生成图片纪要四板块（幂等，只读渲染，不写任何业务数据）。"""
+    team_id = request.state.team_id
+    history, action_rows, self_name = _image_minutes_inputs(meeting_id, team_id)
+    parts = [
+        ImageMinutesPart(
+            key=part["key"], title=part["title"], subtitle=part["subtitle"],
+            empty_note=part["empty_note"],
+            items=[
+                ImageMinutesItem(
+                    text=item["text"],
+                    timestamp=item.get("timestamp"), meta=item.get("meta"),
+                )
+                for item in part["items"]
+            ],
+        )
+        for part in build_parts(report=history.report, action_rows=action_rows, self_name=self_name)
+    ]
+    return ImageMinutesResult(
+        meeting_id=meeting_id, title=history.title,
+        meta=_image_minutes_meta(history, self_name), parts=parts,
+    )
+
+
+@app.get("/api/meetings/{meeting_id}/image-minutes.pdf")
+async def image_minutes_pdf(request: Request, meeting_id: str) -> Response:
+    """R-P1.5-1：导出图片纪要 PDF。渲染器不可用时返回 503（不返回 500，不影响其它交付物）。"""
+    team_id = request.state.team_id
+    history, action_rows, self_name = _image_minutes_inputs(meeting_id, team_id)
+    html_text = render_html(
+        report=history.report, action_rows=action_rows, self_name=self_name,
+        title="{}｜图片纪要".format(history.title),
+        meta=_image_minutes_meta(history, self_name),
+        footer=(
+            "由「会脉 · 团队会议记忆」生成 ｜ 完整录音已按隐私策略删除，此处不含音频。\n"
+            "图片纪要仅用于速览；结论与引文以会脉报告中的原话证据为准。"
+        ),
+        template=settings.image_minutes_template or DEFAULT_TEMPLATE,
+    )
+    try:
+        pdf_bytes = await render_pdf(html_text, renderer=settings.pdf_renderer)
+    except RendererUnavailable as exc:
+        raise APIError(503, "renderer_unavailable", str(exc)) from exc
+    filename = "{}-图片纪要.pdf".format(history.title or "会议")
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": "attachment; filename*=UTF-8''{}".format(
+                quote(filename, safe="")
+            ),
+            "Cache-Control": "no-store",
+        },
     )
 
 

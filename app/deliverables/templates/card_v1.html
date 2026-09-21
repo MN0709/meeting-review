@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>@@TITLE@@</title>
+<style>
+  @page { size: A4; margin: 12mm; }
+  :root {
+    --ink: #16241d; --muted: #5d6b62; --line: #dfe6e0;
+    --c1: #e8f3ff; --b1: #3dadff;
+    --c2: #fff0e6; --b2: #ff8a3d;
+    --c3: #eef7ee; --b3: #4caf50;
+    --c4: #f1ebff; --b4: #874fff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 28px 32px; background: #fff; color: var(--ink);
+         font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+  header { margin-bottom: 22px; }
+  header h1 { margin: 0 0 8px; font-size: 26px; line-height: 1.35; }
+  header .meta { color: var(--muted); font-size: 13px; line-height: 1.7; white-space: pre-line; }
+  .card { border: 1px solid var(--line); border-radius: 16px; padding: 16px 18px; margin-bottom: 16px;
+          border-left: 6px solid var(--line); page-break-inside: avoid; }
+  .card h2 { margin: 0 0 4px; font-size: 18px; }
+  .card .sub { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+  .card.c-core { background: var(--c1); border-left-color: var(--b1); }
+  .card.c-urgent { background: var(--c2); border-left-color: var(--b2); }
+  .card.c-todo { background: var(--c3); border-left-color: var(--b3); }
+  .card.c-mine { background: var(--c4); border-left-color: var(--b4); }
+  ul { margin: 0; padding-left: 20px; }
+  li { margin: 7px 0; line-height: 1.7; font-size: 14px; }
+  .ts { display: inline-block; margin-right: 6px; padding: 1px 6px; border-radius: 6px;
+        background: #ffffff; border: 1px solid var(--line); color: var(--muted);
+        font-size: 12px; font-variant-numeric: tabular-nums; }
+  .meta-line { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .empty { color: var(--muted); font-size: 13px; margin: 0; }
+  footer { margin-top: 18px; color: var(--muted); font-size: 11px; line-height: 1.6; white-space: pre-line; }
+</style>
+</head>
+<body>
+<header>
+  <h1>@@TITLE@@</h1>
+  <div class="meta">@@META@@</div>
+</header>
+@@BODY@@
+<footer>@@FOOTER@@</footer>
+</body>
+</html>
