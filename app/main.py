@@ -144,9 +144,13 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
             raise TaskProcessingError(422, "未检测到可转写的语音")
         if not progress("说话人识别中", "转写完成，正在区分说话人并匹配已记住的声音…"):
             raise TaskAborted()
+        # R-P2-4：只用**本场所属项目**的成员声纹匹配（未归类时用未归类桶），不跨项目。
         profiles = [
             KnownVoiceProfile(**item)
-            for item in database.voice_profiles(team_id, settings.speaker_model)
+            for item in database.voice_profiles(
+                team_id, settings.speaker_model,
+                project_id=(usage_context or {}).get("project_id"),
+            )
         ] if team_id else []
         speaker_result = await run_in_threadpool(
             speaker_recognizer.process, path, transcript, profiles
@@ -1431,6 +1435,79 @@ async def project_delete(
         project_id=project_id,
         affected_meetings=affected,
         meetings_deleted=delete_meetings,
+    )
+
+
+def _assert_member_in_project(project_id: str, member_id: int, team_id: int) -> None:
+    """R-P2-4：成员必须属于该工作区，且属于该项目（不能拿别人项目的成员来操作）。"""
+    owner = database.member_owner_team_id(member_id)
+    if owner is None:
+        raise APIError(404, "not_found", "成员不存在")
+    if owner != team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他工作区的成员")
+    if database.member_project_id(member_id) != project_id:
+        raise APIError(404, "not_found", "该成员不属于这个项目")
+
+
+@app.get("/api/projects/{project_id}/members", response_model=list[MemberIdentity])
+async def project_member_list(request: Request, project_id: str) -> list[MemberIdentity]:
+    """R-P2-4：项目成员声纹库（只返回本项目成员）。"""
+    _assert_team_owns_project(project_id, request.state.team_id)
+    return database.list_project_members(project_id, request.state.team_id)
+
+
+@app.patch("/api/projects/{project_id}/members/{member_id}", response_model=MemberIdentity)
+async def project_member_update(
+    request: Request, project_id: str, member_id: int, payload: MemberUpdate = Body(...),
+) -> MemberIdentity:
+    _assert_team_owns_project(project_id, request.state.team_id)
+    _assert_member_in_project(project_id, member_id, request.state.team_id)
+    name = payload.name.strip()
+    if not name:
+        raise APIError(422, "invalid_args", "成员姓名不能为空")
+    updated = database.update_member(
+        member_id, request.state.team_id, name, payload.role.strip(),
+        payload.is_key_decision_maker,
+    )
+    if updated is None:
+        raise APIError(404, "not_found", "成员不存在")
+    return updated
+
+
+@app.delete("/api/projects/{project_id}/members/{member_id}/voiceprint")
+async def project_member_voiceprint_delete(
+    request: Request, project_id: str, member_id: int,
+) -> dict:
+    """R-P2-4：只删除本项目该成员的声纹，不影响其他项目与历史会议。"""
+    _assert_team_owns_project(project_id, request.state.team_id)
+    _assert_member_in_project(project_id, member_id, request.state.team_id)
+    if not database.delete_voiceprint(member_id, request.state.team_id):
+        raise APIError(404, "not_found", "该成员尚未保存声纹")
+    return {"status": "ok"}
+
+
+@app.post(
+    "/api/projects/{project_id}/members/{member_id}/merge",
+    response_model=MemberMergeResult,
+)
+async def project_member_merge(
+    request: Request, project_id: str, member_id: int,
+    payload: MemberMergeRequest = Body(...),
+) -> MemberMergeResult:
+    """R-P2-4：只在**本项目内**合并，不可跨项目。"""
+    _assert_team_owns_project(project_id, request.state.team_id)
+    _assert_member_in_project(project_id, member_id, request.state.team_id)
+    _assert_member_in_project(project_id, payload.target_member_id, request.state.team_id)
+    try:
+        affected = database.merge_members(
+            member_id, payload.target_member_id, request.state.team_id
+        )
+    except ValueError as exc:
+        raise APIError(422, "invalid_args", "不能将身份合并到自己") from exc
+    if affected is None:
+        raise APIError(404, "not_found", "成员不存在")
+    return MemberMergeResult(
+        target_member_id=payload.target_member_id, merged_meetings=affected,
     )
 
 

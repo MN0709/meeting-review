@@ -395,6 +395,8 @@ class MemberIdentity(StrictModel):
     is_key_decision_maker: bool = False
     has_voiceprint: bool = False
     created_at: str
+    # R-P2-4：成员所属项目；None 表示「未归类」桶。
+    project_id: Optional[str] = None
 
 
 class MemberUpdate(StrictModel):

@@ -20,6 +20,9 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
+# 用于区分「未传参数」与「显式传 None」（None = 未归类桶，project_id IS NULL）。
+_UNSET = object()
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -339,6 +342,9 @@ class Database:
             self._ensure_column(
                 connection, "meeting_speakers", "remember_requested", "INTEGER NOT NULL DEFAULT 0"
             )
+            # R-P2-4：声纹库从「团队全局」改为「项目级」。project_id 为空 = 未归类桶。
+            self._ensure_column(connection, "members", "project_id", "TEXT REFERENCES projects(id)")
+            self._ensure_column(connection, "speaker_profiles", "project_id", "TEXT")
             self._ensure_column(connection, "agent_tasks", "message", "TEXT")
             self._ensure_column(connection, "agent_tasks", "request_id", "TEXT")
             self._ensure_column(connection, "agent_tasks", "long_meeting", "INTEGER NOT NULL DEFAULT 0")
@@ -356,7 +362,10 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_action_items_team_status
                     ON meeting_action_items(team_id, status, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_members_team_name ON members(team_id, name);
+                CREATE INDEX IF NOT EXISTS idx_members_team_project ON members(team_id, project_id, name);
                 CREATE INDEX IF NOT EXISTS idx_speaker_profiles_team ON speaker_profiles(team_id);
+                CREATE INDEX IF NOT EXISTS idx_speaker_profiles_team_project
+                    ON speaker_profiles(team_id, project_id);
                 CREATE INDEX IF NOT EXISTS idx_meeting_speakers_team_meeting
                     ON meeting_speakers(team_id, meeting_id);
                 CREATE INDEX IF NOT EXISTS idx_speaker_clips_team_meeting
@@ -689,12 +698,31 @@ class Database:
             )
 
     def move_meeting(self, meeting_id: str, team_id: int, project_id: str) -> bool:
+        now = _utc_now()
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE meetings SET project_id=? WHERE id=? AND team_id=?",
                 (project_id, meeting_id, team_id),
             )
-        return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                return False
+            # R-P2-4 ④：未归类成员随会议迁入目标项目（只动 project_id 为空的人）。
+            connection.execute(
+                """UPDATE members SET project_id=?
+                   WHERE team_id=? AND project_id IS NULL AND id IN (
+                       SELECT member_id FROM meeting_speakers
+                       WHERE meeting_id=? AND team_id=? AND member_id IS NOT NULL)""",
+                (project_id, team_id, meeting_id, team_id),
+            )
+            connection.execute(
+                """UPDATE speaker_profiles SET project_id=?, updated_at=?
+                   WHERE member_id IN (
+                       SELECT member_id FROM meeting_speakers
+                       WHERE meeting_id=? AND team_id=? AND member_id IS NOT NULL)
+                     AND project_id IS NULL""",
+                (project_id, now, meeting_id, team_id),
+            )
+        return True
 
     def update_meeting_title(self, meeting_id: str, team_id: int, title: str) -> bool:
         with self._lock, self._connect() as connection:
@@ -744,14 +772,29 @@ class Database:
                 (transcript.duration_seconds, meeting_id, team_id),
             )
 
-    def voice_profiles(self, team_id: int, model_version: Optional[str] = None) -> list[dict]:
+    def voice_profiles(
+        self, team_id: int, model_version: Optional[str] = None, project_id: Any = _UNSET,
+    ) -> list[dict]:
+        """按项目返回可用于匹配的声纹。
+
+        R-P2-4：默认（传 `project_id`）只返回**同一项目**的成员声纹；
+        `project_id=None` 表示「未归类」桶（`project_id IS NULL`）；
+        不传 `project_id`（哨兵 `_UNSET`）时保持旧行为（整团队），仅供历史调用与测试。
+        这样 A 项目的声纹不会出现在 B 项目（红线 13）。
+        """
+        scope_sql, scope_args = "", []
+        if project_id is None:
+            scope_sql = " AND m.project_id IS NULL"
+        elif project_id is not _UNSET:
+            scope_sql = " AND m.project_id=?"
+            scope_args = [project_id]
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """SELECT m.id AS member_id,m.name,p.embedding_json
                    FROM speaker_profiles p JOIN members m ON m.id=p.member_id
-                   WHERE p.team_id=? AND m.team_id=?
+                   WHERE p.team_id=? AND m.team_id=?""" + scope_sql + """
                      AND (? IS NULL OR p.model_version=?) ORDER BY m.id""",
-                (team_id, team_id, model_version, model_version),
+                (team_id, team_id, *scope_args, model_version, model_version),
             ).fetchall()
         return [
             {
@@ -1063,7 +1106,7 @@ class Database:
     def list_members(self, team_id: int) -> list[MemberIdentity]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
-                """SELECT m.id,m.name,m.role,m.is_key_decision_maker,m.created_at,
+                """SELECT m.id,m.name,m.role,m.is_key_decision_maker,m.created_at,m.project_id,
                           CASE WHEN p.id IS NULL THEN 0 ELSE 1 END AS has_voiceprint
                    FROM members m LEFT JOIN speaker_profiles p ON p.member_id=m.id
                    WHERE m.team_id=? ORDER BY m.name,m.id""",
@@ -1073,7 +1116,21 @@ class Database:
             id=row["id"], name=row["name"], role=row["role"],
             is_key_decision_maker=bool(row["is_key_decision_maker"]),
             has_voiceprint=bool(row["has_voiceprint"]), created_at=row["created_at"],
+            project_id=row["project_id"],
         ) for row in rows]
+
+    def list_project_members(self, project_id: str, team_id: int) -> list[MemberIdentity]:
+        """R-P2-4：只返回本项目成员（项目级声纹库）。"""
+        return [
+            item for item in self.list_members(team_id) if item.project_id == project_id
+        ]
+
+    def member_project_id(self, member_id: int) -> Optional[str]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT project_id FROM members WHERE id=?", (member_id,)
+            ).fetchone()
+        return row["project_id"] if row else None
 
     def member_owner_team_id(self, member_id: int) -> Optional[int]:
         with self._lock, self._connect() as connection:
@@ -1175,7 +1232,10 @@ class Database:
         self, meeting_id: str, team_id: int, local_label: str, name: str, role: str,
         is_key_decision_maker: bool, remember_voice: bool, model_version: str,
     ) -> Optional[tuple[int, bool, bool]]:
-        """Map a local label; voiceprint persistence is deferred to meeting finalization."""
+        """Map a local label; voiceprint persistence is deferred to meeting finalization.
+
+        R-P2-4：成员按（项目 + 姓名）查重并创建——同名的人在不同项目是不同成员。
+        """
         now = _utc_now()
         with self._lock, self._connect() as connection:
             speaker = connection.execute(
@@ -1187,9 +1247,15 @@ class Database:
                 return None
             if remember_voice and not speaker["embedding_json"]:
                 raise ValueError("voice sample unavailable")
+            meeting_row = connection.execute(
+                "SELECT project_id FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id)
+            ).fetchone()
+            project_id = meeting_row["project_id"] if meeting_row else None
             member = connection.execute(
-                "SELECT id FROM members WHERE team_id=? AND name=? ORDER BY id LIMIT 1",
-                (team_id, name),
+                """SELECT id FROM members
+                   WHERE team_id=? AND name=? AND project_id IS ?
+                   ORDER BY id LIMIT 1""",
+                (team_id, name, project_id),
             ).fetchone()
             if member:
                 member_id = int(member["id"])
@@ -1199,9 +1265,9 @@ class Database:
                 )
             else:
                 cursor = connection.execute(
-                    """INSERT INTO members(team_id,name,role,is_key_decision_maker,created_at)
-                       VALUES(?,?,?,?,?)""",
-                    (team_id, name, role, int(is_key_decision_maker), now),
+                    """INSERT INTO members(team_id,name,role,is_key_decision_maker,created_at,project_id)
+                       VALUES(?,?,?,?,?,?)""",
+                    (team_id, name, role, int(is_key_decision_maker), now, project_id),
                 )
                 member_id = int(cursor.lastrowid)
             connection.execute(
@@ -1260,17 +1326,22 @@ class Database:
             for row in rows:
                 if not row["embedding_json"]:
                     raise ValueError("voice sample unavailable")
+                member_project = connection.execute(
+                    "SELECT project_id FROM members WHERE id=?", (row["member_id"],)
+                ).fetchone()
+                profile_project = member_project["project_id"] if member_project else None
                 connection.execute(
                     """INSERT INTO speaker_profiles(
-                           team_id,member_id,embedding_json,model_version,consented_at,updated_at
-                       ) VALUES(?,?,?,?,?,?)
+                           team_id,member_id,embedding_json,model_version,consented_at,updated_at,project_id
+                       ) VALUES(?,?,?,?,?,?,?)
                        ON CONFLICT(member_id) DO UPDATE SET
                            embedding_json=excluded.embedding_json,
                            model_version=excluded.model_version,
-                           consented_at=excluded.consented_at,updated_at=excluded.updated_at""",
+                           consented_at=excluded.consented_at,updated_at=excluded.updated_at,
+                           project_id=excluded.project_id""",
                     (
                         team_id, row["member_id"], row["embedding_json"],
-                        model_version, now, now,
+                        model_version, now, now, profile_project,
                     ),
                 )
             connection.execute(

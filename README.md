@@ -21,7 +21,7 @@
 - 项目连续回顾：选择项目后聚合最近 3 场已完成会议的决策、行动项和遗留问题；每项标明来源会议，行动项可人工设置状态。
 - 说话人确认：报告中展示本场说话人、可点击回听的代表片段、时长、自动匹配置信度和状态。同一声音被过度切成多个标签时会先尝试合并（阈值 `SPEAKER_INTRA_MERGE_THRESHOLD`，默认 0.85），**但两个簇各自命中不同的已知成员时一律不合并**（身份优先于相似度，2026-09-21 真实录音校准后新增），最终身份仍由用户确认。
 - 声音授权：不再要求每位说话人分别勾选同意；点击“完成整理”时统一显示参会者名单并确认授权。
-- 声纹身份库：姓名、角色和“关键决策人”由用户维护，声纹可单独删除。（R-P2-4 会把声纹库按项目隔离，见 M2。）
+- 项目成员声纹库（R-P2-4）：在每个项目详情页维护本项目成员（姓名 / 角色 / 关键决策人 / 是否记住声音）；**同名的人在不同项目互不影响**，A 项目的声纹不会在 B 项目匹配。说话人确认只写入本场所属项目；会议未归类时成员暂存「未归类」桶，会议归入项目后随会议迁移。旧的 `/api/members*` 端点保留但已废弃（界面不再调用）。
 - 报告（R-P2-7 瘦身后）：交付物状态（顶部）、① 会议总览、② 会议要点、**我答应的任务**、**③ 关键结论**、说话人确认、逐字稿侧栏、图片纪要。其中「③ 关键结论」内部合并三小组——**决策 / 行动项 / 待跟进**，每组为空时显示明确空态。⑦ 识别状态、⑧ 本次会议成本、⑨ Agent 步骤**默认从界面移除**（接口保留，`DEBUG_PANELS_ENABLED=true` 时才显示）。点击引文时间戳可在**右侧逐字稿侧栏**定位高亮，也可点「看上下文」展开带说话人标签的转写上下文。**决策、行动项、遗留问题都带原话证据（D-028）：引文旁标「原话」，点「看上下文」展开原文核对；旧报告无行动项原话时明确显示「无法核对」，不伪造。**
 - 逐项勾选分享（R-P1.5-3）：报告页右上「分享」→ 勾选要外发的内容（图片纪要 / 精简纪要 / 逐字稿 / 代表语音片段 / 任务单，**默认全不勾**）→ 生成只读链接。**未勾选的字段后端根本不会出现在响应里**（不是前端隐藏）；链接**固定 3 天有效**（`SHARE_TTL_HOURS=72`）、可随时撤销、每次访问写 `share_audit`（令牌哈希 / 时间 / IP / 结果码）。数据库**只存令牌的 sha256 哈希**（原文只在创建时返回一次），因此链接列表用 `share_id` 撤销。分享读取是独立受限出口：只有 `GET /api/shares/**` 免团队口令，其余 `/api/*` 仍然必须鉴权；分享页（`/s/{token}`）不复用团队单页，也看不到团队成员身份库、其它会议与成本数据。代表语音走 `/api/shares/{token}/clips/{id}`，**未勾选语音时读片段返回 403**。分享页会明确标注有效期与「完整录音已删除，仅含代表性片段」。
 - AI 项目建议（R-P1.5-8）：**未归类**会议的报告顶部会出现一张带「**AI 建议**」角标的卡片，给出建议归入的已有项目（优先复用，不编造）或建议的新项目名，并附一句依据。三个动作都由人决定：**加入该项目 / 新建「建议名」并加入 / 用新名字新建并加入 / 不加入**；选「不加入」保持未分类、清除建议、**不留副作用**。**AI 永不自动移动会议**（有专门测试断言）；建议里出现团队不存在的项目 id 时**整条丢弃**；旧报告没有该字段时界面不显示卡片。团队还没有项目时不传项目列表，分析调用与之前完全一致。
@@ -163,6 +163,21 @@ curl http://127.0.0.1:8000/health
 # {"status":"ok"}
 ```
 
+## 旧数据迁移（R-P2-11，团队版 → 个人版）
+
+只跑一次，**幂等**，可先预览：
+
+```bash
+# 先看将发生什么（不写任何数据）
+.venv/bin/python -m app.migrate_v2 --dry-run
+# 确认后执行（自动整库备份到 data/meeting-review.db.bak-<时间戳>）
+.venv/bin/python -m app.migrate_v2
+```
+
+做四件事：① 解析个人工作区（旧名改为 `OWNER_NAME`）；② 旧项目 → 个人项目（跨团队同名加前缀）；
+③ 成员按其会议出现最多的项目归位（判断不出留在「未归类」桶）；④ 导出并清空 `team_terms`，写 `app_state.schema_version=2.0`。
+迁移后旧报告、旧分享链接、旧音频片段都不受影响。
+
 ## API
 
 - `GET /health`：免鉴权健康检查。
@@ -179,7 +194,12 @@ curl http://127.0.0.1:8000/health
 - `GET /api/meetings/{id}/my-tasks`：**「我答应的任务」切面（R-P1.5-5）**。只返回 `owner` 与「我」完全一致的行动项；未指定时 `self_speaker_set=false` + 空列表，另给 `owner_unknown`（负责人为「未明确」的条数）。跨团队 403。
 - `POST /api/meetings/{id}/self-speaker`：指定本场「我」对应哪个说话人（`{"local_label": "说话人 1"}` 或 `{"member_id": 3}`；传空对象表示清除）。非法说话人/非本场成员 422；无报告 404；跨团队 403。
 - `GET /api/projects`：列出当前团队项目文件夹及会议数量。
-- `GET /api/projects/{id}/memory`：聚合当前团队当前项目最近 3 场已完成会议的决策、行动项和遗留问题；包含来源会议。
+- `GET /api/projects/{id}/memory`：聚合当前项目最近 3 场已完成会议的决策、行动项和遗留问题；包含来源会议。
+- `GET /api/projects/{id}/members`：**项目成员声纹库（R-P2-4）**。只返回本项目成员；项目不属于当前工作区 403。
+- `PATCH /api/projects/{id}/members/{member_id}`：改成员姓名 / 角色 / 关键决策人；成员不属于该项目 404，空姓名 422。
+- `DELETE /api/projects/{id}/members/{member_id}/voiceprint`：**只删本项目该成员声纹**，不影响其它项目与历史会议。
+- `POST /api/projects/{id}/members/{member_id}/merge`：**只在项目内合并**，目标必须同项目（跨项目 404）。
+- 旧 `GET /api/members`、`PATCH /api/members/{id}`、`DELETE /api/members/{id}/voiceprint`、`POST /api/members/{id}/merge` 保留但**已废弃**，界面不再调用。
 - `POST /api/projects`：创建项目文件夹，可传 `parent_id` 创建第二级；第三层会被拒绝。`PATCH /api/projects/{id}` 修改名称。
 - `DELETE /api/projects/{id}`：默认把会议移入未分类；显式传入 `delete_meetings=true` 才连同终态会议、转写稿和报告删除。
 - `POST /api/review`：multipart 字段 `file`、可选 `title` 和可选 `project_id`，成功返回 HTTP 202 与任务 ID；新版页面要求先选文件夹，API 保留未分类兼容能力。
@@ -318,13 +338,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：385 passed
+python -m pytest -q            # 本地完整环境：397 passed
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 385 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 397 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：
