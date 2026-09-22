@@ -106,7 +106,7 @@ def test_core_is_overview_and_points_and_decisions_are_separate() -> None:
     decisions = next(part for part in parts if part["key"] == "decisions")
     assert [item["text"] for item in decisions["items"]] == ["本周上线内测"]
     assert decisions["items"][0]["timestamp"] == "00:00:02"
-    assert "决策人：胡泊" in decisions["items"][0]["meta"]
+    assert decisions["items"][0]["meta"] is None  # R-P2.1：不再有「决策人」
 
 
 def test_urgent_items_merged_into_todo_and_first() -> None:

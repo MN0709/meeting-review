@@ -25,6 +25,7 @@ from app.agent.planning import Planner
 from app.agent.session import AgentLimits
 from app.agent.tools import default_registry as agent_tool_registry
 from app.agent.tools.catalog import register_all_tools
+from app import attribution, conclusions
 from app.config import get_settings
 from app.db import Database, ProjectHasActiveMeetingsError, ProjectHasChildrenError
 from app.deliverables.image_minutes import DEFAULT_TEMPLATE, build_parts, render_html
@@ -55,6 +56,7 @@ from app.models import (
     TaskAccepted, TaskStatus, TeamMeetingReport,
 )
 from app.pipeline import build_team_report
+from app.conclusions import finalize_report
 from app.owner import SpeakerCandidate, decide_owner
 from app.security import AdmissionController, AdmissionError, AdmissionReservation, SHANGHAI_TZ
 from app import shares
@@ -73,6 +75,13 @@ OWNER_AUDIO_EXTENSIONS: Set[str] = ALLOWED_EXTENSIONS | {".webm", ".ogg", ".oga"
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 settings = get_settings()
+# R-P2.1 紧急回退开关：按配置启用读取时归属与内容级去重。
+attribution.set_enabled(settings.speaker_attribution_enabled)
+conclusions.set_content_dedupe(
+    settings.conclusion_dedupe_enabled,
+    settings.conclusion_dedupe_jaccard,
+    settings.conclusion_dedupe_containment,
+)
 database = Database(settings.database_path)
 transcriber = WhisperTranscriber(settings)
 
@@ -241,6 +250,14 @@ async def _run_agent_report(meeting_id: str, team_id: int) -> TeamMeetingReport:
             raise TaskProcessingError(
                 502, "Agent 报告的引文校验未通过：{}".format(str(exc)[:150])
             ) from exc
+        # R-P2.1：Agent 路径也要做确定性互斥/去重/负责人口径。
+        report, _ = finalize_report(
+            report, transcript.segments,
+            dedupe_enabled=settings.conclusion_dedupe_enabled,
+            jaccard_threshold=settings.conclusion_dedupe_jaccard,
+            containment_threshold=settings.conclusion_dedupe_containment,
+            normalize_owners=True,
+        )
     return report
 
 

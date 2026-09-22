@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from app.attribution import attribute_report
+from app.conclusions import dedupe_report
 from app.models import (
     ActionStatus, DEFAULT_MEETING_TITLE, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
     MemberIdentity, ProjectListItem, SpeakerClip,
@@ -1707,6 +1709,14 @@ class Database:
             return None
         report_payload = self._report_payload(row["json"])
         self_speaker = self.self_speaker(meeting_id, team_id)
+        segments = [TranscriptSegment.model_validate(dict(item)) for item in transcript_rows]
+        label_to_name = {
+            str(item["local_label"]): (item["name"] or str(item["local_label"]))
+            for item in speaker_rows
+        }
+        # R-P2.1：读取时确定性互斥/去重 + 说话人归属（旧报告不改库也能生效）。
+        report, _ = dedupe_report(TeamMeetingReport.model_validate(report_payload))
+        report = attribute_report(report, segments, label_to_name)
         clips_by_label: dict[str, list[SpeakerClip]] = {}
         for clip in clip_rows:
             clips_by_label.setdefault(clip["local_label"], []).append(SpeakerClip(
@@ -1718,8 +1728,8 @@ class Database:
             status=row["status"], created_at=row["created_at"],
             assignment_source=row["assignment_source"],
             assignment_confidence=row["assignment_confidence"],
-            report=TeamMeetingReport.model_validate(report_payload),
-            transcript=[TranscriptSegment.model_validate(dict(item)) for item in transcript_rows],
+            report=report,
+            transcript=segments,
             speaker_consent_confirmed=row["speaker_consent_at"] is not None,
             self_speaker=SelfSpeakerResult(**self_speaker, self_speaker_set=True) if self_speaker else None,
             speakers=[MeetingSpeaker(
@@ -1771,7 +1781,7 @@ class Database:
             meeting_ids = [row["id"] for row in rows]
             if meeting_ids:
                 action_rows = connection.execute(
-                    """SELECT id,meeting_id,item_index,status FROM meeting_action_items
+                    """SELECT id,meeting_id,item_index,task,status FROM meeting_action_items
                        WHERE team_id=? AND meeting_id IN ({})""".format(
                         ",".join("?" for _ in meeting_ids)
                     ),
@@ -1780,9 +1790,9 @@ class Database:
             else:
                 action_rows = []
 
-        actions_by_position = {
-            (row["meeting_id"], row["item_index"]): row for row in action_rows
-        }
+        status_by_task: dict = {}
+        for row in action_rows:
+            status_by_task.setdefault((row["meeting_id"], row["task"]), []).append(row)
         recent_meetings: list[MeetingListItem] = []
         decisions: list[ProjectMemoryDecision] = []
         action_items: list[ProjectMemoryAction] = []
@@ -1792,8 +1802,11 @@ class Database:
                 key: row[key]
                 for key in ("id", "title", "project_id", "duration_seconds", "status", "created_at")
             }))
+            history = self.get_history(row["id"], team_id)
+            if history is None:
+                continue
+            report = history.report  # 已做互斥/去重 + 说话人归属
             source = MeetingSource(id=row["id"], title=row["title"], created_at=row["created_at"])
-            report = TeamMeetingReport.model_validate(self._report_payload(row["json"]))
             decisions.extend(
                 ProjectMemoryDecision(**item.model_dump(), source=source)
                 for item in report.decisions
@@ -1802,13 +1815,15 @@ class Database:
                 ProjectMemoryIssue(**item.model_dump(), source=source)
                 for item in report.unresolved_issues
             )
-            for index, item in enumerate(report.action_items):
-                action_row = actions_by_position.get((row["id"], index))
+            for item in report.action_items:
+                bucket = status_by_task.get((row["id"], item.task))
+                action_row = bucket.pop(0) if bucket else None
                 if action_row is None:
                     continue
                 action_items.append(ProjectMemoryAction(
                     id=action_row["id"], task=item.task, owner=item.owner,
                     deadline=item.deadline, status=action_row["status"], source=source,
+                    evidence=item.evidence, speaker=item.speaker,
                 ))
         return ProjectMemory(
             project_id=project.id,
@@ -1972,7 +1987,10 @@ class Database:
     # ------------------------------------------------------------------
 
     def get_report(self, meeting_id: str, team_id: int) -> Optional[TeamMeetingReport]:
-        """只取报告（不连带转写），供 get_report 工具用。"""
+        """只取报告（不连带转写），供 get_report 工具用。
+
+        R-P2.1：读取时先做确定性互斥/去重，再补 `speaker`（不落库）。
+        """
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """SELECT r.json FROM reports r JOIN meetings m ON m.id=r.meeting_id
@@ -1981,7 +1999,36 @@ class Database:
             ).fetchone()
         if row is None:
             return None
-        return TeamMeetingReport.model_validate(self._report_payload(row["json"]))
+        report = TeamMeetingReport.model_validate(self._report_payload(row["json"]))
+        report, _ = dedupe_report(report)
+        return self.attribute_meeting_report(meeting_id, team_id, report)
+
+    def _speaker_context(self, meeting_id: str, team_id: int):
+        """转写片段 + 本地标签→展示名映射（供读取时说话人归属）。"""
+        with self._lock, self._connect() as connection:
+            transcript_rows = connection.execute(
+                """SELECT t.start,t.end,t.speaker_label,t.text FROM transcripts t
+                   JOIN meetings m ON m.id=t.meeting_id
+                   WHERE t.meeting_id=? AND m.team_id=? ORDER BY t.id""",
+                (meeting_id, team_id),
+            ).fetchall()
+            speaker_rows = connection.execute(
+                """SELECT s.local_label,m.name FROM meeting_speakers s
+                   LEFT JOIN members m ON m.id=s.member_id
+                   WHERE s.meeting_id=? AND s.team_id=? ORDER BY s.id""",
+                (meeting_id, team_id),
+            ).fetchall()
+        segments = [TranscriptSegment.model_validate(dict(row)) for row in transcript_rows]
+        label_to_name = {
+            str(row["local_label"]): (row["name"] or str(row["local_label"])) for row in speaker_rows
+        }
+        return segments, label_to_name
+
+    def attribute_meeting_report(
+        self, meeting_id: str, team_id: int, report: TeamMeetingReport,
+    ) -> TeamMeetingReport:
+        segments, label_to_name = self._speaker_context(meeting_id, team_id)
+        return attribute_report(report, segments, label_to_name)
 
     def load_transcript(self, meeting_id: str, team_id: int) -> Optional[Transcript]:
         """加载一场会议的完整转写（供能力工具分析用；已按 team_id 隔离）。"""

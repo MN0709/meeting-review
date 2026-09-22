@@ -57,6 +57,20 @@ class Settings(BaseSettings):
     # 关闭后回到 v1.2 行为：只给建议，不自动移动。
     auto_project_assign_enabled: bool = Field(default=True, alias="AUTO_PROJECT_ASSIGN_ENABLED")
     auto_assign_threshold: float = Field(default=0.75, ge=0, le=1, alias="AUTO_ASSIGN_THRESHOLD")
+
+    # --- R-P2.1 关键结论重构 -------------------------------------------------
+    # 内容级去重（互斥与证据级去重始终生效）；关闭只保留证据级。
+    conclusion_dedupe_enabled: bool = Field(default=True, alias="CONCLUSION_DEDUPE_ENABLED")
+    # 字符二元组 Jaccard 阈值（RK-1 可调）。
+    conclusion_dedupe_jaccard: float = Field(
+        default=0.6, ge=0, le=1, alias="CONCLUSION_DEDUPE_JACCARD"
+    )
+    # 二元组包含度阈值（「基本包含」即判重）。
+    conclusion_dedupe_containment: float = Field(
+        default=0.6, ge=0, le=1, alias="CONCLUSION_DEDUPE_CONTAINMENT"
+    )
+    # 读取时说话人归属；关闭后一律显示「未标注说话人」。
+    speaker_attribution_enabled: bool = Field(default=True, alias="SPEAKER_ATTRIBUTION_ENABLED")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: Optional[str] = Field(default=None, alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")

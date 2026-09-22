@@ -136,16 +136,17 @@ def build_parts(
         if text:
             items["core"].append({"text": text, "kind": "point"})
 
-    # ④ 关键决策：每条带时间戳，可回到原话
+    # ④ 关键决策：每条带时间戳，可回到原话；R-P2.1 改为显示「谁说的」，不再有决策人。
     for decision in getattr(report, "decisions", []) or []:
         text = str(getattr(decision, "content", "") or "").strip()
         if not text:
             continue
         evidence = getattr(decision, "evidence", None)
+        speaker = str(getattr(decision, "speaker", "") or "").strip()
         items["decisions"].append({
-            "text": text,
+            "text": "{}：{}".format(speaker, text) if speaker else text,
             "timestamp": evidence.timestamp if evidence else None,
-            "meta": "决策人：{}".format(str(getattr(decision, "decision_maker", "") or "未明确")),
+            "meta": None,
         })
 
     # ② 待办：未完成行动项；同时收集「我答应的任务」（同一对象引用，后续标记紧急会同步）
@@ -157,8 +158,9 @@ def build_parts(
         if not text or status not in OPEN_STATUSES:
             continue
         evidence = getattr(item, "evidence", None)
+        speaker = str(getattr(item, "speaker", "") or "").strip()
         entry = {
-            "text": text,
+            "text": "{}：{}".format(speaker, text) if speaker else text,
             "timestamp": evidence.timestamp if evidence else None,
             "meta": "负责人：{} ｜ 截止：{} ｜ 状态：{}".format(
                 item.owner or "未明确", item.deadline or "未明确", status,

@@ -175,8 +175,8 @@ async function load(){
     const report=body.report;
     content.append(section('会议总览',[line(report.overview||'（无）')],'（无）'));
     content.append(section('会议要点',(report.meeting_points||[]).map(point=>line(point)),'（无）'));
-    content.append(section('决策清单',(report.decisions||[]).map(item=>group(item.content,item.evidence&&item.evidence.timestamp,item.decision_maker?('决策人：'+item.decision_maker):null)),'（无）'));
-    content.append(section('遗留问题',(report.unresolved_issues||[]).map(item=>group(item.content,item.evidence&&item.evidence.timestamp)),'（无）'));
+    content.append(section('关键决策',(report.decisions||[]).map(item=>group(item.speaker?(item.speaker+'：'+item.content):item.content,item.evidence&&item.evidence.timestamp)),'（无）'));
+    content.append(section('待跟进',(report.unresolved_issues||[]).map(item=>group(item.speaker?(item.speaker+'：'+item.content):item.content,item.evidence&&item.evidence.timestamp)),'（无）'));
   }
   if(body.tasks){
     content.append(section('待办（行动项）',(body.tasks.action_items||[]).map(item=>group(item.task,item.evidence&&item.evidence.timestamp,`负责人：${item.owner||'未明确'} ｜ 截止：${item.deadline||'未明确'}`)),'（无）'));

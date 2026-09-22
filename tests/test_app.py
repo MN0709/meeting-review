@@ -738,7 +738,8 @@ def test_team_payload_normalizes_overview_and_unresolved_issue_shape() -> None:
     assert report.suggested_title == "内测上线安排确认"
     assert report.overview == "会议讨论内测上线安排。"
     assert report.decisions[0].content == "本周上线"
-    assert report.decisions[0].decision_maker == "小宁"
+    # R-P2.1-4：新报告不再采信模型输出的「决策人」
+    assert report.decisions[0].decision_maker == ""
     assert report.action_items[0].owner == "未明确"
     assert report.unresolved_issues[0].content == "监控阈值尚未确定"
 

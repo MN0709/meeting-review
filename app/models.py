@@ -40,6 +40,8 @@ class ActionItem(StrictModel):
     # 新增（可选）：行动项的原话证据。新报告由模型强制提供并严格校验；
     # 旧报告缺失时为 None，保证历史数据仍可读取（D-024 契约向前兼容）。
     evidence: Optional[EvidenceQuote] = None
+    # R-P2.1-4：派生字段，读取时按原话定位计算，不落库（None = 未标注说话人）。
+    speaker: Optional[str] = None
 
 
 class MeetingMinutes(StrictModel):
@@ -94,13 +96,20 @@ class ReviewReport(SemanticAnalysis):
 
 class DecisionItem(StrictModel):
     content: str
-    decision_maker: str
+    # R-P2.1-4：模型不再输出「决策人」；字段保留仅为兼容旧报告，新报告一律为空串。
+    decision_maker: str = ""
     evidence: EvidenceQuote
+    # R-P2.1-4③：派生字段，读取时按原话定位计算（None = 未标注说话人）。
+    speaker: Optional[str] = None
+    # R-P2.1-2③：被去重并进决策的行动项负责人，界面显示「落实：X」。
+    implementer: Optional[str] = None
 
 
 class UnresolvedIssue(StrictModel):
     content: str
     evidence: EvidenceQuote
+    # R-P2.1-4③：派生字段，读取时按原话定位计算（None = 未标注说话人）。
+    speaker: Optional[str] = None
 
 
 class SuggestedProject(StrictModel):

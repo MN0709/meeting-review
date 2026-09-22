@@ -13,6 +13,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from app.config import Settings
+from app.conclusions import finalize_report
 from app.models import ChunkSummary, SemanticAnalysis, TeamChunkSummary, TeamMeetingReport, Transcript, TranscriptSegment
 
 
@@ -57,24 +58,37 @@ CHUNK_SYSTEM_PROMPT = """
 """.strip()
 
 TEAM_SYSTEM_PROMPT = """
-你是严谨的团队正式会议分析助手。只能根据转写内容提炼信息，不得补写。
+你是严谨的会议分析助手。只能根据转写内容提炼信息，不得补写。
 先根据会议的核心主题生成一个 8-20 个字的中文建议标题，不加书名号，不使用“会议纪要”等空泛名称。
-再用不超过 300 字概括会议目标、进展和结果，并输出会议要点、决策清单、行动项与遗留问题。
-每条决策、行动项和遗留问题都必须包含输入中完全一致的原话和时间戳，不得改写引文；无法确认决策人或负责人时填“未明确”，但仍必须给出对应原话（evidence）。
-行动项的 evidence 用于核对“谁承诺了什么”，不得省略。
-遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
-紧急事项只记录“带时间压力、需要尽快处理”的事项（如“今天必须定”“明天上线前要改完”），必须带原话；普通行动项、已完成安排、泛泛的“要注意”都不算，没有则返回空数组。
-如果用户消息里给了「当前团队已有项目」列表，可以额外给出项目归属建议 suggested_project：优先复用已有项目（existing_project_id 必须从给定列表里选，不得编造）；确实都不合适时才给 new_project_name；无法判断时三个字段都留空。绝对不要输出“这几场会属于同一个项目”这类解释性总结。
-行动项的截止时间不明确时填“未明确”。speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
+再用不超过 300 字概括会议目标、进展和结果，并输出会议要点、决策、行动项与待跟进。
+
+把内容严格分成三类，彼此互斥，一句话只能归一类：
+1) 决策：会上「已经拍板」的结论，原话要能看出「定了 / 采用 / 不做 / 就按这个 / 决定」等确定语义。只输出 content 与 evidence，不要输出「决策人」。
+2) 行动项：会上「明确承诺要去做」、且原话能看出由谁负责的事。第一人称「我 / 我来 / 我负责」→ owner 等于这句的说话人；原话明确点名某人 → owner 等于该姓名；否则 owner 写「未明确」。输出 task / owner / deadline / evidence。
+3) 待跟进（unresolved_issues）：会上提出，但既没有结论、也没有明确负责人的事项。输出 content 与 evidence。
+
+硬规则：
+- 同一句原话只能归一类；不得把同一件事同时写进决策和行动项。
+- 没有「已拍板」语义的方向、建议、讨论，不要写成决策，写成待跟进。
+- 没有明确负责人的事，不要写成行动项。
+- 不要输出、不要猜测「决策人」；谁说的由系统根据原话定位。
+- 每条都必须带 evidence：quote 为转写原文的完全一致子串，timestamp 为该片段内时间。
+- 行动项 deadline 不明确时填「未明确」。
+- 遗留问题只记录会上明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
+- 紧急事项（urgent_items）只记录“带时间压力、需要尽快处理”的事项（如“今天必须定”“明天上线前要改完”），必须带原话；普通行动项、已完成安排、泛泛的“要注意”都不算，没有则返回空数组；且不得与行动项或决策是同一条内容。
+- 如果用户消息里给了「当前项目」列表，可以额外给出项目归属建议 suggested_project：优先复用已有项目（existing_project_id 必须从给定列表里选，不得编造）；确实都不合适时才给 new_project_name；无法判断时三个字段都留空。绝对不要输出“这几场会属于同一个项目”这类解释性总结。
+- speaker_stats_note 输出空字符串，它会由后端本地说话人识别结果覆盖，不要用 LLM 猜测说话人。
 只输出符合指定 JSON Schema 的 JSON，不输出 Markdown 或解释。
 """.strip()
 
 TEAM_CHUNK_SYSTEM_PROMPT = """
-你负责从团队正式会议的一个转写分块中提取会议要点、明确决策、行动项、遗留问题和紧急事项。
-每条决策、行动项、遗留问题和紧急事项必须保留完全一致的逐字原话及时间戳，不得改写引文；无法确认决策人、负责人或截止时间时填“未明确”，但仍必须给出对应原话（evidence）。
-行动项的 evidence 用于核对“谁承诺了什么”，不得省略。
-遗留问题只记录明确提出但尚未解决、尚未决定或需要后续确认的事项，没有则返回空数组。
-紧急事项只记录本块里“带时间压力、需要尽快处理”的事项，必须带原话；普通行动项、已完成安排、泛泛的“要注意”都不算，没有则返回空数组。
+你负责从一个会议转写分块中提取会议要点、决策、行动项、待跟进和紧急事项。
+把内容严格分成三类，彼此互斥，一句话只能归一类：
+1) 决策：本块里「已经拍板」的结论（定了 / 采用 / 不做 / 就按这个），只输出 content/evidence，不要输出决策人。
+2) 行动项：本块里「明确承诺要去做」且原话能看出由谁负责的事；第一人称→owner 为该句说话人，原话点名→owner 为该姓名，否则 owner 写「未明确」。
+3) 待跟进（unresolved_issues）：本块里提出但既无结论、也无明确负责人的事项。
+硬规则：同一句原话只能归一类；没有拍板语义的不要写决策；没有明确负责人的不要写行动项；不要输出/猜测决策人；每条都必须带完全一致的逐字原话与时间戳；截止不明确填「未明确」。
+紧急事项只记录本块里带时间压力、需尽快处理的事项，必须带原话，且不得与行动项或决策是同一条内容。
 不要分析个人表现，不要补写分块中不存在的信息。只输出符合指定 JSON Schema 的 JSON。
 """.strip()
 
@@ -102,6 +116,20 @@ class AnalysisError(RuntimeError):
     pass
 
 
+def _team_schema(model_type: Type[BaseModel]) -> Dict[str, Any]:
+    """R-P2.1-4：不再向模型要求 `decision_maker`（字段保留仅为兼容旧报告）。"""
+    schema = model_type.model_json_schema()
+    definitions = schema.get("$defs", {})
+    decision = definitions.get("DecisionItem")
+    if isinstance(decision, dict):
+        properties = decision.get("properties", {})
+        properties.pop("decision_maker", None)
+        required = decision.get("required")
+        if isinstance(required, list) and "decision_maker" in required:
+            required.remove("decision_maker")
+    return schema
+
+
 def _json_mode_contract(model_type: Type[BaseModel]) -> str:
     if issubclass(model_type, TeamMeetingReport):
         example = {
@@ -109,7 +137,7 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
             "overview": "会议围绕内测上线安排展开，明确了发布时间和准备工作。",
             "meeting_points": ["会议要点"],
             "decisions": [{
-                "content": "决策内容", "decision_maker": "未明确",
+                "content": "决策内容",
                 "evidence": {"quote": "原话", "timestamp": "00:00:00"},
             }],
             "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确",
@@ -133,10 +161,10 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
         fields = (
             "suggested_title(必填字符串，8-20 个字)；overview(必填字符串，不超过 300 字)；"
             "meeting_points(必填字符串数组)；"
-            "decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
-            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
+            "decisions(必填对象数组，每项只有 content/evidence，"
+            "evidence 只有 quote/timestamp；不要输出 decision_maker)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
             "evidence 只有 quote/timestamp)；"
-            "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
+            "unresolved_issues(必填对象数组，待跟进，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
             "urgent_items(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp；"
             "只收带时间压力、需尽快处理的事项，没有就返回空数组)；"
             "suggested_project(可选对象，只有 existing_project_id/new_project_name/confidence/reason；"
@@ -146,16 +174,16 @@ def _json_mode_contract(model_type: Type[BaseModel]) -> str:
     elif issubclass(model_type, TeamChunkSummary):
         example = {
             "meeting_points": ["会议要点"],
-            "decisions": [{"content": "决策内容", "decision_maker": "未明确", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
+            "decisions": [{"content": "决策内容", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "action_items": [{"task": "任务", "owner": "未明确", "deadline": "未明确", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "unresolved_issues": [{"content": "尚未解决的问题", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
             "urgent_items": [{"content": "需要尽快处理的事项", "evidence": {"quote": "原话", "timestamp": "00:00:00"}}],
         }
         fields = (
-            "meeting_points(必填字符串数组)；decisions(必填对象数组，每项只有 content/decision_maker/evidence，"
-            "evidence 只有 quote/timestamp)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
+            "meeting_points(必填字符串数组)；decisions(必填对象数组，每项只有 content/evidence，"
+            "evidence 只有 quote/timestamp；不要输出 decision_maker)；action_items(必填对象数组，每项只有 task/owner/deadline/evidence，"
             "evidence 只有 quote/timestamp)；"
-            "unresolved_issues(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
+            "unresolved_issues(必填对象数组，待跟进，每项只有 content/evidence，evidence 只有 quote/timestamp)；"
             "urgent_items(必填对象数组，每项只有 content/evidence，evidence 只有 quote/timestamp；没有就返回空数组)"
         )
     elif issubclass(model_type, SemanticAnalysis):
@@ -343,7 +371,7 @@ def normalize_llm_payload(payload: Any, model_type: Type[BaseModel]) -> Any:
                 )
                 cleaned_decisions.append({
                     "content": str(content),
-                    "decision_maker": str(item.get("decision_maker") or item.get("owner") or "未明确"),
+                    "decision_maker": "",
                     "evidence": {
                         "quote": evidence.get("quote", ""),
                         "timestamp": evidence.get("timestamp", ""),
@@ -687,7 +715,11 @@ class LLMAnalyzer:
                 "json_schema": {
                     "name": model_type.__name__,
                     "strict": True,
-                    "schema": model_type.model_json_schema(),
+                    "schema": (
+                        _team_schema(model_type)
+                        if issubclass(model_type, (TeamMeetingReport, TeamChunkSummary))
+                        else model_type.model_json_schema()
+                    ),
                 },
             }
         else:
@@ -934,13 +966,15 @@ class LLMAnalyzer:
             result = await self._validated_call(
                 TeamMeetingReport,
                 TEAM_SYSTEM_PROMPT,
-                "请生成团队会议报告。\n\n带时间戳转写：\n"
+                "请生成会议报告。\n\n带时间戳转写：\n"
                 + format_segments(transcript.segments) + project_context,
                 "team_final_direct",
                 transcript.segments,
                 usage_context,
             )
-            return TeamMeetingReport.model_validate(result.model_dump())
+            return self._finalize_conclusions(
+                TeamMeetingReport.model_validate(result.model_dump()), transcript.segments
+            )
 
         chunks = split_segments(transcript.segments, max(1000, self.settings.transcript_chunk_chars - 1000))
         chunk_results = await self._gather_bounded([
@@ -955,11 +989,32 @@ class LLMAnalyzer:
         result = await self._validated_call(
             TeamMeetingReport,
             TEAM_SYSTEM_PROMPT,
-            "以下分块按原顺序排列。去重归并；决策、遗留问题和紧急事项的引文只能从各分块 evidence 原样选取；"
+            "以下分块按原顺序排列。去重归并；决策、待跟进和紧急事项的引文只能从各分块 evidence 原样选取；"
             "紧急事项只保留真正带时间压力、需尽快处理的，宁少勿多。\n\n"
             + json.dumps(summaries, ensure_ascii=False) + project_context,
             "team_final_merge",
             transcript.segments,
             usage_context,
         )
-        return TeamMeetingReport.model_validate(result.model_dump())
+        return self._finalize_conclusions(
+            TeamMeetingReport.model_validate(result.model_dump()), transcript.segments
+        )
+
+    def _finalize_conclusions(self, report: TeamMeetingReport, segments: Sequence[TranscriptSegment]) -> TeamMeetingReport:
+        """R-P2.1-1/2/3：分块归并后、写库前的确定性互斥/去重/负责人口径。"""
+        finalized, stats = finalize_report(
+            report, segments,
+            dedupe_enabled=self.settings.conclusion_dedupe_enabled,
+            jaccard_threshold=self.settings.conclusion_dedupe_jaccard,
+            containment_threshold=self.settings.conclusion_dedupe_containment,
+            normalize_owners=True,
+        )
+        logger.info(
+            "conclusion_finalize decisions=%s->%s actions=%s->%s issues=%s->%s "
+            "evidence_deduped=%s content_deduped=%s owners_normalized=%s",
+            stats["decisions_in"], stats["decisions_out"],
+            stats["actions_in"], stats["actions_out"],
+            stats["issues_in"], stats["issues_out"],
+            stats["evidence_deduped"], stats["content_deduped"], stats["owners_normalized"],
+        )
+        return finalized
