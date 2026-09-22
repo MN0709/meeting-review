@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     )
     # 读取时说话人归属；关闭后一律显示「未标注说话人」。
     speaker_attribution_enabled: bool = Field(default=True, alias="SPEAKER_ATTRIBUTION_ENABLED")
+    # --- R-P2.1 M2：待跟进跨会议闭环 ---------------------------------------
+    # 关闭后报告写库不再 upsert 待跟进；列表与横幅显示空（不删已存数据）。
+    followups_enabled: bool = Field(default=True, alias="FOLLOWUPS_ENABLED")
     openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     openai_base_url: Optional[str] = Field(default=None, alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")

@@ -44,6 +44,7 @@ from app.models import (
     MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
+    FollowupList, FollowupStatusResult, FollowupStatusUpdate,
     MyTaskItem, MyTasksResult, OwnerBackfillResult, OwnerEnrollResult, OwnerStatus,
     ClaimOwnerVoiceRequest,
     AssignBatchRequest, AssignBatchResult, BatchProgress, BatchReviewItem, BatchReviewResult,
@@ -224,6 +225,8 @@ async def _process_audio(path: Path, progress: ProgressCallback) -> TeamMeetingR
             _mark_deliverable(path.stem, team_id, "tasks", "ok")
             # R-P2-6：高置信自动归入**已存在**项目（可撤销、永不自动新建）。
             _auto_assign_from_suggestion(path.stem, team_id, report)
+            # R-P2.1-7：把本场「待跟进」按指纹 upsert 到项目（跨会议跟踪）。
+            _upsert_followups_if_enabled(path.stem, team_id, report)
         return report
     except AnalysisError as exc:
         if team_id:
@@ -704,6 +707,21 @@ def _auto_assign_from_suggestion(meeting_id: str, team_id: Optional[int], report
         )
 
 
+def _upsert_followups_if_enabled(meeting_id: str, team_id: Optional[int], report: Any) -> None:
+    """R-P2.1-7：把本场「待跟进」按指纹 upsert 到项目（跨会议跟踪）。
+
+    只跟踪已归类会议；失败不影响报告主链路。开关 FOLLOWUPS_ENABLED=false 时跳过。
+    """
+    if not settings.followups_enabled or not team_id:
+        return
+    try:
+        database.upsert_followups(meeting_id, team_id, report)
+    except Exception as exc:
+        logger.warning(
+            "followups_upsert_failed meeting_id=%s error_type=%s", meeting_id, type(exc).__name__,
+        )
+
+
 @app.post("/api/review", response_model=TaskAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def review(
     request: Request, file: UploadFile = File(...), title: str = Form(default=""),
@@ -889,6 +907,35 @@ async def project_memory(request: Request, project_id: str) -> ProjectMemory:
     if memory is None:
         raise HTTPException(status_code=404, detail="项目文件夹不存在")
     return memory
+
+
+@app.get("/api/projects/{project_id}/followups", response_model=FollowupList)
+async def project_followups(
+    request: Request, project_id: str, status: Optional[str] = Query(default=None),
+) -> FollowupList:
+    """R-P2.1-7：项目待跟进列表（默认全部；可按 status=open/resolved/dropped 过滤）。"""
+    _assert_team_owns_project(project_id, request.state.team_id)
+    if status is not None and status not in ("open", "resolved", "dropped"):
+        raise APIError(422, "invalid_args", "status 只能是 open / resolved / dropped")
+    followups = database.list_followups(project_id, request.state.team_id, status=status)
+    if followups is None:
+        raise APIError(404, "not_found", "项目文件夹不存在")
+    return followups
+
+
+@app.patch("/api/followups/{followup_id}", response_model=FollowupStatusResult)
+async def followup_status_update(
+    request: Request, followup_id: int, payload: FollowupStatusUpdate = Body(...),
+) -> FollowupStatusResult:
+    """R-P2.1-7：人工改待跟进状态（open/resolved/dropped）。状态只能人改，AI 无此端点。"""
+    owner = database.followup_owner_team_id(followup_id)
+    if owner is None:
+        raise APIError(404, "not_found", "待跟进不存在")
+    if owner != request.state.team_id:
+        raise APIError(403, "team_forbidden", "无权访问其他团队的待跟进")
+    if not database.update_followup_status(followup_id, request.state.team_id, payload.status):
+        raise APIError(404, "not_found", "待跟进不存在")
+    return FollowupStatusResult(id=followup_id, status=payload.status)
 
 
 def _parse_iso8601(value: Optional[str], field_name: str) -> Optional[str]:
@@ -1679,6 +1726,8 @@ async def retry_deliverable(
     database.save_report(meeting_id, team_id, report)
     _mark_deliverable(meeting_id, team_id, "report", "ok")
     _mark_deliverable(meeting_id, team_id, "tasks", "ok")
+    # R-P2.1-7：重跑报告后同步待跟进（幂等；已 resolved/dropped 不会被改回 open）。
+    _upsert_followups_if_enabled(meeting_id, team_id, report)
     return RetryResult(
         meeting_id=meeting_id, kind=kind, status="ok",
         message="已重新生成报告（本次重新调用了 AI）。",

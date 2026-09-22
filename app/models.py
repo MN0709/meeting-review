@@ -561,6 +561,46 @@ class ProjectMemory(StrictModel):
 
 
 # ---------------------------------------------------------------------------
+# R-P2.1-7/8（阶段 17／M2）：待跟进跨会议跟踪
+# ---------------------------------------------------------------------------
+
+FollowupStatus = Literal["open", "resolved", "dropped"]
+
+
+class FollowupItem(StrictModel):
+    id: int
+    project_id: str
+    text: str
+    status: FollowupStatus
+    first_speaker: Optional[str] = None
+    first_meeting_id: Optional[str] = None
+    first_meeting_title: Optional[str] = None
+    last_seen_meeting_id: Optional[str] = None
+    last_seen_meeting_title: Optional[str] = None
+    # 该待跟进出现过的所有场次（含首提与后续重现）。
+    meeting_ids: List[str] = Field(default_factory=list)
+    meeting_count: int = Field(ge=0, default=0)
+    created_at: str
+    updated_at: str
+
+
+class FollowupList(StrictModel):
+    project_id: str
+    total: int = Field(ge=0)
+    open: int = Field(ge=0)
+    items: List[FollowupItem]
+
+
+class FollowupStatusUpdate(StrictModel):
+    status: FollowupStatus
+
+
+class FollowupStatusResult(StrictModel):
+    id: int
+    status: FollowupStatus
+
+
+# ---------------------------------------------------------------------------
 # LLM 成本归因（PRD R-P0-2）：GET /api/usage 的响应契约
 # ---------------------------------------------------------------------------
 

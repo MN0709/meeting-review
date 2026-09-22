@@ -9,12 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from app.attribution import attribute_report
+from app.attribution import attribute_report, display_speaker, speaker_for_evidence
 from app.conclusions import dedupe_report
+from app.followups import fingerprint
 from app.models import (
     ActionStatus, DEFAULT_MEETING_TITLE, MeetingHistory, MeetingListItem, MeetingSource, MeetingSpeaker,
     MemberIdentity, ProjectListItem, SpeakerClip,
     SelfSpeakerResult,
+    FollowupItem, FollowupList, FollowupStatus,
     ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
     TeamMeetingReport, Transcript, TranscriptSegment,
 )
@@ -364,6 +366,34 @@ class Database:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (meeting_id, kind)
                 );
+                -- R-P2.1-7（阶段 17／M2）：待跟进跨会议跟踪。
+                -- 红线：项目内合并（UNIQUE(project_id,fingerprint)），跨项目绝不合并；
+                -- 状态只能人改（本阶段不实现 AI 建议已解决）。
+                CREATE TABLE IF NOT EXISTS followups(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    team_id INTEGER NOT NULL,
+                    project_id TEXT NOT NULL REFERENCES projects(id),
+                    fingerprint TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','resolved','dropped')),
+                    first_meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL,
+                    first_speaker TEXT NULL,
+                    last_seen_meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL,
+                    resolved_meeting_id TEXT REFERENCES meetings(id) ON DELETE SET NULL,
+                    resolved_evidence_json TEXT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, fingerprint)
+                );
+                CREATE INDEX IF NOT EXISTS idx_followups_project_status
+                    ON followups(team_id, project_id, status, updated_at DESC);
+                -- 一条待跟进出现过的所有场次（含首提与后续重现）。
+                CREATE TABLE IF NOT EXISTS followup_meetings(
+                    followup_id INTEGER NOT NULL REFERENCES followups(id) ON DELETE CASCADE,
+                    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                    UNIQUE(followup_id, meeting_id)
+                );
                 """
             )
             self._ensure_column(connection, "meetings", "project_id", "TEXT REFERENCES projects(id)")
@@ -690,6 +720,10 @@ class Database:
                     "UPDATE meetings SET project_id=NULL WHERE team_id=? AND project_id=?",
                     (team_id, project_id),
                 )
+            # R-P2.1-7：项目删除时其待跟进一并删除（followup_meetings 随 FK 级联）。
+            connection.execute(
+                "DELETE FROM followups WHERE team_id=? AND project_id=?", (team_id, project_id)
+            )
             deleted = connection.execute(
                 "DELETE FROM projects WHERE id=? AND team_id=?", (project_id, team_id)
             )
@@ -733,6 +767,23 @@ class Database:
             )
             connection.execute(
                 "DELETE FROM share_audit WHERE meeting_id=? AND team_id=?", (meeting_id, team_id),
+            )
+            # R-P2.1-7：解除待跟进对被删会议的引用（首提/最近/解决均置空），
+            # 出场记录（followup_meetings）一并删除。待跟进本身保留，状态不动。
+            connection.execute(
+                "UPDATE followups SET first_meeting_id=NULL WHERE first_meeting_id=?",
+                (meeting_id,),
+            )
+            connection.execute(
+                "UPDATE followups SET last_seen_meeting_id=NULL WHERE last_seen_meeting_id=?",
+                (meeting_id,),
+            )
+            connection.execute(
+                "UPDATE followups SET resolved_meeting_id=NULL WHERE resolved_meeting_id=?",
+                (meeting_id,),
+            )
+            connection.execute(
+                "DELETE FROM followup_meetings WHERE meeting_id=?", (meeting_id,)
             )
             connection.execute("DELETE FROM meetings WHERE id=? AND team_id=?", (meeting_id, team_id))
 
@@ -1833,6 +1884,154 @@ class Database:
             action_items=action_items,
             unresolved_issues=unresolved_issues,
         )
+
+    # ------------------------------------------------------------------
+    # R-P2.1-7（阶段 17／M2）：待跟进跨会议跟踪
+    # ------------------------------------------------------------------
+
+    def upsert_followups(self, meeting_id: str, team_id: int, report: TeamMeetingReport) -> None:
+        """报告写库后，把本场 unresolved_issues 按指纹 upsert 到所属项目。
+
+        只跟踪已归类会议（project_id 为空不跟踪）；跨项目隔离由
+        UNIQUE(project_id, fingerprint) + team_id 过滤保证。
+        状态只在此处**新建 open**，绝不把 resolved/dropped 悄悄改回 open（红线 23）。
+        """
+        issues = list(getattr(report, "unresolved_issues", []) or [])
+        if not issues:
+            return
+        with self._lock, self._connect() as connection:
+            meeting = connection.execute(
+                "SELECT project_id FROM meetings WHERE id=? AND team_id=?",
+                (meeting_id, team_id),
+            ).fetchone()
+            if meeting is None or not meeting["project_id"]:
+                return
+            project_id = meeting["project_id"]
+            segments, label_to_name = self._speaker_context(meeting_id, team_id)
+            now = _utc_now()
+            for issue in issues:
+                fp = fingerprint(str(issue.content))
+                speaker = display_speaker(
+                    speaker_for_evidence(getattr(issue, "evidence", None), segments),
+                    label_to_name,
+                )
+                existing = connection.execute(
+                    "SELECT id FROM followups WHERE team_id=? AND project_id=? AND fingerprint=?",
+                    (team_id, project_id, fp),
+                ).fetchone()
+                if existing is None:
+                    cursor = connection.execute(
+                        """INSERT INTO followups(
+                               team_id,project_id,fingerprint,text,status,
+                               first_meeting_id,first_speaker,last_seen_meeting_id,
+                               created_at,updated_at
+                           ) VALUES(?,?,?,?,'open',?,?,?,?,?)""",
+                        (team_id, project_id, fp, str(issue.content),
+                         meeting_id, speaker, meeting_id, now, now),
+                    )
+                    followup_id = cursor.lastrowid
+                else:
+                    followup_id = int(existing["id"])
+                    connection.execute(
+                        "UPDATE followups SET last_seen_meeting_id=?, updated_at=? WHERE id=?",
+                        (meeting_id, now, followup_id),
+                    )
+                connection.execute(
+                    "INSERT OR IGNORE INTO followup_meetings(followup_id, meeting_id) VALUES(?,?)",
+                    (followup_id, meeting_id),
+                )
+
+    def list_followups(
+        self, project_id: str, team_id: int, status: Optional[FollowupStatus] = None,
+    ) -> Optional[FollowupList]:
+        """列出项目待跟进（默认全部，可按 status 过滤）。返回 None 表示项目不存在。"""
+        project = self.get_project(project_id, team_id)
+        if project is None:
+            return None
+        conditions = ["f.team_id=?", "f.project_id=?"]
+        params: List[Any] = [team_id, project_id]
+        if status is not None:
+            conditions.append("f.status=?")
+            params.append(status)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT f.id,f.project_id,f.text,f.status,f.first_speaker,
+                          f.first_meeting_id,f.last_seen_meeting_id,f.created_at,f.updated_at,
+                          fm.meeting_id AS m_id
+                   FROM followups f
+                   LEFT JOIN followup_meetings fm ON fm.followup_id=f.id
+                   WHERE {} ORDER BY f.updated_at DESC, f.id DESC""".format(" AND ".join(conditions)),
+                tuple(params),
+            ).fetchall()
+            meeting_ids = sorted(
+                {row["m_id"] for row in rows if row["m_id"]}
+                | {row["first_meeting_id"] for row in rows if row["first_meeting_id"]}
+                | {row["last_seen_meeting_id"] for row in rows if row["last_seen_meeting_id"]}
+            )
+            titles: Dict[str, str] = {}
+            if meeting_ids:
+                title_rows = connection.execute(
+                    "SELECT id,title FROM meetings WHERE id IN ({})".format(
+                        ",".join("?" for _ in meeting_ids)
+                    ),
+                    tuple(meeting_ids),
+                ).fetchall()
+                titles = {row["id"]: row["title"] for row in title_rows}
+        items: Dict[int, FollowupItem] = {}
+        order: List[int] = []
+        for row in rows:
+            fid = int(row["id"])
+            if fid not in items:
+                items[fid] = FollowupItem(
+                    id=fid, project_id=row["project_id"], text=row["text"],
+                    status=row["status"], first_speaker=row["first_speaker"],
+                    first_meeting_id=row["first_meeting_id"],
+                    first_meeting_title=titles.get(row["first_meeting_id"])
+                    if row["first_meeting_id"] else None,
+                    last_seen_meeting_id=row["last_seen_meeting_id"],
+                    last_seen_meeting_title=titles.get(row["last_seen_meeting_id"])
+                    if row["last_seen_meeting_id"] else None,
+                    meeting_ids=[], meeting_count=0,
+                    created_at=row["created_at"], updated_at=row["updated_at"],
+                )
+                order.append(fid)
+            if row["m_id"] and row["m_id"] not in items[fid].meeting_ids:
+                items[fid].meeting_ids.append(row["m_id"])
+        for fid in order:
+            items[fid].meeting_count = len(items[fid].meeting_ids)
+        result_items = [items[fid] for fid in order]
+        open_count = sum(1 for item in result_items if item.status == "open")
+        return FollowupList(
+            project_id=project_id, total=len(result_items), open=open_count,
+            items=result_items,
+        )
+
+    def followup_owner_team_id(self, followup_id: int) -> Optional[int]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT team_id FROM followups WHERE id=?", (followup_id,)
+            ).fetchone()
+        return int(row["team_id"]) if row else None
+
+    def update_followup_status(
+        self, followup_id: int, team_id: int, status: FollowupStatus,
+        resolved_meeting_id: Optional[str] = None,
+    ) -> bool:
+        """人工改状态。resolved_meeting_id 仅在本团队内有效时才会被采信。"""
+        with self._lock, self._connect() as connection:
+            if resolved_meeting_id:
+                owned = connection.execute(
+                    "SELECT 1 FROM meetings WHERE id=? AND team_id=?",
+                    (resolved_meeting_id, team_id),
+                ).fetchone()
+                if owned is None:
+                    resolved_meeting_id = None
+            cursor = connection.execute(
+                """UPDATE followups SET status=?, resolved_meeting_id=?, updated_at=?
+                   WHERE id=? AND team_id=?""",
+                (status, resolved_meeting_id, _utc_now(), followup_id, team_id),
+            )
+        return cursor.rowcount == 1
 
     def action_owner_team_id(self, action_id: int) -> Optional[int]:
         with self._lock, self._connect() as connection:
