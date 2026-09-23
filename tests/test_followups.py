@@ -18,6 +18,9 @@ from app.models import TeamMeetingReport
 AUTH_HEADERS = {"X-Access-Token": "test-access-token"}
 OTHER_HEADERS = {"X-Access-Token": "other-team-token"}
 
+ROOT = Path(__file__).parent.parent
+HTML = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path):
@@ -211,3 +214,17 @@ def test_followups_api_and_authz(isolated) -> None:
         # 不存在的待跟进
         missing = client.patch("/api/followups/999999", json={"status": "open"})
         assert missing.status_code == 404
+
+
+# --- 界面：空则不显示（M2 调整） ---------------------------------------------
+
+
+def test_empty_followups_hidden_in_ui() -> None:
+    """报告页/项目页「待跟进」为空时不显示，且不再显示空态文案。"""
+    # 报告页：待跟进栏空则隐藏，去掉「本次会议未识别到明确遗留问题」空话
+    assert "本次会议未识别到明确遗留问题" not in HTML
+    assert "unresolvedHeading" in HTML
+    assert "issuesHeading.classList.toggle('hidden',!unresolved.length)" in HTML
+    # 项目页：待跟进板块默认隐藏，无内容时整体不出现
+    assert 'class="followup-panel hidden" id="projectFollowups"' in HTML
+    assert "panel.classList.add('hidden');return}" in HTML
