@@ -44,7 +44,7 @@ from app.models import (
     MemberIdentity, MemberMergeRequest, MemberMergeResult, MemberUpdate,
     ProjectCreate, ProjectDeleteResult,
     ProjectListItem, ProjectMemory, ProjectRename, SpeakerConfirmRequest, SpeakerConfirmResult,
-    FollowupList, FollowupStatusResult, FollowupStatusUpdate,
+    FollowupList, FollowupStatusResult, FollowupStatusUpdate, SpeakerDigest,
     MyTaskItem, MyTasksResult, OwnerBackfillResult, OwnerEnrollResult, OwnerStatus,
     ClaimOwnerVoiceRequest,
     AssignBatchRequest, AssignBatchResult, BatchProgress, BatchReviewItem, BatchReviewResult,
@@ -936,6 +936,16 @@ async def followup_status_update(
     if not database.update_followup_status(followup_id, request.state.team_id, payload.status):
         raise APIError(404, "not_found", "待跟进不存在")
     return FollowupStatusResult(id=followup_id, status=payload.status)
+
+
+@app.get("/api/projects/{project_id}/by-speaker", response_model=SpeakerDigest)
+async def project_by_speaker(request: Request, project_id: str) -> SpeakerDigest:
+    """R-P2.2（阶段 18）：这个项目里，谁说了什么（跨会议按人聚合）。"""
+    _assert_team_owns_project(project_id, request.state.team_id)
+    digest = database.get_project_speaker_digest(project_id, request.state.team_id)
+    if digest is None:
+        raise APIError(404, "not_found", "项目文件夹不存在")
+    return digest
 
 
 def _parse_iso8601(value: Optional[str], field_name: str) -> Optional[str]:

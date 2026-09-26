@@ -17,6 +17,7 @@ from app.models import (
     MemberIdentity, ProjectListItem, SpeakerClip,
     SelfSpeakerResult,
     FollowupItem, FollowupList, FollowupStatus,
+    SpeakerDigest, SpeakerItem, SpeakerSection,
     ProjectMemory, ProjectMemoryAction, ProjectMemoryDecision, ProjectMemoryIssue,
     TeamMeetingReport, Transcript, TranscriptSegment,
 )
@@ -30,6 +31,54 @@ _UNSET = object()
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# R-P2.2（阶段 18）：「谁说了什么」——把报告条目按「谁说的」分组。
+# 行动项（action）按产品经理 2026-09-22 决定**不进入**这个视图（负责人不准，已收起）；
+# 只保留每个人说的关键结论（决策）与他提出/悬而未决的问题（待跟进、紧急）。
+_KIND_FIELDS = (
+    ("decision", "decisions"),
+    ("issue", "unresolved_issues"),
+    ("urgent", "urgent_items"),
+)
+
+
+def _sort_sections(
+    buckets: Dict[Optional[str], List[SpeakerItem]], key_names: Dict[str, bool],
+) -> List[SpeakerSection]:
+    """★关键决策人优先 → 其余按条目数 → 「未标注说话人」最后。"""
+    sections = [
+        SpeakerSection(
+            speaker=speaker,
+            is_key_decision_maker=bool(speaker and key_names.get(speaker)),
+            items=items,
+        )
+        for speaker, items in buckets.items()
+    ]
+    sections.sort(key=lambda section: (
+        0 if section.is_key_decision_maker else (2 if section.speaker is None else 1),
+        -len(section.items), section.speaker or "",
+    ))
+    return sections
+
+
+def build_speaker_sections(
+    report: TeamMeetingReport, key_names: Dict[str, bool],
+    *, meeting_id: Optional[str] = None, meeting_title: Optional[str] = None,
+) -> List[SpeakerSection]:
+    """把一场报告的四类条目按 `speaker`（已归属）分组；无人称的归入 None。"""
+    buckets: Dict[Optional[str], List[SpeakerItem]] = {}
+    for kind, attr in _KIND_FIELDS:
+        for item in (getattr(report, attr, None) or []):
+            speaker = getattr(item, "speaker", None) or None
+            text = str(getattr(item, "task", None) or getattr(item, "content", "") or "")
+            if not text:
+                continue
+            buckets.setdefault(speaker, []).append(SpeakerItem(
+                kind=kind, text=text, evidence=getattr(item, "evidence", None),
+                meeting_id=meeting_id, meeting_title=meeting_title,
+            ))
+    return _sort_sections(buckets, key_names)
 
 
 def _token_hash(token: str) -> str:
@@ -1745,7 +1794,8 @@ class Database:
             ).fetchall() if row else []
             speaker_rows = connection.execute(
                 """SELECT s.local_label,s.member_id,s.confidence,s.status,s.speech_seconds,
-                          s.excerpts_json,s.embedding_json,s.remember_requested,m.name
+                          s.excerpts_json,s.embedding_json,s.remember_requested,
+                          m.name,m.is_key_decision_maker
                    FROM meeting_speakers s LEFT JOIN members m ON m.id=s.member_id
                    WHERE s.meeting_id=? AND s.team_id=? ORDER BY s.id""",
                 (meeting_id, team_id),
@@ -1768,6 +1818,14 @@ class Database:
         # R-P2.1：读取时确定性互斥/去重 + 说话人归属（旧报告不改库也能生效）。
         report, _ = dedupe_report(TeamMeetingReport.model_validate(report_payload))
         report = attribute_report(report, segments, label_to_name)
+        # R-P2.2（阶段 18）：「谁说了什么」按人分组（★关键决策人由用户标记）。
+        key_names = {
+            str(item["name"]): bool(item["is_key_decision_maker"])
+            for item in speaker_rows if item["name"]
+        }
+        speaker_digest = SpeakerDigest(sections=build_speaker_sections(
+            report, key_names, meeting_id=row["id"], meeting_title=row["title"],
+        ))
         clips_by_label: dict[str, list[SpeakerClip]] = {}
         for clip in clip_rows:
             clips_by_label.setdefault(clip["local_label"], []).append(SpeakerClip(
@@ -1783,6 +1841,7 @@ class Database:
             transcript=segments,
             speaker_consent_confirmed=row["speaker_consent_at"] is not None,
             self_speaker=SelfSpeakerResult(**self_speaker, self_speaker_set=True) if self_speaker else None,
+            speaker_digest=speaker_digest,
             speakers=[MeetingSpeaker(
                 local_label=item["local_label"],
                 display_name=item["name"] or item["local_label"],
@@ -1792,6 +1851,7 @@ class Database:
                 clips=clips_by_label.get(item["local_label"], []),
                 has_voice_sample=item["embedding_json"] is not None,
                 remember_requested=bool(item["remember_requested"]),
+                is_key_decision_maker=bool(item["is_key_decision_maker"]),
             ) for item in speaker_rows],
         )
 
@@ -1884,6 +1944,38 @@ class Database:
             action_items=action_items,
             unresolved_issues=unresolved_issues,
         )
+
+    def get_project_speaker_digest(
+        self, project_id: str, team_id: int, meeting_limit: int = 20,
+    ) -> Optional[SpeakerDigest]:
+        """R-P2.2（阶段 18）：这个项目里，谁说了什么（跨会议按人聚合）。
+
+        只统计已完成、且有报告的会议；同一展示名跨会议自动合并；**跨项目不合并**。
+        """
+        project = self.get_project(project_id, team_id)
+        if project is None:
+            return None
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT m.id FROM meetings m JOIN reports r ON r.meeting_id=m.id
+                   WHERE m.team_id=? AND m.status='完成'
+                     AND (m.project_id=? OR m.project_id IN (
+                         SELECT id FROM projects WHERE team_id=? AND parent_id=?
+                     ))
+                   ORDER BY m.created_at DESC LIMIT ?""",
+                (team_id, project_id, team_id, project_id, meeting_limit),
+            ).fetchall()
+        buckets: Dict[Optional[str], List[SpeakerItem]] = {}
+        key_flags: Dict[str, bool] = {}
+        for row in rows:
+            history = self.get_history(row["id"], team_id)
+            if history is None:
+                continue
+            for section in history.speaker_digest.sections:
+                buckets.setdefault(section.speaker, []).extend(section.items)
+                if section.is_key_decision_maker and section.speaker:
+                    key_flags[section.speaker] = True
+        return SpeakerDigest(sections=_sort_sections(buckets, key_flags))
 
     # ------------------------------------------------------------------
     # R-P2.1-7（阶段 17／M2）：待跟进跨会议跟踪

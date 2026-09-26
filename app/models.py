@@ -439,12 +439,42 @@ class ShareLinksPayload(StrictModel):
     items: List[ShareLinkItem]
 
 
+# ---------------------------------------------------------------------------
+# R-P2.2（阶段 18／聚焦重构）：「谁说了什么」按人分组（读取时计算的派生结构）
+# ---------------------------------------------------------------------------
+
+SpeakerItemKind = Literal["decision", "action", "issue", "urgent"]
+
+
+class SpeakerItem(StrictModel):
+    kind: SpeakerItemKind
+    text: str
+    evidence: Optional[EvidenceQuote] = None
+    # 项目页（跨会议）用：这条来自哪场会议。
+    meeting_id: Optional[str] = None
+    meeting_title: Optional[str] = None
+
+
+class SpeakerSection(StrictModel):
+    # speaker 为 None 表示「未标注说话人」（不编造，排在最后）。
+    speaker: Optional[str] = None
+    is_key_decision_maker: bool = False
+    items: List[SpeakerItem] = Field(default_factory=list)
+
+
+class SpeakerDigest(StrictModel):
+    """按人分组的「谁说了什么」（报告页与项目页共用）。"""
+    sections: List[SpeakerSection] = Field(default_factory=list)
+
+
 class MeetingHistory(MeetingListItem):
     report: TeamMeetingReport
     transcript: List[TranscriptSegment]
     speakers: List["MeetingSpeaker"] = Field(default_factory=list)
     speaker_consent_confirmed: bool = False
     self_speaker: Optional[SelfSpeakerResult] = None
+    # R-P2.2：这场会议按人分组的「谁说了什么」（读取时计算，不落库）。
+    speaker_digest: SpeakerDigest = Field(default_factory=SpeakerDigest)
 
 
 SpeakerIdentityStatus = Literal["待确认", "已识别", "已确认", "仅本场"]
@@ -468,6 +498,8 @@ class MeetingSpeaker(StrictModel):
     clips: List[SpeakerClip] = Field(default_factory=list)
     has_voice_sample: bool = False
     remember_requested: bool = False
+    # R-P2.2：该展示名是否被用户标为「关键决策人★」（由用户维护，AI 不判断）。
+    is_key_decision_maker: bool = False
 
 
 class SpeakerConfirmRequest(StrictModel):
