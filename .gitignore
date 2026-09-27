@@ -5,3 +5,7 @@ __pycache__/
 data/
 *.py[cod]
 .DS_Store
+desktop/macos/.build/
+desktop/macos/.backend-build/
+desktop/macos/.backend-dist/
+dist/

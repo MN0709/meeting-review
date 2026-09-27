@@ -430,6 +430,8 @@ async def auth_check(request: Request) -> dict:
         "workspace": settings.owner_name,
         "auth_enabled": settings.auth_enabled,
         "debug_panels": settings.debug_panels_enabled,
+        "api_key_configured": bool(settings.openai_api_key),
+        "llm_model": settings.openai_model,
     }
 
 
@@ -1734,6 +1736,7 @@ async def retry_deliverable(
         _mark_deliverable(meeting_id, team_id, "report", "failed", "evidence_failed")
         raise APIError(502, "evidence_failed", "重新生成的报告引文校验未通过") from exc
     database.save_report(meeting_id, team_id, report)
+    database.update_status(meeting_id, team_id, "完成")
     _mark_deliverable(meeting_id, team_id, "report", "ok")
     _mark_deliverable(meeting_id, team_id, "tasks", "ok")
     # R-P2.1-7：重跑报告后同步待跟进（幂等；已 resolved/dropped 不会被改回 open）。

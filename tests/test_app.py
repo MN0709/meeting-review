@@ -238,6 +238,7 @@ def test_team_long_meeting_defaults() -> None:
     assert settings.max_upload_mb == 300
     assert settings.max_audio_minutes == 240
     assert settings.processing_timeout_seconds == 21600
+    assert settings.llm_request_timeout_seconds == 300
     assert settings.rate_limit_per_hour == 10
     assert settings.daily_task_limit == 30
     assert settings.queue_max == 5

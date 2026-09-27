@@ -1,0 +1,2 @@
+pyinstaller==6.22.3
+importlib-resources==6.5.2

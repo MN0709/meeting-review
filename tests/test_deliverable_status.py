@@ -269,10 +269,12 @@ def test_retry_report_calls_analyzer_and_updates_status(isolated_database, monke
     with TestClient(main_module.app, headers=AUTH_HEADERS) as client:
         response = client.post("/api/meetings/{}/retry?kind=report".format(MEETING))
         statuses = _statuses(client)
+        meeting = client.get("/api/meetings").json()[0]
     assert response.status_code == 200
     assert calls["n"] == 1
     assert statuses["report"]["status"] == "ok"
     assert statuses["tasks"]["status"] == "ok"
+    assert meeting["status"] == "完成"
 
 
 def test_retry_report_failure_marks_failed(isolated_database, monkeypatch) -> None:

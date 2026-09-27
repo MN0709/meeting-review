@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     queue_max: int = Field(default=5, gt=0, alias="QUEUE_MAX")
     database_path: str = Field(default="data/meeting-review.db", alias="DATABASE_PATH")
     llm_max_retries: int = Field(default=2, alias="LLM_MAX_RETRIES")
+    llm_request_timeout_seconds: float = Field(
+        default=300, gt=0, alias="LLM_REQUEST_TIMEOUT_SECONDS"
+    )
     # R-P1-7 ②：分块分析的并发上限，避免 4 小时会议无条件并发数十次调用
     llm_max_concurrency: int = Field(default=4, ge=1, le=16, alias="LLM_MAX_CONCURRENCY")
     transcript_chunk_chars: int = Field(default=6000, alias="TRANSCRIPT_CHUNK_CHARS")

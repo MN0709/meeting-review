@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import io
+import sys
 import tempfile
 import threading
+import types
 import wave
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -95,6 +97,20 @@ class SpeakerRecognizer:
 
     def _load_model(self):
         if self._model is None:
+            if getattr(sys, "frozen", False) and "wespeaker.frontend" not in sys.modules:
+                frontend = types.ModuleType("wespeaker.frontend")
+                frontend.__path__ = []
+                frontend.frontend_class_dict = {"fbank": None}
+                tfmel = types.ModuleType("wespeaker.frontend.tfmel")
+
+                class UnsupportedBundledFrontend:
+                    def __init__(self, *args, **kwargs):
+                        raise RuntimeError("This bundled build supports fbank speaker models only")
+
+                for name in ("TFMelBanks", "TFSpectrogram", "NormalizeAudio", "PreEmphasis", "FbankAug"):
+                    setattr(tfmel, name, UnsupportedBundledFrontend)
+                sys.modules["wespeaker.frontend"] = frontend
+                sys.modules["wespeaker.frontend.tfmel"] = tfmel
             import wespeaker  # type: ignore[import-not-found]
 
             self._model = wespeaker.load_model(self.model_name)
@@ -299,8 +315,13 @@ class SpeakerRecognizer:
             )
         try:
             self._load_model()
-        except (ImportError, ModuleNotFoundError):
-            logger.warning("speaker_runtime_unavailable model=%s", self.model_name)
+        except (ImportError, ModuleNotFoundError) as exc:
+            logger.warning(
+                "speaker_runtime_unavailable model=%s error_type=%s error=%s",
+                self.model_name,
+                type(exc).__name__,
+                exc,
+            )
             return SpeakerRecognitionResult(
                 transcript, transcript, [], False,
                 "声纹运行时未安装，本场暂不识别说话人",
@@ -310,6 +331,18 @@ class SpeakerRecognizer:
             return SpeakerRecognitionResult(
                 transcript, transcript, [], False,
                 "声纹模型不可用，本场暂不识别说话人",
+            )
+        except Exception as exc:
+            logger.warning(
+                "speaker_model_load_failed model=%s error_type=%s error=%s",
+                self.model_name,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            return SpeakerRecognitionResult(
+                transcript, transcript, [], False,
+                "声纹模型加载失败，已保留完整转写和报告",
             )
         try:
             with self._normalized_wav(audio_path) as normalized_path:

@@ -1,5 +1,7 @@
 # 会脉 · 我的会议记忆
 
+本项目以 [MIT License](LICENSE) 开源。依赖的 Whisper、WeSpeaker 及其模型文件仍分别遵循各自上游项目的许可证。
+
 > 当前 10 天产品化迭代的状态、风险和每日验收入口见 [PROJECT_CONTROL.md](PROJECT_CONTROL.md)，详细路线见 [docs/ROADMAP_10_DAYS.md](docs/ROADMAP_10_DAYS.md)。
 
 `meeting-review` 是**个人会议记忆**工具：一个人可以同时在多个项目里开会、一天多场；把录音丢进来，服务在本机完成转写、说话人分离与声纹匹配，再生成带原话证据的报告。用户首次把“说话人 1”确认为真实姓名并授权保存声纹后，后续会议会自动尝试识别；低置信度或多个候选过于接近时必须回退为“待确认”。
@@ -12,7 +14,7 @@
 - 批量上传（R-P2-5）：上传区支持一次选/拖入多个录音（`BATCH_MAX_FILES`，默认 20），**一次勾选同意**、逐文件落 `consent_records`；单个文件失败不影响其他；项目**可留空**（会议先进入「未归类」）；首页有「有 N 场会待归类」入口，上传后显示逐文件进度。
 - 自动归类（R-P2-6）：报告生成的 `suggested_project` 作为信号——**高置信（`AUTO_ASSIGN_THRESHOLD`，默认 0.75）且指向已存在项目**时，由确定性代码自动归入（可**一键撤销**、`project_assignments` 留痕）；低置信或新项目**不自动**，进「待归类」收件箱由人批量确认；**永不自动新建项目**。`AUTO_PROJECT_ASSIGN_ENABLED=false` 时回到「只建议、不自动」。
 - 会后整理：报告生成后自动打开“整理本次会议”，用户可确认/编辑 AI 建议标题，并根据原话片段确认说话人；允许稍后处理。**若标题仍是“未命名会议”（用户从未填写或修改），报告生成后会自动采用 AI 建议标题（D-027）；用户自己填过或改过的标题不会被覆盖。**
-- 导航：登录后左侧有“首页 / 全部会议 / 项目 / 搜索”；主页专注上传，不再同屏堆叠历史和项目记忆。
+- 导航：桌面端左侧、390px 移动端底部均有“首页 / 文件 / 项目 / 查找”。阶段 19 首页按产品经理参考图高还原：浅灰左栏、大留白回声区、三张横向快捷卡、带纪要缩略图的最近文件卡；“导入录音 / 批量导入 / 跨会搜索”仍只连接现有真实能力，下方展示后端返回的最近 3 场会议；上传、本人声纹、授权与任务状态链路保持不变。
 - 跨会议搜索（R-P1.5-4）：“搜索”页输入一句话，在**当前团队全部历史会议**的转写原文里查找；结果带会议名、项目、时间戳、说话人与命中片段，点击直接跳到那场会议并定位。底层复用 FTS5 转写索引（中文 ≥ 3 字走 FTS5，更短或含特殊字符自动回退 `LIKE`），不占上传限频与每日名额。
 - 逐字稿常驻侧栏（R-P1.5-2）：报告页右侧常驻逐字稿（桌面左右分栏，≤ 900 px 折叠为底部抽屉）。侧栏文本与 `GET /api/meetings/{id}` 的 `transcript` 逐字一致；自带关键词过滤与上一个/下一个跳转；点报告里任一时间戳 → 侧栏滚到那段并高亮；长会议按 200 段分批渲染，滚动到底自动续。
 - 项目：“项目”页的每个文件夹就是一个项目，用户界面不展示二级目录；点击文件夹进入独立项目页。新上传先选择项目，标题仍可不填。
@@ -136,6 +138,21 @@ python run.py
 > 因为它们都是延迟导入、测试里被 mock）。`requirements.lock` 是当前环境的完整快照。
 
 打开 <http://127.0.0.1:8000>。健康检查无需团队口令：
+
+### Mac 桌面应用
+
+朋友内测版是独立的 Apple Silicon Mac 应用，内含后端运行时、Whisper 转写模型和 WeSpeaker 说话人模型，不依赖项目目录、Python、`.env` 或开发者数据库。
+
+首次打开可直接进入主界面浏览；顶部独立的「AI 服务状态」栏会显示「未配置」，需要上传复盘时再填写使用者自己的 DeepSeek API Key。密钥只保存在 macOS 系统钥匙串，保存后本地服务自动重启生效。每台 Mac 的会议数据保存在 `~/Library/Application Support/会脉/data/meeting-review.db`。
+
+构建可分发 DMG：
+
+```bash
+desktop/macos/build_backend.sh
+desktop/macos/build_dmg.sh
+```
+
+产物在 `dist/会脉-0.2.1-beta-arm64.dmg`。当前内测包仅支持 macOS 13+ 的 Apple Silicon Mac；使用 ad-hoc 签名，未做 Apple Developer ID 公证，首次需在 Finder 中右键「会脉」→「打开」。PDF 导出未打入本次内测包。
 
 ### 日常怎么用（自己操作）
 
@@ -291,6 +308,7 @@ curl http://127.0.0.1:8000/health
 | `TRANSCRIPT_CHUNK_CHARS` | 否 | `6000` | 长文本分块阈值 |
 | `LLM_MAX_RETRIES` | 否 | `2` | 结构或证据校验失败后的重试次数 |
 | `LLM_MAX_CONCURRENCY` | 否 | `4` | 分块分析的并发上限，避免长会议无条件并发数十次调用 |
+| `LLM_REQUEST_TIMEOUT_SECONDS` | 否 | `300` | 单次 LLM 请求最长等待时间；长会议使用的推理模型可能超过 120 秒 |
 | `LLM_PRICE_PROMPT_PER_1K` | 否 | 空 | 输入 token 单价（每 1000）；留空时只记 token、`cost` 返回 `null`，价格不硬编码 |
 | `LLM_PRICE_COMPLETION_PER_1K` | 否 | 空 | 输出 token 单价（每 1000）；同上 |
 | `APP_HOST` / `APP_PORT` | 否 | `127.0.0.1` / `8000` | 监听地址与端口 |
@@ -368,13 +386,13 @@ Compose 使用 `meeting-data` 保存 SQLite，使用 `whisper-models` 缓存模�
 
 ```bash
 # 统一用 `python -m` 调用，避免依赖 venv 里脚本的绝对路径
-python -m pytest -q            # 本地完整环境：489 passed
+python -m pytest -q            # 当前环境：492 passed，1 skipped（未安装 torch）
 python -m ruff check app tests # lint（E501 已按项目理由关闭，见 pyproject.toml）
 python -m compileall -q app    # 语法编译
 ```
 
 **CI（R-P0-1）**：`.github/workflows/ci.yml` 在 Python **3.9 / 3.11 / 3.12** 三版本上跑「语法编译 + pytest + ruff + 密钥扫描」。
-CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 489 项在本地验证。
+CI 使用 `requirements-ci.txt` 轻量集合，跳过的那 1 项由测试自身的 `pytest.importorskip("torch")` 标为可选；完整 493 项在本地验证。
 
 测试使用模拟转写和假 LLM，覆盖 legacy 契约、团队登录/upsert、团队隔离、历史查询、时长双检、队列、音频全分支清理、转写入库与日志脱敏；P0 新增口令强度、启动拒绝、密钥不入日志、认证路径健壮性（非 ASCII 口令返回 403 而非 500）、成本落库与归因、`json_schema` 能力缓存（避免重复的必然失败请求）。
 LLM 每次调用记录 `stage/model/prompt_tokens/completion_tokens/total_tokens/duration_ms` **并写入 `llm_usage` 表**，经 `GET /api/usage` 按 stage / 会议 / 项目归因；真实会议成本待真实录音后回填：

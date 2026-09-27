@@ -655,7 +655,7 @@ class LLMAnalyzer:
                     self._client = OpenAI(
                         api_key=self.settings.openai_api_key,
                         base_url=self.settings.openai_base_url,
-                        timeout=120.0,
+                        timeout=self.settings.llm_request_timeout_seconds,
                         max_retries=1,
                     )
         return self._client

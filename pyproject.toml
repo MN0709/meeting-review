@@ -4,7 +4,7 @@ version = "0.3.0"
 description = "会脉 · 团队会议记忆：上传会议录音，看清决定了什么、谁承诺了什么、还有什么没解决"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 # 依赖以 requirements*.txt 为唯一来源（本仓库不开 src 布局，也不走 pip install .）。
 #   requirements.txt      运行所需（含开发期 lint 工具）
 #   requirements-ci.txt   CI 专用轻量集合（见下方注释）
